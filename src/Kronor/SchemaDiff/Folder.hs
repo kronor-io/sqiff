@@ -1,0 +1,68 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+
+-- | Writes a schema as one file per object, for example
+-- @table-column/public/payment/amount.sql@.
+module Kronor.SchemaDiff.Folder (writeFolder) where
+
+import Crypto.Hash qualified as Hash
+import Data.Text qualified as T
+import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, failWith)
+import RIO
+import RIO.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory, removeDirectoryRecursive)
+import RIO.FilePath (joinPath, takeDirectory, (<.>), (</>))
+import RIO.Map qualified as Map
+
+
+-- | Writes into an empty or new folder. With @replace@, first clears a folder this
+-- function wrote before, which it recognises by its marker file.
+writeFolder :: Bool -> FilePath -> Schema -> IO ()
+writeFolder replace root schema = do
+    exists <- doesDirectoryExist root
+    entries <- if exists then listDirectory root else pure []
+    unless (null entries) do
+        unless replace $ failWith (T.pack root <> " is not empty; pass --replace to rewrite it, or choose another folder")
+        written <- doesFileExist (root </> marker)
+        unless written $ failWith (T.pack root <> " was not written by schema-diff, so --replace leaves it alone")
+        removeDirectoryRecursive root
+    for_ (Map.toList schema) \(key, definition) -> do
+        let path = root </> objectPath key
+        createDirectoryIfMissing True (takeDirectory path)
+        writeFileUtf8 path (definition <> "\n")
+    writeFileUtf8 (root </> marker) "Written by schema-diff describe --out; --replace clears this folder.\n"
+
+
+marker :: FilePath
+marker = ".schema-diff"
+
+
+objectPath :: ObjectKey -> FilePath
+objectPath key = segment addr.objectType </> joinPath (map segment parents) </> (segment name <> args) <.> extension
+  where
+    addr = key.address
+
+    (parents, name) = case reverse addr.objectNames of
+        [] -> ([], "_")
+        lastName : rest -> (reverse rest, lastName)
+
+    args
+        | null addr.objectArgs = ""
+        | T.length signature <= 120 = segment signature
+        | otherwise = "(" <> T.unpack (shortHash signature) <> ")"
+      where
+        signature = "(" <> T.intercalate ", " addr.objectArgs <> ")"
+
+    extension = case key.aspect of
+        Definition -> "sql"
+        Privileges -> "privileges"
+
+
+shortHash :: Text -> Text
+shortHash = T.take 12 . tshow . Hash.hashWith Hash.SHA256 . encodeUtf8
+
+
+segment :: Text -> FilePath
+segment = T.unpack . T.replace "/" "%2F" . T.replace " " "-" . dotless
+  where
+    dotless t = if "." `T.isPrefixOf` t then "%2E" <> T.drop 1 t else t

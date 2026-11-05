@@ -1,0 +1,160 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+
+-- | Compares the table a deploy file creates before and after an edit, or the live table
+-- with what the edited file creates. Runs in a transaction that is always rolled back,
+-- with the live table moved aside so the file can create the table under its own name.
+module Kronor.SchemaDiff.TableEdit (
+    TableEdit (..),
+    Baseline (..),
+    compareTable,
+) where
+
+import Data.Text qualified as T
+import Hasql.Connection qualified as Connection
+import Hasql.Decoders qualified as D
+import Hasql.Encoders qualified as E
+import Hasql.Errors qualified as Errors
+import Hasql.Session qualified as Session
+import Hasql.Statement qualified as Statement
+import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, describe, failWith)
+import Kronor.SchemaDiff.Diff (Change (..), diff)
+import Kronor.SchemaDiff.Object
+import RIO
+import RIO.Map qualified as Map
+
+
+data TableEdit = TableEdit
+    { current :: Schema
+    , desired :: Schema
+    , changes :: Map ObjectKey Change
+    , ignored :: [(ObjectKey, Text)]
+    -- ^ Differences left out, with the reason.
+    }
+
+
+aside :: Text
+aside = "schema_diff_aside"
+
+
+-- | What the edited file is compared with.
+data Baseline
+    = -- | The statements of the file before the edit. Drift between the files and the
+      -- database cancels out, and everything the edit removes is meant.
+      BaseFile [Text]
+    | -- | The table as it is. With @allowDrops@, columns and constraints missing from the
+      -- file are dropped; otherwise they are only reported.
+      LiveTable Bool
+
+
+compareTable :: Connection.Connection -> Baseline -> QName -> [Text] -> IO TableEdit
+compareTable conn baseline table statements = do
+    (current, desired) <-
+        ( do
+            script "begin"
+            script "set local lock_timeout = '5s'"
+            exists <- script' ("select 1 from pg_class where oid = to_regclass(" <> literal (qualified table) <> ")")
+            unless exists $ failWith (qualified table <> " does not exist yet; a new table only needs its own change")
+            -- Owned sequences would move with the table; the ones the files name stay.
+            owned <-
+                Connection.use conn (Session.statement () ownedSequences)
+                    >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
+            for_ (filter (\s -> any (s `T.isInfixOf`) (statements <> baseStatements)) owned) \s ->
+                script ("alter sequence " <> quoteIdent table.schema <> "." <> quoteIdent s <> " owned by none")
+            script ("create schema " <> aside)
+            script ("alter table " <> qualified table <> " set schema " <> aside)
+            current <- case baseline of
+                BaseFile base -> do
+                    script "savepoint schema_diff_base"
+                    built <- build "before the edit" base
+                    script "rollback to savepoint schema_diff_base"
+                    pure built
+                LiveTable _ -> do
+                    schema <- describe conn [] False
+                    pure (Map.fromList [(moveBack k, restore def) | (k, def) <- Map.toList schema, belongsTo (QName aside table.name) k def])
+            desired <- build "as edited" statements
+            pure (current, desired)
+        )
+            `finally` void (Connection.use conn (Session.script "rollback"))
+    let all' = diff (\_ a b -> a == b) current (Map.mapWithKey (keepSettings current) desired)
+        reasons = Map.mapMaybeWithKey leftOut all'
+    pure
+        TableEdit
+            { current
+            , desired
+            , changes = all' `Map.difference` reasons
+            , ignored = Map.toList reasons
+            }
+  where
+    script sql = Connection.use conn (Session.script sql) >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
+
+    baseStatements = case baseline of
+        BaseFile base -> base
+        LiveTable _ -> []
+
+    build label stmts = do
+        for_ (zip [1 :: Int ..] stmts) \(n, statement) ->
+            Connection.use conn (Session.script statement)
+                >>= either (\e -> failWith ("statement " <> tshow n <> " of the file " <> label <> " failed: " <> errorText e)) pure
+        schema <- describe conn [] False
+        pure (Map.fromList [(k, def) | (k, def) <- Map.toList schema, belongsTo table k def])
+
+    ownedSequences =
+        Statement.unpreparable
+            ( "select s.relname::text from pg_class s \
+              \join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = s.oid and d.deptype = 'a' \
+              \join pg_class t on t.oid = d.refobjid \
+              \where s.relkind = 'S' and t.oid = to_regclass("
+                <> literal (qualified table)
+                <> ")"
+            )
+            E.noParams
+            (D.rowList (D.column (D.nonNullable D.text)))
+
+    errorText = \case
+        Errors.ScriptSessionError _ (Errors.ServerError _ message detail _ _) -> message <> maybe "" ("; " <>) detail
+        Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message detail _ _)) -> message <> maybe "" ("; " <>) detail
+        e -> tshow e
+
+    script' sql = do
+        result <- Connection.use conn (Session.script ("do $$ begin if not exists (" <> sql <> ") then raise exception 'missing'; end if; end $$"))
+        pure (isRight result)
+
+    literal t = "'" <> T.replace "'" "''" t <> "'"
+
+    asideRef = quoteIdent aside <> "."
+    tableSchemaRef = quoteIdent table.schema <> "."
+
+    moveBack k = case k.address.objectNames of
+        s : rest | s == aside -> k{address = k.address{objectNames = table.schema : rest}}
+        _ -> k
+
+    restore = T.replace asideRef tableSchemaRef
+
+    belongsTo q k def = case fromAddress k.address of
+        Table t -> t == q
+        Index _ -> any (`T.isInfixOf` def) [" ON " <> qualified q <> " ", " ON ONLY " <> qualified q <> " "]
+        Sequence _ -> False
+        o -> owningTable o == Just q
+
+    -- Row-level security and storage options may be set outside the table's file.
+    keepSettings current k def = case (fromAddress k.address, k.aspect, Map.lookup k current) of
+        (Table _, Definition, Just old) ->
+            let settings = filter (\l -> l `elem` ["row level security", "force row level security"] || "with (" `T.isPrefixOf` l) (T.lines old)
+                missing = filter (`notElem` T.lines def) settings
+                hasOptions = any ("with (" `T.isPrefixOf`) (T.lines def)
+             in T.intercalate "\n" (T.lines def <> filter (\l -> not ("with (" `T.isPrefixOf` l && hasOptions)) missing)
+        _ -> def
+
+    -- Against the live table: kronor keeps grants, triggers, policies and many indexes in
+    -- other files, and migrations sometimes add columns and constraints a table file never got.
+    leftOut k c
+        | BaseFile _ <- baseline = Nothing
+        | k.aspect == Privileges = Just "grants are kept outside table files"
+        | otherwise = case (fromAddress k.address, c) of
+            (Index _, Dropped _) -> Just "not in the file; indexes are often kept in their own files"
+            (Trigger _ _, Dropped _) -> Just "not in the file; triggers are kept in their own files"
+            (Policy _ _, Dropped _) -> Just "not in the file; policies may be kept in other files"
+            (_, Dropped _) | LiveTable False <- baseline -> Just "in the database but not in the file; --allow-drops drops it"
+            _ -> Nothing
