@@ -2,6 +2,7 @@ select
     'pg_class'::regclass::oid as classid,
     c.oid as objid,
     0 as objsubid,
+    c.oid as relid,
     case
         when c.relkind in ('v', 'm') then
             concat_ws(
@@ -34,5 +35,6 @@ from pg_class c
 join pg_namespace n on n.oid = c.relnamespace
 left join pg_class toast on toast.oid = c.reltoastrelid
 where c.relkind in ('r', 'p', 'v', 'm')
+    and ($2 or not c.relispartition)
     and n.nspname <> 'information_schema'
     and n.nspname !~ '^pg_'

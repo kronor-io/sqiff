@@ -3,6 +3,7 @@ with acl as (
     from pg_class c
     join pg_namespace n on n.oid = c.relnamespace
     where c.relkind in ('r', 'p', 'v', 'm', 'S')
+        and ($2 or not c.relispartition)
         and n.nspname <> 'information_schema'
         and n.nspname !~ '^pg_'
     union all
@@ -21,6 +22,7 @@ select
     acl.classid,
     acl.objid,
     0 as objsubid,
+    case when acl.classid = 'pg_class'::regclass then acl.objid end as relid,
     coalesce(
         (
             select string_agg(g.line, E'\n' order by g.line)

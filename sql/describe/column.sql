@@ -2,6 +2,7 @@ select
     'pg_class'::regclass::oid as classid,
     a.attrelid as objid,
     a.attnum::int as objsubid,
+    a.attrelid as relid,
     concat_ws(
         E'\n',
         'type ' || format_type(a.atttypid, a.atttypmod),
@@ -45,5 +46,6 @@ left join pg_constraint nn on nn.conrelid = a.attrelid and nn.contype = 'n' and 
 where a.attnum > 0
     and not a.attisdropped
     and c.relkind in ('r', 'p')
+    and ($2 or not c.relispartition)
     and n.nspname <> 'information_schema'
     and n.nspname !~ '^pg_'

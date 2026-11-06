@@ -2,6 +2,7 @@ select
     'pg_policy'::regclass::oid as classid,
     p.oid as objid,
     0 as objsubid,
+    p.polrelid as relid,
     concat_ws(
         E'\n',
         case when p.polpermissive then 'as permissive' else 'as restrictive' end,

@@ -1,63 +1,67 @@
-cabal-version: 3.0
-name:          kronor-schema-diff
-version:       0.1.0.0
-synopsis:      Describe and diff PostgreSQL schemas from their catalogs
-build-type:    Simple
+cabal-version:      3.0
+name:               kronor-schema-diff
+version:            0.1.0.0
+synopsis:           Describe and diff PostgreSQL schemas from their catalogs
+build-type:         Simple
 extra-source-files:
-    sql/depend.sql
-    sql/describe/*.sql
-    sql/plpgsql/*.sql
+  sql/depend.sql
+  sql/describe/*.sql
+  sql/plpgsql/*.sql
 
 common shared
-    default-language: GHC2021
-    default-extensions:
-        BlockArguments
-        DerivingStrategies
-        LambdaCase
-    ghc-options: -Wall
+  default-language:   GHC2021
+  default-extensions:
+    BlockArguments
+    DerivingStrategies
+    LambdaCase
+
+  ghc-options:        -Wall
 
 library
-    import:          shared
-    hs-source-dirs:  src
-    exposed-modules:
-        Kronor.SchemaDiff.Body
-        Kronor.SchemaDiff.Catalog
-        Kronor.SchemaDiff.Diff
-        Kronor.SchemaDiff.Folder
-        Kronor.SchemaDiff.Object
-        Kronor.SchemaDiff.Plan
-        Kronor.SchemaDiff.Recipe
-        Kronor.SchemaDiff.Script
-        Kronor.SchemaDiff.Sqitch
-        Kronor.SchemaDiff.TableEdit
-    build-depends:
-        base,
-        containers,
-        crypton,
-        file-embed,
-        filepath,
-        hasql,
-        pqi-ffi,
-        rio,
-        string-interpolate,
-        text,
-        time,
-        typed-process
+  import:          shared
+  hs-source-dirs:  src
+  exposed-modules:
+    Kronor.SchemaDiff.Body
+    Kronor.SchemaDiff.Catalog
+    Kronor.SchemaDiff.Diff
+    Kronor.SchemaDiff.Folder
+    Kronor.SchemaDiff.Object
+    Kronor.SchemaDiff.Plan
+    Kronor.SchemaDiff.Recipe
+    Kronor.SchemaDiff.Script
+    Kronor.SchemaDiff.Sqitch
+    Kronor.SchemaDiff.TableEdit
+
+  build-depends:
+    , base
+    , containers
+    , crypton
+    , file-embed
+    , filepath
+    , hasql
+    , pqi-ffi
+    , rio
+    , string-interpolate
+    , text
+    , time
+    , typed-process
 
 executable schema-diff
-    import:          shared
-    hs-source-dirs:  app
-    main-is:         SchemaDiff.hs
-    ghc-options:     -main-is SchemaDiff.main
-    build-depends:
-        base,
-        containers,
-        Diff,
-        hasql,
-        kronor-schema-diff,
-        filepath,
-        optparse-applicative,
-        rio,
-        string-interpolate,
-        text,
-        time
+  import:         shared
+  hs-source-dirs: app
+  main-is:        SchemaDiff.hs
+  ghc-options:
+    -main-is SchemaDiff.main -threaded -rtsopts -with-rtsopts=-N4
+
+  build-depends:
+    , base
+    , containers
+    , Diff
+    , filepath
+    , hasql
+    , kronor-schema-diff
+    , optparse-applicative
+    , rio
+    , string-interpolate
+    , text
+    , time

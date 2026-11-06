@@ -1,86 +1,56 @@
--- View rules, column defaults, table row types and arrays of either stand for the
--- view, column, table or element type they belong to.
-with raw as (
-    select d.classid, d.objid, d.objsubid, d.refclassid, d.refobjid, d.refobjsubid
+-- Edges between the objects in $1, $2 and $3 (class, object and sub-object ids), as one
+-- row of arrays. View rules, column defaults, table row types and arrays of either stand
+-- for the view, column, table or element type they belong to.
+with remap (classid, objid, toclassid, toobjid, tosubid) as (
+    select 'pg_rewrite'::regclass::oid, rw.oid, 'pg_class'::regclass::oid, rw.ev_class, 0
+    from pg_rewrite rw
+    union all
+    select 'pg_attrdef'::regclass::oid, ad.oid, 'pg_class'::regclass::oid, ad.adrelid, ad.adnum::int
+    from pg_attrdef ad
+    union all
+    select 'pg_type'::regclass::oid, t.oid, 'pg_class'::regclass::oid, k.oid, 0
+    from pg_type t
+    join pg_class k on k.oid = t.typrelid and k.relkind <> 'c'
+    union all
+    select
+        'pg_type'::regclass::oid,
+        ta.oid,
+        case when k.oid is not null then 'pg_class'::regclass::oid else 'pg_type'::regclass::oid end,
+        coalesce(k.oid, ta.typelem),
+        0
+    from pg_type ta
+    left join pg_type te on te.oid = ta.typelem
+    left join pg_class k on k.oid = te.typrelid and k.relkind <> 'c'
+    where ta.typcategory = 'A'
+        and ta.typelem <> 0
+),
+edge as (
+    select distinct
+        coalesce(ma.toclassid, d.classid) as classid,
+        coalesce(ma.toobjid, d.objid) as objid,
+        coalesce(ma.tosubid, d.objsubid) as objsubid,
+        coalesce(mb.toclassid, d.refclassid) as refclassid,
+        coalesce(mb.toobjid, d.refobjid) as refobjid,
+        coalesce(mb.tosubid, d.refobjsubid) as refobjsubid
     from pg_depend d
+    left join remap ma on ma.classid = d.classid and ma.objid = d.objid
+    left join remap mb on mb.classid = d.refclassid and mb.objid = d.refobjid
     where d.deptype in ('n', 'a', 'i')
         and d.objid >= 16384
         and d.refobjid >= 16384
 ),
-edge as (
-    select distinct
-        a.classid, a.objid, a.objsubid,
-        b.classid as refclassid, b.objid as refobjid, b.objsubid as refobjsubid
-    from raw
-    cross join lateral (
-        select
-            case
-                when rw.ev_class is not null or ad.adrelid is not null or tr.typrelid is not null or te.typrelid is not null
-                    then 'pg_class'::regclass::oid
-                when ta.typelem is not null then 'pg_type'::regclass::oid
-                else raw.classid
-            end as classid,
-            coalesce(rw.ev_class, ad.adrelid, tr.typrelid, te.typrelid, ta.typelem, raw.objid) as objid,
-            case
-                when ad.adrelid is not null then ad.adnum::int
-                when rw.ev_class is not null or tr.typrelid is not null or ta.typelem is not null then 0
-                else raw.objsubid
-            end as objsubid
-        from (select) one
-        left join pg_rewrite rw on raw.classid = 'pg_rewrite'::regclass and rw.oid = raw.objid
-        left join pg_attrdef ad on raw.classid = 'pg_attrdef'::regclass and ad.oid = raw.objid
-        left join pg_type tr
-            on raw.classid = 'pg_type'::regclass
-            and tr.oid = raw.objid
-            and exists (select from pg_class k where k.oid = tr.typrelid and k.relkind <> 'c')
-        left join pg_type ta
-            on raw.classid = 'pg_type'::regclass
-            and ta.oid = raw.objid
-            and ta.typcategory = 'A'
-            and ta.typelem <> 0
-        left join pg_type te
-            on te.oid = ta.typelem
-            and exists (select from pg_class k where k.oid = te.typrelid and k.relkind <> 'c')
-    ) a
-    cross join lateral (
-        select
-            case
-                when rw.ev_class is not null or ad.adrelid is not null or tr.typrelid is not null or te.typrelid is not null
-                    then 'pg_class'::regclass::oid
-                when ta.typelem is not null then 'pg_type'::regclass::oid
-                else raw.refclassid
-            end as classid,
-            coalesce(rw.ev_class, ad.adrelid, tr.typrelid, te.typrelid, ta.typelem, raw.refobjid) as objid,
-            case
-                when ad.adrelid is not null then ad.adnum::int
-                when rw.ev_class is not null or tr.typrelid is not null or ta.typelem is not null then 0
-                else raw.refobjsubid
-            end as objsubid
-        from (select) one
-        left join pg_rewrite rw on raw.refclassid = 'pg_rewrite'::regclass and rw.oid = raw.refobjid
-        left join pg_attrdef ad on raw.refclassid = 'pg_attrdef'::regclass and ad.oid = raw.refobjid
-        left join pg_type tr
-            on raw.refclassid = 'pg_type'::regclass
-            and tr.oid = raw.refobjid
-            and exists (select from pg_class k where k.oid = tr.typrelid and k.relkind <> 'c')
-        left join pg_type ta
-            on raw.refclassid = 'pg_type'::regclass
-            and ta.oid = raw.refobjid
-            and ta.typcategory = 'A'
-            and ta.typelem <> 0
-        left join pg_type te
-            on te.oid = ta.typelem
-            and exists (select from pg_class k where k.oid = te.typrelid and k.relkind <> 'c')
-    ) b
-    where (a.classid, a.objid, a.objsubid) is distinct from (b.classid, b.objid, b.objsubid)
+described as (
+    select k.classid::oid, k.objid::oid, k.objsubid
+    from unnest($1::int8[], $2::int8[], $3::int4[]) as k (classid, objid, objsubid)
 )
 select
-    a.type, a.object_names, a.object_args,
-    b.type, b.object_names, b.object_args
-from edge
-cross join lateral pg_identify_object_as_address(edge.classid, edge.objid, edge.objsubid) a
-cross join lateral pg_identify_object_as_address(edge.refclassid, edge.refobjid, edge.refobjsubid) b
-cross join lateral pg_identify_object(edge.classid, edge.objid, edge.objsubid) ia
-cross join lateral pg_identify_object(edge.refclassid, edge.refobjid, edge.refobjsubid) ib
-where not coalesce(coalesce(ia.schema, case when a.type in ('trigger', 'policy') then a.object_names[1] end) = any($1), false)
-    and not coalesce(coalesce(ib.schema, case when b.type in ('trigger', 'policy') then b.object_names[1] end) = any($1), false)
+    coalesce(array_agg(e.classid::int8), '{}'),
+    coalesce(array_agg(e.objid::int8), '{}'),
+    coalesce(array_agg(e.objsubid::int4), '{}'),
+    coalesce(array_agg(e.refclassid::int8), '{}'),
+    coalesce(array_agg(e.refobjid::int8), '{}'),
+    coalesce(array_agg(e.refobjsubid::int4), '{}')
+from edge e
+where (e.classid, e.objid, e.objsubid) is distinct from (e.refclassid, e.refobjid, e.refobjsubid)
+    and exists (select from described k where k.classid = e.classid and k.objid = e.objid and k.objsubid = e.objsubid)
+    and exists (select from described k where k.classid = e.refclassid and k.objid = e.refobjid and k.objsubid = e.refobjsubid)

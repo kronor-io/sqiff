@@ -11,7 +11,7 @@ import Data.Text.IO qualified as TIO
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
 import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), Edge, ObjectKey (..), UserError (..), bodyDependencies, connect, dependencies, describe, failWith, render)
+import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge, ObjectKey (..), Schema, UserError (..), bodyDependencies, connect, dependencies, describeOn, failWith, render)
 import Kronor.SchemaDiff.Diff (Change (..), affected, diff)
 import Kronor.SchemaDiff.Folder (writeFolder)
 import Kronor.SchemaDiff.Object (QName (..))
@@ -25,6 +25,7 @@ import RIO.Directory (makeAbsolute)
 import RIO.FilePath (makeRelative, (</>))
 import RIO.List qualified as L
 import RIO.Map qualified as Map
+import RIO.NonEmpty (nonEmpty)
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import System.Process.Typed (proc, readProcess, setWorkingDir)
@@ -37,27 +38,58 @@ data Scope = Scope
     }
 
 
--- | Edges from @pg_depend@ and, when plpgsql_check is installed, from PL/pgSQL bodies.
--- @label@ names the database in notes on stderr.
-edgesOf :: Text -> Scope -> Connection.Connection -> IO [Edge]
-edgesOf label scope conn = do
-    edges <- dependencies conn scope.excluded
-    bodyDependencies conn scope.excluded >>= \case
-        Nothing -> do
-            TIO.hPutStrLn stderr "schema-diff: plpgsql_check is not installed; PL/pgSQL body dependencies are left out"
-            pure edges
-        Just (bodyEdges, skipped) -> do
-            unless (null skipped) do
-                let n = length skipped
-                TIO.hPutStrLn stderr [i|schema-diff: plpgsql_check could not analyse #{n} PL/pgSQL functions on #{label}; their body dependencies are left out:|]
-                for_ skipped \(name, reason) -> TIO.hPutStrLn stderr [i|  #{name}: #{reason}|]
-            pure (edges <> bodyEdges)
+-- | Edges from @pg_depend@ and, when plpgsql_check is installed, from PL/pgSQL bodies,
+-- with notes for stderr. @label@ names the database in the notes.
+edgesOf :: Text -> Scope -> Connection.Connection -> [Connection.Connection] -> Addresses -> IO ([Edge], [Text])
+edgesOf label scope conn extra addresses = do
+    (edges, body) <-
+        concurrently
+            (dependencies conn addresses)
+            (bodyDependencies (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded addresses)
+    pure case body of
+        Nothing -> (edges, ["schema-diff: plpgsql_check is not installed; PL/pgSQL body dependencies are left out"])
+        Just (bodyEdges, skipped) ->
+            let n = length skipped
+                notes
+                    | null skipped = []
+                    | otherwise =
+                        [i|schema-diff: plpgsql_check could not analyse #{n} PL/pgSQL functions on #{label}; their body dependencies are left out:|]
+                            : [[i|  #{name}: #{reason}|] | (name, reason) <- skipped]
+             in (edges <> bodyEdges, notes)
 
 
-bodyChecks :: Scope -> Connection.Connection -> Map ObjectKey Text -> IO (Map ObjectKey BodyCheck)
-bodyChecks scope conn schema
-    | scope.checkFunctionBodies = checkBodies conn schema
+-- | Connections per database; the describe queries run over all of them at once.
+describeConnections :: Int
+describeConnections = 4
+
+
+-- | A database's schema over 'describeConnections' connections, and its edges when
+-- @withEdges@. Keeps one connection open and returns it.
+readDatabase :: Text -> Scope -> Text -> Bool -> IO (Connection.Connection, Schema, [Edge], [Text])
+readDatabase label scope db withEdges = do
+    (conn, extra) <- concurrently (connect db) (replicateConcurrently (describeConnections - 1) (connect db))
+    (schema, addresses) <- describeOn (conn : extra) scope.excluded scope.includePartitions Nothing
+    (edges, notes) <- if withEdges then edgesOf label scope conn extra addresses else pure ([], [])
+    for_ extra Connection.release
+    pure (conn, schema, edges, notes)
+
+
+-- | Reads both databases at the same time; the edges of @--to@ only when @toEdges@.
+readBoth :: Scope -> Text -> Text -> Bool -> IO ((Schema, [Edge]), (Connection.Connection, Schema, [Edge]))
+readBoth scope fromDb toDb toEdges = do
+    ((_, fromSchema, fromEdges, fromNotes), (toConn, toSchema, toEdges', toNotes)) <-
+        concurrently (readDatabase "--from" scope fromDb True) (readDatabase "--to" scope toDb toEdges)
+    for_ (fromNotes <> toNotes) (TIO.hPutStrLn stderr)
+    pure ((fromSchema, fromEdges), (toConn, toSchema, toEdges'))
+
+
+-- | Body checks for the definitions that are added or changed: no other check is consulted.
+bodyChecks :: Scope -> Connection.Connection -> Schema -> Schema -> IO (Map ObjectKey BodyCheck)
+bodyChecks scope conn fromSchema toSchema
+    | scope.checkFunctionBodies = checkBodies conn (Map.restrictKeys toSchema addedOrChanged)
     | otherwise = pure Map.empty
+  where
+    addedOrChanged = Map.keysSet (Map.filter (\case Dropped _ -> False; _ -> True) (diff (\_ a b -> a == b) fromSchema toSchema))
 
 
 data Command
@@ -95,20 +127,16 @@ main =
         $ O.execParser (O.info (commandParser O.<**> O.helper) O.fullDesc)
         >>= \case
             Describe db out replace scope -> do
-                conn <- connect db
-                schema <- describe conn scope.excluded scope.includePartitions
+                conns <- replicateConcurrently describeConnections (connect db)
+                (schema, _) <- describeOn conns scope.excluded scope.includePartitions Nothing
                 case out of
                     Just dir -> writeFolder replace dir schema
                     Nothing ->
                         for_ (Map.toList (Map.fromListWith (+) [(k.address.objectType, 1 :: Int) | k <- Map.keys schema])) \(kind, n) ->
                             TIO.putStrLn [i|#{n}\t#{kind}|]
             Diff fromDb toDb scope -> do
-                fromConn <- connect fromDb
-                toConn <- connect toDb
-                fromSchema <- describe fromConn scope.excluded scope.includePartitions
-                toSchema <- describe toConn scope.excluded scope.includePartitions
-                edges <- edgesOf "--from" scope fromConn
-                checks <- bodyChecks scope toConn toSchema
+                ((fromSchema, edges), (toConn, toSchema, _)) <- readBoth scope fromDb toDb False
+                checks <- bodyChecks scope toConn fromSchema toSchema
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     known = Set.fromList [k.address | k <- Map.keys fromSchema, k.aspect == Definition]
                     affectedBy = affected known edges changes
@@ -119,26 +147,16 @@ main =
                 TIO.putStrLn (summary changes)
                 unless (Map.null changes) $ exitWith (ExitFailure 1)
             Plan fromDb toDb scope -> do
-                fromConn <- connect fromDb
-                toConn <- connect toDb
-                fromSchema <- describe fromConn scope.excluded scope.includePartitions
-                toSchema <- describe toConn scope.excluded scope.includePartitions
-                fromEdges <- edgesOf "--from" scope fromConn
-                toEdges <- edgesOf "--to" scope toConn
-                checks <- bodyChecks scope toConn toSchema
+                ((fromSchema, fromEdges), (toConn, toSchema, toEdges)) <- readBoth scope fromDb toDb True
+                checks <- bodyChecks scope toConn fromSchema toSchema
                 let steps = plan checks fromSchema toSchema fromEdges toEdges (diff (sameDefinition checks) fromSchema toSchema)
                 for_ steps (TIO.putStrLn . renderStep)
             Sqitch fromDb toDb scope opts -> do
                 unless opts.dryRun requireSqitch
                 sqitchPlan <- readPlan (opts.projectDir </> opts.planFile)
-                fromConn <- connect fromDb
-                toConn <- connect toDb
-                fromSchema <- describe fromConn scope.excluded scope.includePartitions
-                toSchema <- describe toConn scope.excluded scope.includePartitions
-                fromEdges <- edgesOf "--from" scope fromConn
-                toEdges <- edgesOf "--to" scope toConn
+                ((fromSchema, fromEdges), (toConn, toSchema, toEdges)) <- readBoth scope fromDb toDb True
                 now <- getCurrentTime
-                checks <- bodyChecks scope toConn toSchema
+                checks <- bodyChecks scope toConn fromSchema toSchema
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     steps = plan checks fromSchema toSchema fromEdges toEdges changes
                     inverseCtx = context Map.empty toSchema fromSchema toEdges (Map.map invert changes)
@@ -201,7 +219,7 @@ main =
 -- | A file as it is at a jj revision.
 jjShow :: FilePath -> Text -> FilePath -> IO Text
 jjShow root rev path = do
-    (code, out, err) <- readProcess (setWorkingDir root (proc "jj" ["file", "show", "-r", T.unpack rev, path]))
+    (code, out, err) <- readProcess (setWorkingDir root (proc "jj" ["--ignore-working-copy", "file", "show", "-r", T.unpack rev, path]))
     case code of
         ExitSuccess -> pure (decodeUtf8Lenient (toStrictBytes out))
         ExitFailure _ -> failWith ("jj file show -r " <> rev <> " " <> T.pack path <> ": " <> decodeUtf8Lenient (toStrictBytes err))

@@ -2,6 +2,7 @@ select
     'pg_type'::regclass::oid as classid,
     t.oid as objid,
     0 as objsubid,
+    null::oid as relid,
     case t.typtype
         when 'e' then
             'enum ('

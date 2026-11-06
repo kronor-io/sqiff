@@ -2,6 +2,7 @@ select
     'pg_class'::regclass::oid as classid,
     s.seqrelid as objid,
     0 as objsubid,
+    s.seqrelid as relid,
     concat_ws(
         ' ',
         'as ' || format_type(s.seqtypid, null),

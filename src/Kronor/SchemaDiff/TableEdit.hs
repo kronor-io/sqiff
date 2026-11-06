@@ -18,7 +18,7 @@ import Hasql.Encoders qualified as E
 import Hasql.Errors qualified as Errors
 import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, describe, failWith)
+import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, describeOn, failWith)
 import Kronor.SchemaDiff.Diff (Change (..), diff)
 import Kronor.SchemaDiff.Object
 import RIO
@@ -72,7 +72,7 @@ compareTable conn baseline table statements = do
                     script "rollback to savepoint schema_diff_base"
                     pure built
                 LiveTable _ -> do
-                    schema <- describe conn [] False
+                    schema <- describeTable (QName aside table.name)
                     pure (Map.fromList [(moveBack k, restore def) | (k, def) <- Map.toList schema, belongsTo (QName aside table.name) k def])
             desired <- build xact "as edited" statements
             pure (current, desired)
@@ -101,12 +101,14 @@ compareTable conn baseline table statements = do
             after <- currentXact
             when (after /= xact)
                 $ failWith ("statement " <> tshow n <> " of the file " <> label <> " ended the transaction the comparison runs in")
-        schema <- describe conn [] False
+        schema <- describeTable table
         pure (Map.fromList [(k, def) | (k, def) <- Map.toList schema, belongsTo table k def])
 
     currentXact =
         Connection.use conn (Session.statement () (Statement.unpreparable "select pg_current_xact_id()::text" E.noParams (D.singleRow (D.column (D.nonNullable D.text)))))
             >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
+
+    describeTable q = fst <$> describeOn [conn] [] False (Just (qualified q))
 
     ownedSequences =
         Statement.unpreparable

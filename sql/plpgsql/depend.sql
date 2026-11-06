@@ -1,13 +1,11 @@
--- What the bodies of the functions in $1 use, as plpgsql_check's static analysis sees it.
--- $2 holds each function's trigger table, null for other functions. @extschema@ is
--- replaced with plpgsql_check's schema.
+-- What the bodies of the functions in $1 use, as plpgsql_check's static analysis sees it,
+-- as (function, class id, object id). $2 holds each function's trigger table, null for
+-- other functions. @extschema@ is replaced with plpgsql_check's schema.
 with f as (
     select u.oid::oid as oid, u.relid::oid as relid
     from unnest($1::int8[], $2::int8[]) u(oid, relid)
 )
-select distinct
-    a.type, a.object_names, a.object_args,
-    b.type, b.object_names, b.object_args
+select distinct f.oid::int8, k.classid::int8, d.oid::int8
 from f
 cross join lateral (
     select d.type, d.oid
@@ -26,10 +24,6 @@ cross join lateral (
         when 'TYPE' then 'pg_type'::regclass::oid
     end as classid
 ) k
-cross join lateral pg_identify_object_as_address('pg_proc'::regclass, f.oid, 0) a
-cross join lateral pg_identify_object_as_address(k.classid, d.oid, 0) b
-cross join lateral pg_identify_object(k.classid, d.oid, 0) ib
 where k.classid is not null
     and d.oid >= 16384
     and (k.classid, d.oid) <> ('pg_proc'::regclass::oid, f.oid)
-    and not coalesce(ib.schema = any($3), false)

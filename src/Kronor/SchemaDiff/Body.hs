@@ -40,7 +40,10 @@ data BodyCheck
 -- check ends in 'DoesNotParse' with the server's reason.
 checkBodies :: Connection.Connection -> Map ObjectKey Text -> IO (Map ObjectKey BodyCheck)
 checkBodies conn schema = qualifiedNames conn do
-    candidates <- run (Statement.unpreparable sqlBodies E.noParams (D.rowList row)) ()
+    candidates <-
+        if any (\k -> k.address.objectType `elem` ["function", "procedure"]) (Map.keys schema)
+            then run (Statement.unpreparable sqlBodies E.noParams (D.rowList row)) ()
+            else pure []
     fmap Map.fromList . for [(k, def) | (names, args, kind) <- candidates, let { k = key names args kind }, Just def <- [Map.lookup k schema]] $ \(k, def) -> do
         printed <- reprint k def
         check <- case printed of
