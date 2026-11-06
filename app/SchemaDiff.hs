@@ -11,7 +11,7 @@ import Data.Text.IO qualified as TIO
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
 import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), UserError (..), connect, dependencies, describe, failWith, render)
+import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), Edge, ObjectKey (..), UserError (..), bodyDependencies, connect, dependencies, describe, failWith, render)
 import Kronor.SchemaDiff.Diff (Change (..), affected, diff)
 import Kronor.SchemaDiff.Folder (writeFolder)
 import Kronor.SchemaDiff.Object (QName (..))
@@ -35,6 +35,23 @@ data Scope = Scope
     , includePartitions :: Bool
     , checkFunctionBodies :: Bool
     }
+
+
+-- | Edges from @pg_depend@ and, when plpgsql_check is installed, from PL/pgSQL bodies.
+-- @label@ names the database in notes on stderr.
+edgesOf :: Text -> Scope -> Connection.Connection -> IO [Edge]
+edgesOf label scope conn = do
+    edges <- dependencies conn scope.excluded
+    bodyDependencies conn scope.excluded >>= \case
+        Nothing -> do
+            TIO.hPutStrLn stderr "schema-diff: plpgsql_check is not installed; PL/pgSQL body dependencies are left out"
+            pure edges
+        Just (bodyEdges, skipped) -> do
+            unless (null skipped) do
+                let n = length skipped
+                TIO.hPutStrLn stderr [i|schema-diff: plpgsql_check could not analyse #{n} PL/pgSQL functions on #{label}; their body dependencies are left out:|]
+                for_ skipped \(name, reason) -> TIO.hPutStrLn stderr [i|  #{name}: #{reason}|]
+            pure (edges <> bodyEdges)
 
 
 bodyChecks :: Scope -> Connection.Connection -> Map ObjectKey Text -> IO (Map ObjectKey BodyCheck)
@@ -90,7 +107,7 @@ main =
                 toConn <- connect toDb
                 fromSchema <- describe fromConn scope.excluded scope.includePartitions
                 toSchema <- describe toConn scope.excluded scope.includePartitions
-                edges <- dependencies fromConn scope.excluded
+                edges <- edgesOf "--from" scope fromConn
                 checks <- bodyChecks scope toConn toSchema
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     known = Set.fromList [k.address | k <- Map.keys fromSchema, k.aspect == Definition]
@@ -106,8 +123,8 @@ main =
                 toConn <- connect toDb
                 fromSchema <- describe fromConn scope.excluded scope.includePartitions
                 toSchema <- describe toConn scope.excluded scope.includePartitions
-                fromEdges <- dependencies fromConn scope.excluded
-                toEdges <- dependencies toConn scope.excluded
+                fromEdges <- edgesOf "--from" scope fromConn
+                toEdges <- edgesOf "--to" scope toConn
                 checks <- bodyChecks scope toConn toSchema
                 let steps = plan checks fromSchema toSchema fromEdges toEdges (diff (sameDefinition checks) fromSchema toSchema)
                 for_ steps (TIO.putStrLn . renderStep)
@@ -118,8 +135,8 @@ main =
                 toConn <- connect toDb
                 fromSchema <- describe fromConn scope.excluded scope.includePartitions
                 toSchema <- describe toConn scope.excluded scope.includePartitions
-                fromEdges <- dependencies fromConn scope.excluded
-                toEdges <- dependencies toConn scope.excluded
+                fromEdges <- edgesOf "--from" scope fromConn
+                toEdges <- edgesOf "--to" scope toConn
                 now <- getCurrentTime
                 checks <- bodyChecks scope toConn toSchema
                 let changes = diff (sameDefinition checks) fromSchema toSchema

@@ -6,6 +6,7 @@ build-type:    Simple
 extra-source-files:
     sql/depend.sql
     sql/describe/*.sql
+    sql/plpgsql/*.sql
 
 common shared
     default-language: GHC2021

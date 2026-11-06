@@ -17,6 +17,8 @@ module Kronor.SchemaDiff.Catalog (
     connect,
     describe,
     dependencies,
+    Skipped,
+    bodyDependencies,
     render,
 ) where
 
@@ -33,8 +35,10 @@ import Hasql.Statement qualified as Statement
 import Pqi.Ffi qualified
 import RIO
 import RIO.FilePath (takeBaseName)
+import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Text qualified as T
+import RIO.Text.Partial qualified as TP
 
 
 data Aspect = Definition | Privileges
@@ -59,7 +63,8 @@ data ObjectKey = ObjectKey
 type Schema = Map ObjectKey Text
 
 
--- | @dependent@ needs @referenced@ to exist, as recorded in @pg_depend@.
+-- | @dependent@ needs @referenced@ to exist, as recorded in @pg_depend@ or seen in a
+-- PL/pgSQL body by plpgsql_check.
 data Edge = Edge
     { dependent :: Address
     , referenced :: Address
@@ -73,6 +78,14 @@ describeQueries = $(makeRelativeToProject "sql/describe" >>= embedDir)
 
 dependQuery :: ByteString
 dependQuery = $(makeRelativeToProject "sql/depend.sql" >>= embedFile)
+
+
+plpgsqlFunctionsQuery :: ByteString
+plpgsqlFunctionsQuery = $(makeRelativeToProject "sql/plpgsql/functions.sql" >>= embedFile)
+
+
+plpgsqlDependQuery :: ByteString
+plpgsqlDependQuery = $(makeRelativeToProject "sql/plpgsql/depend.sql" >>= embedFile)
 
 
 -- | A failure the command line reports as one line.
@@ -156,6 +169,47 @@ dependencies :: Connection.Connection -> [Text] -> IO [Edge]
 dependencies conn excluded =
     run conn excluded
         $ Statement.unpreparable (decodeUtf8Lenient dependQuery) excludedParam (D.rowList (Edge <$> addressRow <*> addressRow))
+
+
+-- | Functions plpgsql_check could not analyse, with the reason.
+type Skipped = [(Text, Text)]
+
+
+-- | What PL/pgSQL bodies use, from plpgsql_check; 'Nothing' when it is not installed.
+bodyDependencies :: Connection.Connection -> [Text] -> IO (Maybe ([Edge], Skipped))
+bodyDependencies conn excluded =
+    run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
+        >>= traverse \extSchema -> do
+            functions <- run conn excluded (Statement.unpreparable (decodeUtf8Lenient plpgsqlFunctionsQuery) excludedParam (D.rowList functionRow))
+            let (unchecked, checkable) = partitionEithers (map triggerTable functions)
+                query = TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlDependQuery)
+            (edges, failed) <- inBatches query checkable
+            pure (edges, unchecked <> failed)
+  where
+    functionRow = (,,,) <$> D.column (D.nonNullable D.int8) <*> textColumn <*> D.column (D.nonNullable D.bool) <*> D.column (D.nullable D.int8)
+    triggerTable (oid, name, isTrigger, relid)
+        | isTrigger && isNothing relid = Left (name, "no trigger uses it")
+        | otherwise = Right (oid, name, relid)
+
+    -- One query for all functions; a batch that fails is split until the failing functions stand alone.
+    inBatches _ [] = pure ([], [])
+    inBatches query batch =
+        Connection.use conn (Session.statement (batch, excluded) (Statement.unpreparable query dependParams (D.rowList (Edge <$> addressRow <*> addressRow))))
+            >>= \case
+                Right edges -> pure (edges, [])
+                Left (Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message _ _ _)))
+                    | [(_, name, _)] <- batch -> pure ([], [(name, message)])
+                    | otherwise -> do
+                        let (left, right) = L.splitAt (length batch `div` 2) batch
+                        (e1, s1) <- inBatches query left
+                        (e2, s2) <- inBatches query right
+                        pure (e1 <> e2, s1 <> s2)
+                Left e -> failWith ("query failed: " <> tshow e)
+
+    dependParams =
+        contramap (map (\(oid, _, _) -> oid) . fst) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int8))))
+            <> contramap (map (\(_, _, relid) -> relid) . fst) (E.param (E.nonNullable (E.foldableArray (E.nullable E.int8))))
+            <> contramap snd excludedParam
 
 
 render :: Address -> Text
