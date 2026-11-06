@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Compares the table a deploy file creates before and after an edit, or the live table
@@ -11,6 +12,7 @@ module Kronor.SchemaDiff.TableEdit (
     compareTable,
 ) where
 
+import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import Hasql.Connection qualified as Connection
 import Hasql.Decoders qualified as D
@@ -55,14 +57,14 @@ compareTable conn baseline table statements = do
             script "begin"
             xact <- currentXact
             script "set local lock_timeout = '5s'"
-            exists <- script' ("select 1 from pg_class where oid = to_regclass(" <> literal (qualified table) <> ")")
+            exists <- script' [i|select 1 from pg_class where oid = to_regclass(#{literal (qualified table)})|]
             unless exists $ failWith (qualified table <> " does not exist yet; a new table only needs its own change")
             -- Owned sequences would move with the table; the ones the files name stay.
             owned <-
                 Connection.use conn (Session.statement () ownedSequences)
                     >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
             for_ (filter (\s -> any (s `T.isInfixOf`) (statements <> baseStatements)) owned) \s ->
-                script ("alter sequence " <> quoteIdent table.schema <> "." <> quoteIdent s <> " owned by none")
+                script [i|alter sequence #{tableSchemaRef}#{quoteIdent s} owned by none|]
             script ("create schema " <> aside)
             script ("alter table " <> qualified table <> " set schema " <> aside)
             current <- case baseline of
@@ -112,13 +114,12 @@ compareTable conn baseline table statements = do
 
     ownedSequences =
         Statement.unpreparable
-            ( "select s.relname::text from pg_class s \
-              \join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = s.oid and d.deptype = 'a' \
-              \join pg_class t on t.oid = d.refobjid \
-              \where s.relkind = 'S' and t.oid = to_regclass("
-                <> literal (qualified table)
-                <> ")"
-            )
+            [i|
+                select s.relname::text from pg_class s
+                join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = s.oid and d.deptype = 'a'
+                join pg_class t on t.oid = d.refobjid
+                where s.relkind = 'S' and t.oid = to_regclass(#{literal (qualified table)})
+            |]
             E.noParams
             (D.rowList (D.column (D.nonNullable D.text)))
 
@@ -127,11 +128,13 @@ compareTable conn baseline table statements = do
         Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message detail _ _)) -> message <> maybe "" ("; " <>) detail
         e -> tshow e
 
+    script' :: Text -> IO Bool
     script' sql = do
-        result <- Connection.use conn (Session.script ("do $$ begin if not exists (" <> sql <> ") then raise exception 'missing'; end if; end $$"))
+        result <- Connection.use conn (Session.script [i|do $$ begin if not exists (#{sql}) then raise exception 'missing'; end if; end $$|])
         pure (isRight result)
 
-    literal t = "'" <> T.replace "'" "''" t <> "'"
+    literal :: Text -> Text
+    literal t = [i|'#{T.replace "'" "''" t}'|]
 
     asideRef = quoteIdent aside <> "."
     tableSchemaRef = quoteIdent table.schema <> "."
@@ -144,7 +147,7 @@ compareTable conn baseline table statements = do
 
     belongsTo q k def = case fromAddress k.address of
         Table t -> t == q
-        Index _ -> any (`T.isInfixOf` def) [" ON " <> qualified q <> " ", " ON ONLY " <> qualified q <> " "]
+        Index _ -> any (`T.isInfixOf` def) [[i| ON #{qualified q} |], [i| ON ONLY #{qualified q} |]]
         Sequence _ -> False
         o -> owningTable o == Just q
 

@@ -211,7 +211,7 @@ main =
                             alreadyReworked = entries sqitchPlan > entries basePlan
                         writeUnits root opts.top sqitchPlan tagName written
                         unless alreadyReworked
-                            $ reworkEdited root opts.top sqitchPlan tagName changeName ("schema-diff: " <> changeName <> " as edited") original
+                            $ reworkEdited root opts.top sqitchPlan tagName changeName [i|schema-diff: #{changeName} as edited|] original
                         for_ written \u -> TIO.putStrLn ("added " <> u.changeName)
                         TIO.putStrLn (if alreadyReworked then "already reworked on this branch: " <> changeName else "reworked " <> changeName)
 

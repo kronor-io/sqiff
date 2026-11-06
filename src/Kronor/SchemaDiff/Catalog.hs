@@ -271,7 +271,7 @@ render addr = addr.objectType <> " " <> T.intercalate "." addr.objectNames <> ar
   where
     args
         | null addr.objectArgs = ""
-        | otherwise = "(" <> T.intercalate ", " addr.objectArgs <> ")"
+        | otherwise = let list = T.intercalate ", " addr.objectArgs in [i|(#{list})|]
 
 
 run :: Connection.Connection -> params -> Statement.Statement params a -> IO a

@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Functions with SQL-standard bodies keep no source text, and their printed text does
@@ -12,6 +13,7 @@ module Kronor.SchemaDiff.Body (
 ) where
 
 import Data.Functor.Contravariant (contramap)
+import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import Hasql.Connection qualified as Connection
 import Hasql.Decoders qualified as D
@@ -103,7 +105,7 @@ checkBodies conn schema = qualifiedNames conn do
 -- does not parse back.
 repair :: Text -> Maybe Text
 repair def =
-    let fixed = foldl' (\t n -> T.replace ("excluded_" <> tshow n <> ".") "excluded." t) def [1 :: Int .. 9]
+    let fixed = foldl' (\t n -> T.replace [i|excluded_#{n}.|] "excluded." t) def [1 :: Int .. 9]
      in if fixed == def then Nothing else Just fixed
 
 
