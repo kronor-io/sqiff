@@ -3,7 +3,12 @@ select
     c.oid as objid,
     0 as objsubid,
     case
-        when c.relkind in ('v', 'm') then pg_get_viewdef(c.oid)
+        when c.relkind in ('v', 'm') then
+            concat_ws(
+                E'\n',
+                case when c.reloptions is not null then 'with (' || array_to_string(c.reloptions, ', ') || ')' end,
+                pg_get_viewdef(c.oid)
+            )
         else concat_ws(
             E'\n',
             case when c.relpersistence = 'u' then 'unlogged' end,
@@ -17,11 +22,17 @@ select
             end,
             case when c.relrowsecurity then 'row level security' end,
             case when c.relforcerowsecurity then 'force row level security' end,
-            case when c.reloptions is not null then 'with (' || array_to_string(c.reloptions, ', ') || ')' end
+            case
+                when c.reloptions is not null or toast.reloptions is not null then
+                    'with ('
+                    || array_to_string(c.reloptions || array(select 'toast.' || o from unnest(toast.reloptions) o), ', ')
+                    || ')'
+            end
         )
     end as definition
 from pg_class c
 join pg_namespace n on n.oid = c.relnamespace
+left join pg_class toast on toast.oid = c.reltoastrelid
 where c.relkind in ('r', 'p', 'v', 'm')
     and n.nspname <> 'information_schema'
     and n.nspname !~ '^pg_'

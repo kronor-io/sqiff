@@ -95,11 +95,11 @@ quoteIdent t
     | otherwise = "\"" <> T.replace "\"" "\"\"" t <> "\""
   where
     simple = case T.uncons t of
-        Just (c, rest) -> (isAsciiLower c || c == '_') && T.all (\x -> isAsciiLower x || isDigit x || x == '_' || x == '$') rest
+        Just (c, rest) -> (isAsciiLower c || c == '_') && T.all (\x -> isAsciiLower x || isDigit x || x == '_') rest
         Nothing -> False
 
 
--- | PostgreSQL's reserved and type/function-name keywords.
+-- | The words @pg_get_keywords()@ lists with a category other than unreserved (PostgreSQL 18).
 reserved :: Set Text
 reserved =
     Set.fromList

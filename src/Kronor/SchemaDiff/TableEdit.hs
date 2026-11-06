@@ -53,6 +53,7 @@ compareTable conn baseline table statements = do
     (current, desired) <-
         ( do
             script "begin"
+            xact <- currentXact
             script "set local lock_timeout = '5s'"
             exists <- script' ("select 1 from pg_class where oid = to_regclass(" <> literal (qualified table) <> ")")
             unless exists $ failWith (qualified table <> " does not exist yet; a new table only needs its own change")
@@ -67,13 +68,13 @@ compareTable conn baseline table statements = do
             current <- case baseline of
                 BaseFile base -> do
                     script "savepoint schema_diff_base"
-                    built <- build "before the edit" base
+                    built <- build xact "before the edit" base
                     script "rollback to savepoint schema_diff_base"
                     pure built
                 LiveTable _ -> do
                     schema <- describe conn [] False
                     pure (Map.fromList [(moveBack k, restore def) | (k, def) <- Map.toList schema, belongsTo (QName aside table.name) k def])
-            desired <- build "as edited" statements
+            desired <- build xact "as edited" statements
             pure (current, desired)
         )
             `finally` void (Connection.use conn (Session.script "rollback"))
@@ -93,12 +94,19 @@ compareTable conn baseline table statements = do
         BaseFile base -> base
         LiveTable _ -> []
 
-    build label stmts = do
-        for_ (zip [1 :: Int ..] stmts) \(n, statement) ->
+    build xact label stmts = do
+        for_ (zip [1 :: Int ..] stmts) \(n, statement) -> do
             Connection.use conn (Session.script statement)
                 >>= either (\e -> failWith ("statement " <> tshow n <> " of the file " <> label <> " failed: " <> errorText e)) pure
+            after <- currentXact
+            when (after /= xact)
+                $ failWith ("statement " <> tshow n <> " of the file " <> label <> " ended the transaction the comparison runs in")
         schema <- describe conn [] False
         pure (Map.fromList [(k, def) | (k, def) <- Map.toList schema, belongsTo table k def])
+
+    currentXact =
+        Connection.use conn (Session.statement () (Statement.unpreparable "select pg_current_xact_id()::text" E.noParams (D.singleRow (D.column (D.nonNullable D.text)))))
+            >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
 
     ownedSequences =
         Statement.unpreparable

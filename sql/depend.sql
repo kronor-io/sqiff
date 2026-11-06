@@ -82,5 +82,5 @@ cross join lateral pg_identify_object_as_address(edge.classid, edge.objid, edge.
 cross join lateral pg_identify_object_as_address(edge.refclassid, edge.refobjid, edge.refobjsubid) b
 cross join lateral pg_identify_object(edge.classid, edge.objid, edge.objsubid) ia
 cross join lateral pg_identify_object(edge.refclassid, edge.refobjid, edge.refobjsubid) ib
-where not coalesce(ia.schema = any($1), false)
-    and not coalesce(ib.schema = any($1), false)
+where not coalesce(coalesce(ia.schema, case when a.type in ('trigger', 'policy') then a.object_names[1] end) = any($1), false)
+    and not coalesce(coalesce(ib.schema, case when b.type in ('trigger', 'policy') then b.object_names[1] end) = any($1), false)

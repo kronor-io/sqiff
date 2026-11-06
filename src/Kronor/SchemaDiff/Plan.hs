@@ -24,7 +24,7 @@ plan checks fromSchema toSchema fromEdges toEdges changes =
         $ L.sortOn
             fst
             [ ((s.phase, s.rank, position s, n), s)
-            | (n, s) <- zip [0 :: Int ..] (concatMap (uncurry (recipe (context checks fromSchema toSchema changes))) (Map.toList changes))
+            | (n, s) <- zip [0 :: Int ..] (concatMap (uncurry (recipe (context checks fromSchema toSchema fromEdges changes))) (Map.toList changes))
             ]
   where
     stepObjects = Set.fromList [fromAddress k.address | k <- Map.keys changes]
@@ -40,11 +40,21 @@ plan checks fromSchema toSchema fromEdges toEdges changes =
     position s = Map.findWithDefault maxBound s.object (if s.phase == DropPhase then dropOrder else createOrder)
 
 
--- | @checks@ were made against @toSchema@'s definitions.
-context :: Map ObjectKey BodyCheck -> Schema -> Schema -> Map ObjectKey Change -> Context
-context checks fromSchema toSchema changes =
+-- | @checks@ were made against @toSchema@'s definitions; @fromEdges@ come from the
+-- database being changed.
+context :: Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> Map ObjectKey Change -> Context
+context checks fromSchema toSchema fromEdges changes =
     Context
         { bodyChecks = Map.intersectionWith (,) toSchema checks
+        , withDependents = Set.fromList [fromAddress e.referenced | e <- fromEdges]
+        , recreatedViews =
+            Map.fromList
+                [ (v, (indexesOn v, (\def -> (grantsKey, def)) <$> Map.lookup grantsKey toSchema))
+                | (k, Changed _ _) <- Map.toList changes
+                , k.aspect == Definition
+                , MaterializedView v <- [fromAddress k.address]
+                , let grantsKey = k{aspect = Privileges}
+                ]
         , newTables = tablesWith isAdded
         , droppedTables = tablesWith isDropped
         , partitionedTables =
@@ -63,6 +73,14 @@ context checks fromSchema toSchema changes =
         }
   where
     definitions = [(fromAddress k.address, change) | (k, change) <- Map.toList changes, k.aspect == Definition]
+    indexesOn v =
+        [ def
+        | (k, def) <- Map.toList toSchema
+        , k.aspect == Definition
+        , Index _ <- [fromAddress k.address]
+        , k `Map.notMember` changes
+        , (" ON " <> qualified v <> " ") `T.isInfixOf` def
+        ]
     tablesWith p = Set.fromList [t | (Table t, change) <- definitions, p change]
     isAdded = \case Added _ -> True; _ -> False
     isDropped = \case Dropped _ -> True; _ -> False

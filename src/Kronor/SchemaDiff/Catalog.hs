@@ -17,6 +17,7 @@ module Kronor.SchemaDiff.Catalog (
     connect,
     describe,
     dependencies,
+    qualifiedNames,
     Skipped,
     bodyDependencies,
     render,
@@ -116,7 +117,7 @@ connect conninfo =
 -- | Every object outside system schemas, extension members and the excluded schemas.
 -- Partitions and their columns only when asked for.
 describe :: Connection.Connection -> [Text] -> Bool -> IO Schema
-describe conn excluded includePartitions = Map.unions <$> traverse describeOne describeQueries
+describe conn excluded includePartitions = qualifiedNames conn (Map.unions <$> traverse describeOne describeQueries)
   where
     describeOne (file, body) = do
         rows <-
@@ -157,6 +158,7 @@ describe conn excluded includePartitions = Map.unions <$> traverse describeOne d
                 and not coalesce(
                     coalesce(
                         (select ident.schema from pg_identify_object(o.classid, o.objid, o.objsubid) ident),
+                        (select n.nspname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = owner.relid),
                         case when a.type = 'schema' then a.object_names[1] end
                     ) = any($1),
                     false
@@ -167,8 +169,20 @@ describe conn excluded includePartitions = Map.unions <$> traverse describeOne d
 
 dependencies :: Connection.Connection -> [Text] -> IO [Edge]
 dependencies conn excluded =
-    run conn excluded
+    qualifiedNames conn
+        . run conn excluded
         $ Statement.unpreparable (decodeUtf8Lenient dependQuery) excludedParam (D.rowList (Edge <$> addressRow <*> addressRow))
+
+
+-- | Runs @action@ with an empty @search_path@, so that names printed by the catalog
+-- functions are schema-qualified whatever the session's path is.
+qualifiedNames :: Connection.Connection -> IO a -> IO a
+qualifiedNames conn action = do
+    previous <- run conn () (Statement.unpreparable "select current_setting('search_path')" mempty (D.singleRow textColumn))
+    void (run conn "" setPath)
+    action `finally` void (Connection.use conn (Session.statement previous setPath))
+  where
+    setPath = Statement.unpreparable "select set_config('search_path', $1, false)" (E.param (E.nonNullable E.text)) (D.singleRow textColumn)
 
 
 -- | Functions plpgsql_check could not analyse, with the reason.
@@ -178,7 +192,8 @@ type Skipped = [(Text, Text)]
 -- | What PL/pgSQL bodies use, from plpgsql_check; 'Nothing' when it is not installed.
 bodyDependencies :: Connection.Connection -> [Text] -> IO (Maybe ([Edge], Skipped))
 bodyDependencies conn excluded =
-    run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
+    qualifiedNames conn
+        $ run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
         >>= traverse \extSchema -> do
             functions <- run conn excluded (Statement.unpreparable (decodeUtf8Lenient plpgsqlFunctionsQuery) excludedParam (D.rowList functionRow))
             let (unchecked, checkable) = partitionEithers (map triggerTable functions)

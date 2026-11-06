@@ -141,7 +141,7 @@ main =
                 checks <- bodyChecks scope toConn toSchema
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     steps = plan checks fromSchema toSchema fromEdges toEdges changes
-                    inverseCtx = context Map.empty toSchema fromSchema (Map.map invert changes)
+                    inverseCtx = context Map.empty toSchema fromSchema toEdges (Map.map invert changes)
                     written = units True inverseCtx sqitchPlan now steps
                     tagName = fromMaybe (T.pack (formatTime defaultTimeLocale "%Y-%m-%d" now) <> "_schema_diff") opts.tag
                 if opts.dryRun
@@ -162,7 +162,7 @@ main =
                 table <- case T.split (== '/') changeName of
                     [s, "table", t] | not ("@" `T.isInfixOf` t) -> pure (QName s t)
                     _ -> failWith (T.pack file <> " is not a table's own deploy file (<schema>/table/<name>.sql)")
-                let parse label = either (\e -> failWith (T.pack file <> label <> ": " <> e)) (pure . withoutTransactionControl) . splitStatements
+                let parse label = either (\e -> failWith (T.pack file <> label <> ": " <> e)) pure . (withoutTransactionControl <=< splitStatements)
                 statements <- parse "" =<< readFileUtf8 absFile
                 original <- jjShow root opts.base (makeRelative root absFile)
                 baseline <-
@@ -186,7 +186,7 @@ main =
                         sqitchPlan <- readPlan (root </> opts.planPath)
                         basePlan <- parsePlan <$> jjShow root opts.base opts.planPath
                         now <- getCurrentTime
-                        let inverseCtx = context Map.empty edit.desired edit.current (Map.map invert edit.changes)
+                        let inverseCtx = context Map.empty edit.desired edit.current [] (Map.map invert edit.changes)
                             written = units False inverseCtx sqitchPlan now steps
                             tagName = fromMaybe (T.pack (formatTime defaultTimeLocale "%Y-%m-%d" now) <> "_schema_diff") opts.tableTag
                             entries p = length (filter (== changeName) p.changes)

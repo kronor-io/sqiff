@@ -4,14 +4,13 @@
 -- | Splits a deploy script into statements, so it can run inside a transaction of ours.
 module Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl) where
 
-import Data.Char (isAlphaNum, isDigit, isSpace, toLower)
+import Data.Char (isAlphaNum, isAsciiUpper, isDigit, isSpace, toLower)
 import Data.Text qualified as T
 import RIO
 import RIO.List qualified as L
-import RIO.Set qualified as Set
 
 
-data Mode = Plain | Single | Double | Dollar String | LineComment | BlockComment Int
+data Mode = Plain | Single | Escaped | Double | Dollar String | LineComment | BlockComment Int
     deriving stock (Eq)
 
 
@@ -30,13 +29,16 @@ splitStatements = go Plain "" False "" Nothing 0 [] . T.unpack
         (LineComment, []) -> go Plain cur hasCode word prev depth acc []
         (_, []) -> Left "a quote, dollar quote or comment is not closed"
         (Plain, c : rest)
-            | isWordChar c -> go Plain (c : cur) True (c : word) prev depth acc rest
+            | isWordChar c || (c == '$' && not (null word)) -> go Plain (c : cur) True (c : word) prev depth acc rest
             | otherwise ->
                 let (prev', depth') = finishWord word prev depth
                     prevAfter = if isSpace c then prev' else Nothing
                  in plain c rest prev' prevAfter depth'
         (Single, '\'' : '\'' : rest) -> go Single ('\'' : '\'' : cur) hasCode word prev depth acc rest
         (Single, '\'' : rest) -> go Plain ('\'' : cur) hasCode "" prev depth acc rest
+        (Escaped, '\\' : x : rest) -> go Escaped (x : '\\' : cur) hasCode word prev depth acc rest
+        (Escaped, '\'' : '\'' : rest) -> go Escaped ('\'' : '\'' : cur) hasCode word prev depth acc rest
+        (Escaped, '\'' : rest) -> go Plain ('\'' : cur) hasCode "" prev depth acc rest
         (Double, '"' : '"' : rest) -> go Double ('"' : '"' : cur) hasCode word prev depth acc rest
         (Double, '"' : rest) -> go Plain ('"' : cur) hasCode "" prev depth acc rest
         (Dollar tag, rest)
@@ -48,7 +50,9 @@ splitStatements = go Plain "" False "" Nothing 0 [] . T.unpack
         (_, c : rest) -> go mode (c : cur) hasCode word prev depth acc rest
       where
         plain c rest prev' prevAfter depth' = case c : rest of
-            '\'' : more -> go Single ('\'' : cur) True "" Nothing depth' acc more
+            '\'' : more
+                | map toLower word == "e" -> go Escaped ('\'' : cur) True "" Nothing depth' acc more
+                | otherwise -> go Single ('\'' : cur) True "" Nothing depth' acc more
             '"' : more -> go Double ('"' : cur) True "" Nothing depth' acc more
             '-' : '-' : more -> go LineComment ('-' : '-' : cur) hasCode "" prev' depth' acc more
             '/' : '*' : more -> go (BlockComment 1) ('*' : '/' : cur) hasCode "" prev' depth' acc more
@@ -60,15 +64,19 @@ splitStatements = go Plain "" False "" Nothing 0 [] . T.unpack
                 | not hasCode ->
                     let (line, afterLine) = break (== '\n') more
                         command = takeWhile isWordChar line
-                     in if command `elem` outputOnly
+                        psqlVariable = case words (drop (length command) line) of
+                            name : _ -> all (\x -> isAsciiUpper x || isDigit x || x == '_') name
+                            [] -> True
+                     in if command `elem` outputOnly || (command `elem` ["set", "unset"] && psqlVariable)
                             then go Plain cur hasCode "" Nothing depth' acc afterLine
                             else Left ("psql's \\" <> T.pack command <> " cannot run outside psql")
             _ -> go Plain (c : cur) (hasCode || not (isSpace c)) "" prevAfter depth' acc rest
 
     isWordChar c = isAlphaNum c || c == '_'
 
-    -- Meta-commands that only change psql's own output, safe to leave out.
-    outputOnly = ["pset", "o", "out", "echo", "qecho", "timing", "x", "set", "unset"]
+    -- Meta-commands that only change psql's own output, safe to leave out. @\\set@ and
+    -- @\\unset@ are too when they name one of psql's own upper-case variables.
+    outputOnly = ["pset", "o", "out", "echo", "qecho", "timing", "x"]
 
     -- The tag after the opening @$@, including the closing @$@.
     dollarTag more = case span isWordChar more of
@@ -91,24 +99,22 @@ splitStatements = go Plain "" False "" Nothing 0 [] . T.unpack
         | otherwise = acc
 
 
--- | Drops @BEGIN@, @COMMIT@ and the like, so the statements run in a transaction of ours.
-withoutTransactionControl :: [Text] -> [Text]
-withoutTransactionControl = filter (\s -> normal s `Set.notMember` control)
+-- | Drops @BEGIN@, @COMMIT@ and the like in all their forms, so the statements run in a
+-- transaction of ours. Savepoints stay; two-phase commit commands are refused.
+withoutTransactionControl :: [Text] -> Either Text [Text]
+withoutTransactionControl = fmap catMaybes . traverse classify
   where
-    normal = T.toLower . T.unwords . T.words . stripComments
-    stripComments = T.unlines . filter (not . ("--" `T.isPrefixOf`) . T.stripStart) . T.lines
-    control =
-        Set.fromList
-            [ "begin"
-            , "begin work"
-            , "begin transaction"
-            , "start transaction"
-            , "commit"
-            , "commit work"
-            , "commit transaction"
-            , "end"
-            , "end work"
-            , "end transaction"
-            , "rollback"
-            , "abort"
-            ]
+    classify s = case T.words (T.toLower (withoutComments s)) of
+        "prepare" : "transaction" : _ -> Left "PREPARE TRANSACTION cannot run inside a transaction of ours"
+        w : "prepared" : _ | w `elem` ["commit", "rollback"] -> Left (T.toUpper w <> " PREPARED cannot run inside a transaction of ours")
+        "rollback" : "to" : _ -> Right (Just s)
+        w : _ | w `elem` ["begin", "start", "commit", "end", "rollback", "abort"] -> Right Nothing
+        _ -> Right (Just s)
+
+    withoutComments = T.pack . strip (0 :: Int) . T.unpack
+    strip 0 ('-' : '-' : rest) = strip 0 (dropWhile (/= '\n') rest)
+    strip n ('/' : '*' : rest) = strip (n + 1) rest
+    strip n ('*' : '/' : rest) | n > 0 = ' ' : strip (n - 1) rest
+    strip 0 (ch : rest) = ch : strip 0 rest
+    strip n (_ : rest) = strip n rest
+    strip _ [] = []

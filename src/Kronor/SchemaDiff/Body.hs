@@ -18,7 +18,7 @@ import Hasql.Decoders qualified as D
 import Hasql.Encoders qualified as E
 import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), failWith)
+import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), failWith, qualifiedNames)
 import RIO
 import RIO.Map qualified as Map
 
@@ -39,7 +39,7 @@ data BodyCheck
 -- transactions, so it needs a database that accepts writes; on one that does not, every
 -- check ends in 'DoesNotParse' with the server's reason.
 checkBodies :: Connection.Connection -> Map ObjectKey Text -> IO (Map ObjectKey BodyCheck)
-checkBodies conn schema = do
+checkBodies conn schema = qualifiedNames conn do
     candidates <- run (Statement.unpreparable sqlBodies E.noParams (D.rowList row)) ()
     fmap Map.fromList . for [(k, def) | (names, args, kind) <- candidates, let { k = key names args kind }, Just def <- [Map.lookup k schema]] $ \(k, def) -> do
         printed <- reprint k def

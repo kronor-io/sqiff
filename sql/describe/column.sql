@@ -6,7 +6,15 @@ select
         E'\n',
         'type ' || format_type(a.atttypid, a.atttypmod),
         case when a.attcollation <> t.typcollation then 'collate ' || quote_ident(co.collname) end,
-        case when a.attnotnull then 'not null' end,
+        case
+            when nn.oid is not null then
+                'not null'
+                || case when nn.convalidated then '' else ' not valid' end
+                || case
+                    when starts_with(nn.conname, c.relname || '_') and nn.conname ~ '_not_null[0-9]*$' then ''
+                    else ' constraint ' || nn.conname
+                end
+        end,
         case a.attidentity
             when 'a' then 'identity always'
             when 'd' then 'identity by default'
@@ -15,6 +23,16 @@ select
             when 's' then 'generated stored ' || pg_get_expr(ad.adbin, ad.adrelid)
             when 'v' then 'generated virtual ' || pg_get_expr(ad.adbin, ad.adrelid)
             else 'default ' || pg_get_expr(ad.adbin, ad.adrelid)
+        end,
+        case
+            when exists (
+                select
+                from regexp_matches(pg_get_expr(ad.adbin, ad.adrelid), '([[:alpha:]_][[:alnum:]_$]*)\(', 'g') m
+                join pg_proc p on p.proname = m[1]
+                where a.attgenerated = '' and p.provolatile = 'v'
+            )
+                or (t.typtype = 'd' and exists (select from pg_constraint dc where dc.contypid = a.atttypid))
+                then 'rewrites the table when added'
         end
     ) as definition
 from pg_attribute a
@@ -23,6 +41,7 @@ join pg_namespace n on n.oid = c.relnamespace
 join pg_type t on t.oid = a.atttypid
 left join pg_collation co on co.oid = a.attcollation
 left join pg_attrdef ad on ad.adrelid = a.attrelid and ad.adnum = a.attnum
+left join pg_constraint nn on nn.conrelid = a.attrelid and nn.contype = 'n' and nn.conkey = array[a.attnum]
 where a.attnum > 0
     and not a.attisdropped
     and c.relkind in ('r', 'p')
