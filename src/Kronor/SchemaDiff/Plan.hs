@@ -1,10 +1,12 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Orders recipe steps: drops before creates, then by rank, then by dependencies.
 module Kronor.SchemaDiff.Plan (plan, context, invert, renderStep) where
 
+import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import Kronor.SchemaDiff.Body (BodyCheck)
 import Kronor.SchemaDiff.Catalog (Aspect (..), Edge (..), ObjectKey (..), Schema, render)
@@ -49,11 +51,11 @@ context checks fromSchema toSchema fromEdges changes =
         , withDependents = Set.fromList [fromAddress e.referenced | e <- fromEdges]
         , recreatedViews =
             Map.fromList
-                [ (v, (indexesOn v, (\def -> (grantsKey, def)) <$> Map.lookup grantsKey toSchema))
+                [ (v, (indexesOn v, (grantsKey,) <$> Map.lookup grantsKey toSchema))
                 | (k, Changed _ _) <- Map.toList changes
                 , k.aspect == Definition
-                , MaterializedView v <- [fromAddress k.address]
                 , let grantsKey = k{aspect = Privileges}
+                , MaterializedView v <- [fromAddress k.address]
                 ]
         , newTables = tablesWith isAdded
         , droppedTables = tablesWith isDropped
@@ -62,8 +64,8 @@ context checks fromSchema toSchema fromEdges changes =
                 [ t
                 | (k, def) <- Map.toList fromSchema <> Map.toList toSchema
                 , k.aspect == Definition
-                , Table t <- [fromAddress k.address]
                 , any ("partition by " `T.isPrefixOf`) (T.lines def)
+                , Table t <- [fromAddress k.address]
                 ]
         , droppedColumns = Set.fromList [(t, c) | (Column t c, Dropped _) <- definitions]
         , newTableColumns =
@@ -77,9 +79,9 @@ context checks fromSchema toSchema fromEdges changes =
         [ def
         | (k, def) <- Map.toList toSchema
         , k.aspect == Definition
-        , Index _ <- [fromAddress k.address]
         , k `Map.notMember` changes
-        , (" ON " <> qualified v <> " ") `T.isInfixOf` def
+        , [i| ON #{qualified v} |] `T.isInfixOf` def
+        , Index _ <- [fromAddress k.address]
         ]
     tablesWith p = Set.fromList [t | (Table t, change) <- definitions, p change]
     isAdded = \case Added _ -> True; _ -> False

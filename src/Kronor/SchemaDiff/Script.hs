@@ -1,10 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Splits a deploy script into statements, so it can run inside a transaction of ours.
 module Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl) where
 
 import Data.Char (isAlphaNum, isAsciiUpper, isDigit, isSpace, toLower)
+import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
 import RIO.List qualified as L
@@ -69,7 +71,7 @@ splitStatements = go Plain "" False "" Nothing 0 [] . T.unpack
                             [] -> True
                      in if command `elem` outputOnly || (command `elem` ["set", "unset"] && psqlVariable)
                             then go Plain cur hasCode "" Nothing depth' acc afterLine
-                            else Left ("psql's \\" <> T.pack command <> " cannot run outside psql")
+                            else Left [i|psql's \\#{command} cannot run outside psql|]
             _ -> go Plain (c : cur) (hasCode || not (isSpace c)) "" prevAfter depth' acc rest
 
     isWordChar c = isAlphaNum c || c == '_'

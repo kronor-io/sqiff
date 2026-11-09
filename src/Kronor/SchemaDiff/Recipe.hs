@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | One fixed recipe per kind of object and kind of change.
@@ -15,6 +16,7 @@ module Kronor.SchemaDiff.Recipe (
 ) where
 
 import Data.ByteString qualified as B
+import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import Kronor.SchemaDiff.Body (BodyCheck (..))
 import Kronor.SchemaDiff.Catalog (Address, Aspect (..), ObjectKey (..))
@@ -144,7 +146,7 @@ definition ctx key object change = case object of
         | t `Set.member` ctx.droppedTables -> []
         | otherwise -> tableConstraint t c
     DomainConstraint d c -> domainConstraint d c
-    Index i -> indexRecipe i
+    Index ix -> indexRecipe ix
     Sequence s -> sequenceRecipe s
     Type t -> type' t
     Routine kind q args -> routine kind q args
@@ -196,10 +198,11 @@ definition ctx key object change = case object of
       where
         columnList = case Map.findWithDefault [] t ctx.newTableColumns of
             [] -> ""
-            cols -> "\n" <> T.intercalate ",\n" ["    " <> quoteIdent c <> " " <> columnSql def | (c, def) <- cols] <> "\n"
+            cols -> [i|\n#{T.intercalate ",\n" (map columnLine cols)}\n|]
+        columnLine (c, def) = [i|    #{quoteIdent c} #{columnSql def}|]
         settings =
-            [createAt tableSettingsRank (Shared, []) ("alter table " <> qualified t <> " enable row level security") | "row level security" `elem` lines']
-                <> [createAt tableSettingsRank (Shared, []) ("alter table " <> qualified t <> " force row level security") | "force row level security" `elem` lines']
+            [createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} enable row level security|] | "row level security" `elem` lines']
+                <> [createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} force row level security|] | "force row level security" `elem` lines']
 
     alterTable t old new
         | partitioning old /= partitioning new = manual "partitioning changed"
@@ -219,11 +222,11 @@ definition ctx key object change = case object of
         newOptions = options new
         removedKeys = [k | o <- oldOptions, let k = T.takeWhile (/= '=') o, k `notElem` map (T.takeWhile (/= '=')) newOptions]
         storageOptions =
-            [ createAt tableSettingsRank (Shared, []) ("alter table " <> qualified t <> " set (" <> T.intercalate ", " newOptions <> ")")
+            [ createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} set (#{T.intercalate ", " newOptions})|]
             | not (null newOptions)
             , L.sort newOptions /= L.sort oldOptions
             ]
-                <> [ createAt tableSettingsRank (Shared, []) ("alter table " <> qualified t <> " reset (" <> T.intercalate ", " removedKeys <> ")")
+                <> [ createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} reset (#{T.intercalate ", " removedKeys})|]
                    | not (null removedKeys)
                    ]
 
@@ -241,8 +244,8 @@ definition ctx key object change = case object of
         Dropped _ -> [remove (Shared, [DeletesData]) (alter <> "drop column " <> quoteIdent c)]
         Changed old new -> alterColumn (parseColumn old) (parseColumn new)
       where
-        alter = "alter table " <> qualified t <> " "
-        col = alter <> "alter column " <> quoteIdent c <> " "
+        alter = [i|alter table #{qualified t} |]
+        col = [i|#{alter}alter column #{quoteIdent c} |]
         alterColumn old new =
             let typeChanged = old.colType /= new.colType || old.collation /= new.collation
                 defaultChanged = old.defaultExpr /= new.defaultExpr
@@ -258,51 +261,45 @@ definition ctx key object change = case object of
                         _ -> []
                     <> notNullSteps old new
                     <> case (old.identity, new.identity) of
-                        (Nothing, Just k) -> [create (Shared, []) (col <> "add generated " <> k <> " as identity")]
+                        (Nothing, Just k) -> [create (Shared, []) [i|#{col}add generated #{k} as identity|]]
                         (Just _, Nothing) -> [create (Shared, []) (col <> "drop identity")]
                         (Just a, Just b) | a /= b -> [create (Shared, []) (col <> "set generated " <> b)]
                         _ -> []
                     <> case (old.generated, new.generated) of
                         (Just (k, _), Just (k', e))
                             | k == k' && old.generated /= new.generated ->
-                                [create (Shared, [h | k == "stored", h <- [MayRewriteTable, LongLock]]) (col <> "set expression as (" <> e <> ")")]
+                                [create (Shared, [h | k == "stored", h <- [MayRewriteTable, LongLock]]) [i|#{col}set expression as (#{e})|]]
                         (a, b) | a /= b -> manual "generated column added or removed"
                         _ -> []
         notNullSteps old new = case (old.notNull, new.notNull) of
             (False, True) ->
-                create (Shared, []) (alter <> "add " <> named new <> "not null " <> quoteIdent c <> " not valid")
+                create (Shared, []) [i|#{alter}add #{named new}not null #{quoteIdent c} not valid|]
                     : [create (Own, []) (onNotNull new.notNullName "validate constraint") | new.notNullValid]
             (True, False) -> [create (Shared, []) (col <> "drop not null")]
             (True, True) ->
                 [ create (Shared, []) (onNotNull old.notNullName "rename constraint" <> " to " <> quoteIdent n)
                 | old.notNullName /= new.notNullName
-                , let n = fromMaybe (t.name <> "_" <> c <> "_not_null") new.notNullName
+                , let n = fromMaybe (T.concat [t.name, "_", c, "_not_null"]) new.notNullName
                 ]
                     <> case (old.notNullValid, new.notNullValid) of
                         (False, True) -> [create (Own, []) (onNotNull new.notNullName "validate constraint")]
                         (True, False) -> manual "a validated not null constraint cannot be made NOT VALID again"
                         _ -> []
             (False, False) -> []
-        named d = maybe "" (\n -> "constraint " <> quoteIdent n <> " ") d.notNullName
+        named d = maybe "" (\n -> [i|constraint #{quoteIdent n} |] :: Text) d.notNullName
         onNotNull name action = case name of
             Just n -> alter <> action <> " " <> quoteIdent n
             Nothing ->
-                "do $$ begin execute format("
-                    <> literal (T.replace "%" "%%" (alter <> action) <> " %I")
-                    <> ", (select conname from pg_constraint where conrelid = "
-                    <> literal (qualified t)
-                    <> "::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = "
-                    <> literal (qualified t)
-                    <> "::regclass and attname = "
-                    <> literal c
-                    <> ")])); end $$"
+                let command = literal [i|#{T.replace "%" "%%" (alter <> action)} %I|]
+                    tableLiteral = literal (qualified t)
+                 in [i|do $$ begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal c})])); end $$|]
 
     tableConstraint t c = case change of
         Added def -> addConstraint def
         Dropped _ -> [dropConstraint]
         Changed _ new -> dropConstraint : addConstraint new
       where
-        alterT = "alter table " <> qualified t <> " "
+        alterT = [i|alter table #{qualified t} |]
         dropConstraint =
             remove
                 (Shared, [MayFail "other objects depend on it, such as foreign keys; drop them first" | dependedOn])
@@ -317,7 +314,7 @@ definition ctx key object change = case object of
                 ]
             | Just (kind, cols) <- simpleKey def
             , not (t `Set.member` ctx.partitionedTables) =
-                [ create (None, [IndexBuild]) (concurrentBuild (QName t.schema c) ("create unique index concurrently " <> quoteIdent c <> " on " <> qualified t <> " (" <> cols <> ")"))
+                [ create (None, [IndexBuild]) (concurrentBuild (QName t.schema c) [i|create unique index concurrently #{quoteIdent c} on #{qualified t} (#{cols})|])
                 , create (Shared, []) (alterT <> "add constraint " <> quoteIdent c <> " " <> kind <> " using index " <> quoteIdent c)
                 ]
             | otherwise = [plain [LongLock, IndexBuild] def]
@@ -336,33 +333,34 @@ definition ctx key object change = case object of
         Dropped _ -> [remove (Shared, []) (alterD <> "drop constraint " <> quoteIdent c)]
         Changed _ new -> remove (Shared, []) (alterD <> "drop constraint " <> quoteIdent c) : add new
       where
-        alterD = "alter domain " <> d <> " "
+        alterD = [i|alter domain #{d} |]
         add def =
-            [ create (Shared, []) (alterD <> "add constraint " <> quoteIdent c <> " " <> def <> " NOT VALID")
+            [ create (Shared, []) [i|#{alterD}add constraint #{quoteIdent c} #{def} NOT VALID|]
             , create (Own, []) (alterD <> "validate constraint " <> quoteIdent c)
             ]
 
-    indexRecipe i = case change of
+    indexRecipe ix = case change of
         Added def -> addIndex def
         Dropped def
             | indexTable def `elem` map (Just . qualified) (Set.toList ctx.droppedTables) -> []
-            | onOnly def -> [remove (Shared, [LongLock]) ("drop index " <> qualified i)]
-            | otherwise -> [remove (None, []) ("drop index concurrently " <> qualified i)]
+            | onOnly def -> [remove (Shared, [LongLock]) ("drop index " <> qualified ix)]
+            | otherwise -> [remove (None, []) ("drop index concurrently " <> qualified ix)]
         Changed old new
-            | onOnly new || onOnly old -> remove (Shared, [LongLock]) ("drop index " <> qualified i) : addIndex new
+            | onOnly new || onOnly old -> remove (Shared, [LongLock]) ("drop index " <> qualified ix) : addIndex new
             | otherwise ->
-                let tmp = takeBytes 59 i.name <> "_new"
+                let tmp = takeBytes 59 ix.name <> "_new"
+                    oldName = quoteIdent ix.name
                  in [ create
                         (None, [IndexBuild])
-                        (concurrentBuild (QName i.schema tmp) (T.replace (" INDEX " <> quoteIdent i.name <> " ON ") (" INDEX CONCURRENTLY " <> quoteIdent tmp <> " ON ") new))
-                    , create (None, []) ("drop index concurrently " <> qualified i)
-                    , create (Shared, []) ("alter index " <> qualified (QName i.schema tmp) <> " rename to " <> quoteIdent i.name)
+                        (concurrentBuild (QName ix.schema tmp) (T.replace [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoteIdent tmp} ON |] new))
+                    , create (None, []) ("drop index concurrently " <> qualified ix)
+                    , create (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
                     ]
       where
         addIndex def
             | onOnly def = [create (Shared, [LongLock, IndexBuild]) (T.replace " ON ONLY " " ON " def)]
             | indexTable def `elem` map (Just . qualified) (Set.toList ctx.newTables) = [create (Shared, []) def]
-            | otherwise = [create (None, [IndexBuild]) (concurrentBuild i (T.replace " INDEX " " INDEX CONCURRENTLY " def))]
+            | otherwise = [create (None, [IndexBuild]) (concurrentBuild ix (T.replace " INDEX " " INDEX CONCURRENTLY " def))]
         onOnly def = " ON ONLY " `T.isInfixOf` def
         indexTable def =
             let afterOn = T.drop 4 (snd (T.breakOn " ON " def))
@@ -412,8 +410,9 @@ definition ctx key object change = case object of
         Changed old new
             | take 2 (T.lines old) == take 2 (T.lines new) -> replaceRoutine new []
             | otherwise -> replaceRoutine new [MayFail "fails when the return type or argument names change; then drop and create it"]
-        Dropped _ -> [remove (Shared, []) ("drop " <> keyword <> " " <> qualified q <> "(" <> T.intercalate ", " args <> ")")]
+        Dropped _ -> [remove (Shared, []) [i|drop #{keyword} #{qualified q}(#{T.intercalate ", " args})|]]
       where
+        keyword :: Text
         keyword = case kind of
             Function -> "function"
             Procedure -> "procedure"
@@ -488,8 +487,8 @@ privileges key object change = case (target, change) of
         View t -> Just ("table " <> qualified t)
         MaterializedView t -> Just ("table " <> qualified t)
         Sequence s -> Just ("sequence " <> qualified s)
-        Routine Function q args -> Just ("function " <> qualified q <> "(" <> T.intercalate ", " args <> ")")
-        Routine Procedure q args -> Just ("procedure " <> qualified q <> "(" <> T.intercalate ", " args <> ")")
+        Routine Function q args -> Just [i|function #{qualified q}(#{T.intercalate ", " args})|]
+        Routine Procedure q args -> Just [i|procedure #{qualified q}(#{T.intercalate ", " args})|]
         Schema s -> Just ("schema " <> quoteIdent s)
         _ -> Nothing
     aclLines def = if def == "default" then Set.empty else Set.fromList (T.lines def)
@@ -526,7 +525,7 @@ parseColumn = foldl' add (ColumnDef "" Nothing False False Nothing Nothing Nothi
         | Just t <- T.stripPrefix "type " line = c{colType = t}
         | Just x <- T.stripPrefix "collate " line = c{collation = Just x}
         | Just x <- T.stripPrefix "not null" line =
-            let (valid, named) = maybe (True, x) (\rest -> (False, rest)) (T.stripPrefix " not valid" x)
+            let (valid, named) = maybe (True, x) (False,) (T.stripPrefix " not valid" x)
              in c{notNull = True, notNullValid = valid, notNullName = T.stripPrefix " constraint " named}
         | line == "rewrites the table when added" = c{rewritesOnAdd = True}
         | Just x <- T.stripPrefix "identity " line = c{identity = Just x}
@@ -542,8 +541,8 @@ columnSql c =
             [ Just c.colType
             , ("collate " <>) <$> c.collation
             , (\(kind, e) -> "generated always as (" <> e <> ") " <> kind) <$> c.generated
-            , (\kind -> "generated " <> kind <> " as identity") <$> c.identity
-            , if c.notNull then Just (maybe "" (\n -> "constraint " <> quoteIdent n <> " ") c.notNullName <> "not null") else Nothing
+            , (\kind -> [i|generated #{kind} as identity|]) <$> c.identity
+            , if c.notNull then Just (maybe "" (\n -> [i|constraint #{quoteIdent n} |]) c.notNullName <> "not null") else Nothing
             , ("default " <>) <$> c.defaultExpr
             ]
 
@@ -623,4 +622,4 @@ firstWithPrefix prefix = listToMaybe . mapMaybe (T.stripPrefix prefix)
 
 
 literal :: Text -> Text
-literal t = "'" <> T.replace "'" "''" t <> "'"
+literal t = [i|'#{T.replace "'" "''" t}'|]

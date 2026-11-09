@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Writes a schema as one file per object, for example
@@ -7,6 +8,7 @@
 module Kronor.SchemaDiff.Folder (writeFolder) where
 
 import Crypto.Hash qualified as Hash
+import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, failWith)
 import RIO
@@ -49,9 +51,9 @@ objectPath key = segment addr.objectType </> joinPath (map segment parents) </> 
     args
         | null addr.objectArgs = ""
         | T.length signature <= 120 = segment signature
-        | otherwise = "(" <> T.unpack (shortHash signature) <> ")"
+        | otherwise = [i|(#{shortHash signature})|]
       where
-        signature = "(" <> T.intercalate ", " addr.objectArgs <> ")"
+        signature = [i|(#{T.intercalate ", " (objectArgs addr)})|]
 
     extension = case key.aspect of
         Definition -> "sql"

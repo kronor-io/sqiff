@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Catalog addresses as one constructor per object kind, and the SQL names to use for them.
@@ -14,6 +15,7 @@ module Kronor.SchemaDiff.Object (
 ) where
 
 import Data.Char (isAsciiLower, isDigit)
+import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import Kronor.SchemaDiff.Catalog (Address (..))
 import RIO
@@ -92,7 +94,7 @@ qualified q = quoteIdent q.schema <> "." <> quoteIdent q.name
 quoteIdent :: Text -> Text
 quoteIdent t
     | simple && not (t `Set.member` reserved) = t
-    | otherwise = "\"" <> T.replace "\"" "\"\"" t <> "\""
+    | otherwise = [i|"#{T.replace "\"" "\"\"" t}"|]
   where
     simple = case T.uncons t of
         Just (c, rest) -> (isAsciiLower c || c == '_') && T.all (\x -> isAsciiLower x || isDigit x || x == '_') rest

@@ -102,7 +102,7 @@ compareTable conn baseline table statements = do
                 >>= either (\e -> failWith ("statement " <> tshow n <> " of the file " <> label <> " failed: " <> errorText e)) pure
             after <- currentXact
             when (after /= xact)
-                $ failWith ("statement " <> tshow n <> " of the file " <> label <> " ended the transaction the comparison runs in")
+                $ failWith [i|statement #{n} of the file #{label} ended the transaction the comparison runs in|]
         schema <- describeTable table
         pure (Map.fromList [(k, def) | (k, def) <- Map.toList schema, belongsTo table k def])
 

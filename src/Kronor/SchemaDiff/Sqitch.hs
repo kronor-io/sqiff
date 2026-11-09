@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Splits a plan into sqitch changes and writes them with sqitch's own commands.
@@ -17,6 +18,7 @@ module Kronor.SchemaDiff.Sqitch (
 ) where
 
 import Data.Char (isAsciiLower, isDigit)
+import Data.String.Interpolate qualified as S
 import Data.Text qualified as T
 import Data.Time (UTCTime, addUTCTime, defaultTimeLocale, formatTime)
 import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), failWith, render)
@@ -85,7 +87,7 @@ parsePlan text =
 -- Consecutive steps on the same table that can share a transaction share a change.
 -- With @conventional@ off, every step goes into a migration.
 units :: Bool -> Context -> SqitchPlan -> UTCTime -> [Step] -> [Unit]
-units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (claimReverts Set.empty (foldr merge [] (map single steps)))
+units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (claimReverts Set.empty (foldr (merge . single) [] steps))
   where
     existing = Set.fromList sqitchPlan.changes
 
@@ -101,11 +103,11 @@ units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (
     merge u rest = u : rest
 
     sharable s = s.txn == Shared
-    samePhase ss = length (L.nub (map (.phase) ss)) <= 1
+    samePhase ss = length (nubOrd (map (.phase) ss)) <= 1
 
     claimReverts _ [] = []
     claimReverts claimed (u : rest) =
-        let keys = L.nub [s.key | s <- u.deploy, s.key `Set.notMember` claimed]
+        let keys = nubOrd [s.key | s <- u.deploy, s.key `Set.notMember` claimed]
             inverse = concat [recipe inverseCtx k (invert c) | k <- reverse keys, Just c <- [lookup k [(s.key, s.change) | s <- u.deploy]]]
          in u{revert = if u.kind == ReworkChange then [] else inverse} : claimReverts (claimed <> Set.fromList keys) rest
 
@@ -218,10 +220,12 @@ writeUnits root topDir sqitchPlan tag us = do
         case u.kind of
             AddChange -> sqitch ["add", u.changeName, "-n", u.note]
             ReworkChange -> sqitch ["rework", u.changeName, "-n", u.note]
-        script "deploy" ("-- Deploy " <> sqitchPlan.project <> ":" <> u.changeName <> " to pg") u.deploy u
+        let project = sqitchPlan.project
+            name = u.changeName
+        script "deploy" [S.i|-- Deploy #{project}:#{name} to pg|] u.deploy u
         when (u.kind == AddChange) do
-            script "revert" ("-- Revert " <> sqitchPlan.project <> ":" <> u.changeName <> " from pg") u.revert u
-            writeFileUtf8 (scriptPath "verify" u) ("-- Verify " <> sqitchPlan.project <> ":" <> u.changeName <> " on pg\n\nBEGIN;\n\nROLLBACK;\n")
+            script "revert" [S.i|-- Revert #{project}:#{name} from pg|] u.revert u
+            writeFileUtf8 (scriptPath "verify" u) [S.i|-- Verify #{project}:#{name} on pg\n\nBEGIN;\n\nROLLBACK;\n|]
   where
     sqitch = runSqitch root
     scriptPath dir u = root </> topDir </> dir </> T.unpack u.changeName <.> "sql"
@@ -248,4 +252,4 @@ runSqitch root args = do
     code <- runProcess (setWorkingDir root (proc "sqitch" (map T.unpack args)))
     case code of
         ExitSuccess -> pure ()
-        ExitFailure n -> failWith ("sqitch " <> T.unwords args <> " failed with exit code " <> tshow n <> "; changes before it were written")
+        ExitFailure n -> failWith [S.i|sqitch #{T.unwords args} failed with exit code #{n}; changes before it were written|]
