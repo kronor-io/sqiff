@@ -19,9 +19,12 @@ module Kronor.SchemaDiff.Catalog (
     Addresses,
     describeOn,
     dependencies,
+    dependenciesOn,
     qualifiedNames,
     Skipped,
-    bodyDependencies,
+    bodyUses,
+    BodyUses,
+    edgesBetween,
     render,
 ) where
 
@@ -41,6 +44,7 @@ import RIO.FilePath (takeBaseName)
 import RIO.List (unzip3, zip3)
 import RIO.List qualified as L
 import RIO.Map qualified as Map
+import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import RIO.Text.Partial qualified as TP
 
@@ -141,17 +145,19 @@ describeOn conns excluded includePartitions onlyTable = do
             q : rest -> (rest, Just q)
         worker conn = next >>= maybe (pure []) (\q -> (:) <$> describeOne conn q <*> worker conn)
     parts <- concat <$> forConcurrently conns (\conn -> qualifiedNames conn (worker conn))
-    pure (Map.unions (map fst parts), Map.unions (map snd parts))
+    (,) <$> evaluate (Map.unions (map fst parts)) <*> evaluate (Map.unions (map snd parts))
   where
+    -- The rows are evaluated here, in the thread that decoded them: the callers read the
+    -- results from several threads at once.
     describeOne conn (file, body) = do
         rows <-
             run conn (excluded, includePartitions, onlyTable)
                 $ Statement.unpreparable (wrap (decodeUtf8Lenient body)) describeParams (D.rowList ((,,) <$> catalogIdRow <*> addressRow <*> textColumn))
+        _ <- evaluate (foldl' (\n (_, addr, def) -> n + T.length def + sum (map T.length (addr.objectType : addr.objectNames <> addr.objectArgs))) (0 :: Int) rows)
         let objectAspect = if takeBaseName file == "privileges" then Privileges else Definition
-        pure
-            ( Map.fromList [(ObjectKey objectAspect addr, def) | (_, addr, def) <- rows]
-            , Map.fromList [(ids, addr) | (ids, addr, _) <- rows]
-            )
+        (,)
+            <$> evaluate (Map.fromList [(ObjectKey objectAspect addr, def) | (_, addr, def) <- rows])
+            <*> evaluate (Map.fromList [(ids, addr) | (ids, addr, _) <- rows])
 
     -- Each query returns its objects' ids, the table they belong to as relid, and their definition.
     wrap body =
@@ -199,6 +205,23 @@ dependencies conn addresses = do
     pure (edgesBetween addresses (zip (zip3 c1 o1 s1) (zip3 c2 o2 s2)))
 
 
+-- | 'dependencies' limited to the edges whose referenced end is one of @targets@.
+dependenciesOn :: Connection.Connection -> Addresses -> [CatalogId] -> IO [Edge]
+dependenciesOn _ _ [] = pure []
+dependenciesOn conn addresses targets = do
+    (c1, o1, s1, c2, o2, s2) <-
+        run conn (unzip3 (Map.keys addresses), unzip3 targets)
+            $ Statement.unpreparable
+                (decodeUtf8Lenient dependOnQuery)
+                (contramap fst catalogIdsParams <> contramap snd catalogIdsParams)
+                (D.singleRow ((,,,,,) <$> int8Array <*> int8Array <*> int4Array <*> int8Array <*> int8Array <*> int4Array))
+    pure (edgesBetween addresses (zip (zip3 c1 o1 s1) (zip3 c2 o2 s2)))
+
+
+dependOnQuery :: ByteString
+dependOnQuery = $(makeRelativeToProject "sql/depend_on.sql" >>= embedFile)
+
+
 -- | The edges whose ends are both described.
 edgesBetween :: Addresses -> [(CatalogId, CatalogId)] -> [Edge]
 edgesBetween addresses pairs =
@@ -220,24 +243,45 @@ qualifiedNames conn action = do
 type Skipped = [(Text, Text)]
 
 
--- | What PL/pgSQL bodies use among the described objects, from plpgsql_check, with the
--- functions shared out over the connections; 'Nothing' when it is not installed.
-bodyDependencies :: NonEmpty Connection.Connection -> [Text] -> Addresses -> IO (Maybe ([Edge], Skipped))
-bodyDependencies conns@(conn :| _) excluded addresses =
+-- | Pairs of a function and what its body uses, and the functions not analysed.
+type BodyUses = ([(CatalogId, CatalogId)], Skipped)
+
+
+-- | What PL/pgSQL bodies use, from plpgsql_check, as catalog ids for 'edgesBetween';
+-- 'Nothing' when it is not installed. With @only@, analyses just the functions with those
+-- oids. Each connection takes the next few functions until none are left, the slowest
+-- first, so one slow function does not hold up the others.
+bodyUses :: NonEmpty Connection.Connection -> [Text] -> Maybe (Set Int64) -> IO (Maybe BodyUses)
+bodyUses conns@(conn :| _) excluded only =
     qualifiedNames conn
         $ run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
         >>= traverse \extSchema -> do
             functions <- run conn excluded (Statement.unpreparable (decodeUtf8Lenient plpgsqlFunctionsQuery) excludedParam (D.rowList functionRow))
-            let (unchecked, checkable) = partitionEithers (map triggerTable functions)
+            let (unchecked, allCheckable) = partitionEithers (map triggerTable functions)
+                checkable = maybe allCheckable (\oids -> [f | f@(oid, _, _) <- allCheckable, oid `Set.member` oids]) only
                 query = TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlDependQuery)
-                shares = [[f | (n, f) <- zip [0 :: Int ..] checkable, n `mod` length conns == k] | k <- [0 .. length conns - 1]]
-            results <- forConcurrently (zip (toList conns) shares) (\(c, share) -> inBatches c query share)
+                cost = Map.fromList [(oid, c) | (oid, _, _, _, c) <- functions]
+                costOf (oid, _, _) = Map.findWithDefault 0 oid cost
+                -- The slowest go first, each on its own, while the rest share the other connections.
+                (slow, fast) = L.partition ((> 0) . costOf) checkable
+            queue <- newIORef (map pure (L.sortOn (Down . costOf) slow) <> chunks fast)
+            let next = atomicModifyIORef' queue \case
+                    [] -> ([], Nothing)
+                    b : rest -> (rest, Just b)
+                worker c = next >>= maybe (pure []) (\b -> (:) <$> inBatches c query b <*> worker c)
+            results <- concat <$> forConcurrently (toList conns) worker
             let position = Map.fromList (zip [name | (_, name, _) <- checkable] [0 :: Int ..])
                 failed = L.sortOn (\(name, _) -> Map.lookup name position) (concatMap snd results)
             pure (concatMap fst results, unchecked <> failed)
   where
-    functionRow = (,,,) <$> D.column (D.nonNullable D.int8) <*> textColumn <*> D.column (D.nonNullable D.bool) <*> D.column (D.nullable D.int8)
-    triggerTable (oid, name, isTrigger, relid)
+    chunks xs = case L.splitAt batchSize xs of
+        ([], _) -> []
+        (b, rest) -> b : chunks rest
+
+    batchSize = 16
+
+    functionRow = (,,,,) <$> D.column (D.nonNullable D.int8) <*> textColumn <*> D.column (D.nonNullable D.bool) <*> D.column (D.nullable D.int8) <*> int8Column
+    triggerTable (oid, name, isTrigger, relid, _)
         | isTrigger && isNothing relid = Left (name, "no trigger uses it")
         | otherwise = Right (oid, name, relid)
 
@@ -246,7 +290,7 @@ bodyDependencies conns@(conn :| _) excluded addresses =
     inBatches c query batch =
         Connection.use c (Session.statement batch (Statement.unpreparable query dependParams (D.rowList useRow)))
             >>= \case
-                Right uses -> pure (edgesBetween addresses [((pgProc, f, 0), (k, o, 0)) | (f, k, o) <- uses], [])
+                Right uses -> pure ([((pgProc, f, 0), (k, o, 0)) | (f, k, o) <- uses], [])
                 Left (Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message _ _ _)))
                     | [(_, name, _)] <- batch -> pure ([], [(name, message)])
                     | otherwise -> do

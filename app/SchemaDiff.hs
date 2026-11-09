@@ -12,7 +12,7 @@ import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
 import Kronor.SchemaDiff.Baseline (ensureBaseline)
 import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
-import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge, ObjectKey (..), Schema, UserError (..), bodyDependencies, connect, dependencies, describeOn, failWith, render)
+import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), BodyUses, Edge, ObjectKey (..), Schema, UserError (..), bodyUses, connect, dependencies, dependenciesOn, describeOn, edgesBetween, failWith, render)
 import Kronor.SchemaDiff.Diff (Change (..), affected, diff)
 import Kronor.SchemaDiff.Folder (writeFolder)
 import Kronor.SchemaDiff.Object (QName (..))
@@ -39,14 +39,52 @@ data Scope = Scope
     }
 
 
+-- | Which edges a command uses.
+data Needed
+    = -- | Every edge.
+      AllEdges
+    | -- | Edges from @pg_depend@, and edges from the bodies of these functions only.
+      BodiesOf (Set Address)
+    | -- | None; plpgsql_check still lists the functions it cannot analyse.
+      NoEdges
+
+
+-- | The edges a command needs, given the objects that differ between the databases.
+-- @diff@ follows dependents of dropped and changed objects through every edge. @plan@
+-- orders steps by edges between objects in the diff, and asks only about constraints and
+-- indexes being depended on, which PL/pgSQL bodies never reference.
+neededFor :: Bool -> Map ObjectKey Change -> Needed
+neededFor forPlan changes
+    | Map.null changes = NoEdges
+    | forPlan = BodiesOf (Set.fromList [k.address | k <- Map.keys changes])
+    | any (\(k, c) -> k.aspect == Definition && removesOrChanges c) (Map.toList changes) = AllEdges
+    | otherwise = NoEdges
+  where
+    removesOrChanges = \case Added _ -> False; _ -> True
+
+
 -- | Edges from @pg_depend@ and, when plpgsql_check is installed, from PL/pgSQL bodies,
 -- with notes for stderr. @label@ names the database in the notes.
-edgesOf :: Text -> Scope -> Connection.Connection -> [Connection.Connection] -> Addresses -> IO ([Edge], [Text])
-edgesOf label scope conn extra addresses = do
+-- With @early@, the uses of every body were started before the database was described.
+edgesOf :: Text -> Scope -> Needed -> Connected -> Maybe (Async (Maybe BodyUses)) -> IO ([Edge], [Text])
+edgesOf label scope needed (Connected conn extra _ addresses) early = do
+    let wantedIds wanted = [ids | (ids, addr) <- Map.toList addresses, addr `Set.member` wanted]
+        only = case needed of
+            AllEdges -> Nothing
+            BodiesOf wanted -> Just (Set.fromList [oid | (classid, oid, _) <- wantedIds wanted, classid == pgProc])
+            NoEdges -> Just Set.empty
+        pgProc = 1255
+        uses = case (needed, early) of
+            (AllEdges, Just started) -> wait started
+            _ -> bodyUses (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded only
     (edges, body) <-
         concurrently
-            (dependencies conn addresses)
-            (bodyDependencies (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded addresses)
+            ( case needed of
+                AllEdges -> dependencies conn addresses
+                BodiesOf wanted -> dependenciesOn conn addresses (wantedIds wanted)
+                NoEdges -> pure []
+            )
+            (fmap (first (edgesBetween addresses)) <$> uses)
     pure case body of
         Nothing -> (edges, ["schema-diff: plpgsql_check is not installed; PL/pgSQL body dependencies are left out"])
         Just (bodyEdges, skipped) ->
@@ -64,33 +102,56 @@ describeConnections :: Int
 describeConnections = 4
 
 
--- | A database's schema over 'describeConnections' connections, and its edges when
--- @withEdges@. Keeps one connection open and returns it.
-readDatabase :: Text -> Scope -> Text -> Bool -> IO (Connection.Connection, Schema, [Edge], [Text])
-readDatabase label scope db withEdges = do
+-- | Connections for the PL/pgSQL bodies when their analysis starts before describing.
+bodyConnections :: Int
+bodyConnections = 3
+
+
+-- | A described database with its open connections.
+data Connected = Connected Connection.Connection [Connection.Connection] Schema Addresses
+
+
+-- | A database's schema over 'describeConnections' connections.
+describeDatabase :: Scope -> Text -> IO Connected
+describeDatabase scope db = do
     (conn, extra) <- concurrently (connect db) (replicateConcurrently (describeConnections - 1) (connect db))
     (schema, addresses) <- describeOn (conn : extra) scope.excluded scope.includePartitions Nothing
-    (edges, notes) <- if withEdges then edgesOf label scope conn extra addresses else pure ([], [])
-    for_ extra Connection.release
-    pure (conn, schema, edges, notes)
+    pure (Connected conn extra schema addresses)
 
 
--- | Reads both databases at the same time; the edges of @--to@ only when @toEdges@.
-readBoth :: Scope -> Text -> Text -> Bool -> IO ((Schema, [Edge]), (Connection.Connection, Schema, [Edge]))
-readBoth scope fromDb toDb toEdges = do
-    ((_, fromSchema, fromEdges, fromNotes), (toConn, toSchema, toEdges', toNotes)) <-
-        concurrently (readDatabase "--from" scope fromDb True) (readDatabase "--to" scope toDb toEdges)
+-- | Reads both databases at the same time, then the edges each command needs, given what
+-- differs, alongside the body checks; the edges of @--to@ only when @forPlan@.
+readBoth :: Scope -> Text -> Text -> Bool -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
+readBoth scope fromDb toDb forPlan = do
+    -- diff needs every body of --from once anything was dropped or changed, which is
+    -- known only after describing; analysing them takes longest, so it starts now. When
+    -- they turn out not to be needed, the process exits without waiting for them.
+    early <-
+        if forPlan
+            then pure Nothing
+            else Just <$> async (concurrently (connect fromDb) (replicateConcurrently (bodyConnections - 1) (connect fromDb)) >>= \(c, cs) -> bodyUses (c :| cs) scope.excluded Nothing)
+    (fromDatabase@(Connected _ _ fromSchema _), toDatabase@(Connected toConn _ toSchema _)) <-
+        concurrently (describeDatabase scope fromDb) (describeDatabase scope toDb)
+    let plainChanges = diff (\_ a b -> a == b) fromSchema toSchema
+        needed = neededFor forPlan plainChanges
+    (((fromEdges, fromNotes), (toEdges, toNotes)), checks) <-
+        concurrently
+            ( concurrently
+                (edgesOf "--from" scope needed fromDatabase early)
+                (if forPlan then edgesOf "--to" scope needed toDatabase Nothing else pure ([], []))
+            )
+            (bodyChecks scope toConn toSchema plainChanges)
     for_ (fromNotes <> toNotes) (TIO.hPutStrLn stderr)
-    pure ((fromSchema, fromEdges), (toConn, toSchema, toEdges'))
+    pure ((fromSchema, fromEdges), (toSchema, toEdges), checks)
 
 
 -- | Body checks for the definitions that are added or changed: no other check is consulted.
-bodyChecks :: Scope -> Connection.Connection -> Schema -> Schema -> IO (Map ObjectKey BodyCheck)
-bodyChecks scope conn fromSchema toSchema
+bodyChecks :: Scope -> Connection.Connection -> Schema -> Map ObjectKey Change -> IO (Map ObjectKey BodyCheck)
+bodyChecks scope conn toSchema plainChanges
     | scope.checkFunctionBodies = checkBodies conn (Map.restrictKeys toSchema addedOrChanged)
     | otherwise = pure Map.empty
   where
-    addedOrChanged = Map.keysSet (Map.filter (\case Dropped _ -> False; _ -> True) (diff (\_ a b -> a == b) fromSchema toSchema))
+    addedOrChanged = Map.keysSet (Map.filter (\case Dropped _ -> False; _ -> True) plainChanges)
 
 
 -- | What @--from@ names: a connection string, or the baseline database built from a revision.
@@ -158,8 +219,7 @@ main =
             BuildBaseline rev rebuild -> ensureBaseline rev rebuild >>= TIO.putStrLn
             Diff from toDb scope -> do
                 fromDb <- connInfoOf from
-                ((fromSchema, edges), (toConn, toSchema, _)) <- readBoth scope fromDb toDb False
-                checks <- bodyChecks scope toConn fromSchema toSchema
+                ((fromSchema, edges), (toSchema, _), checks) <- readBoth scope fromDb toDb False
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     known = Set.fromList [k.address | k <- Map.keys fromSchema, k.aspect == Definition]
                     affectedBy = affected known edges changes
@@ -171,17 +231,15 @@ main =
                 unless (Map.null changes) $ exitWith (ExitFailure 1)
             Plan from toDb scope -> do
                 fromDb <- connInfoOf from
-                ((fromSchema, fromEdges), (toConn, toSchema, toEdges)) <- readBoth scope fromDb toDb True
-                checks <- bodyChecks scope toConn fromSchema toSchema
+                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- readBoth scope fromDb toDb True
                 let steps = plan checks fromSchema toSchema fromEdges toEdges (diff (sameDefinition checks) fromSchema toSchema)
                 for_ steps (TIO.putStrLn . renderStep)
             Sqitch from toDb scope opts -> do
                 unless opts.dryRun requireSqitch
                 sqitchPlan <- readPlan (opts.projectDir </> opts.planFile)
                 fromDb <- connInfoOf from
-                ((fromSchema, fromEdges), (toConn, toSchema, toEdges)) <- readBoth scope fromDb toDb True
+                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- readBoth scope fromDb toDb True
                 now <- getCurrentTime
-                checks <- bodyChecks scope toConn fromSchema toSchema
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     steps = plan checks fromSchema toSchema fromEdges toEdges changes
                     inverseCtx = context Map.empty toSchema fromSchema toEdges (Map.map invert changes)
