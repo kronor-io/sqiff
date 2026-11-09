@@ -12,8 +12,8 @@ import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
 import Kronor.SchemaDiff.Baseline (ensureBaseline)
 import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
-import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), BodyUses, Edge, ObjectKey (..), Schema, UserError (..), bodyUses, connect, dependencies, dependenciesOn, describeOn, edgesBetween, failWith, render)
-import Kronor.SchemaDiff.Diff (Change (..), affected, diff)
+import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, render)
+import Kronor.SchemaDiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
 import Kronor.SchemaDiff.Folder (writeFolder)
 import Kronor.SchemaDiff.Object (QName (..))
 import Kronor.SchemaDiff.Plan (context, invert, plan, renderStep)
@@ -24,6 +24,7 @@ import Options.Applicative qualified as O
 import RIO
 import RIO.Directory (makeAbsolute)
 import RIO.FilePath (makeRelative, (</>))
+import RIO.HashSet qualified as HS
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.NonEmpty (nonEmpty)
@@ -41,8 +42,8 @@ data Scope = Scope
 
 -- | Which edges a command uses.
 data Needed
-    = -- | Every edge.
-      AllEdges
+    = -- | Edges from @pg_depend@, and the body edges 'affected' can reach from these.
+      ReachableFrom (Set Address)
     | -- | Edges from @pg_depend@, and edges from the bodies of these functions only.
       BodiesOf (Set Address)
     | -- | None; plpgsql_check still lists the functions it cannot analyse.
@@ -57,54 +58,113 @@ neededFor :: Bool -> Map ObjectKey Change -> Needed
 neededFor forPlan changes
     | Map.null changes = NoEdges
     | forPlan = BodiesOf (Set.fromList [k.address | k <- Map.keys changes])
-    | any (\(k, c) -> k.aspect == Definition && removesOrChanges c) (Map.toList changes) = AllEdges
-    | otherwise = NoEdges
+    | null starts = NoEdges
+    | otherwise = ReachableFrom (Set.fromList starts)
   where
+    starts = [k.address | (k, c) <- Map.toList changes, k.aspect == Definition, removesOrChanges c]
     removesOrChanges = \case Added _ -> False; _ -> True
 
 
 -- | Edges from @pg_depend@ and, when plpgsql_check is installed, from PL/pgSQL bodies,
 -- with notes for stderr. @label@ names the database in the notes.
--- With @early@, the uses of every body were started before the database was described.
-edgesOf :: Text -> Scope -> Needed -> Connected -> Maybe (Async (Maybe BodyUses)) -> IO ([Edge], [Text])
-edgesOf label scope needed (Connected conn extra _ addresses) early = do
-    let wantedIds wanted = [ids | (ids, addr) <- Map.toList addresses, addr `Set.member` wanted]
-        only = case needed of
-            AllEdges -> Nothing
-            BodiesOf wanted -> Just (Set.fromList [oid | (classid, oid, _) <- wantedIds wanted, classid == pgProc])
-            NoEdges -> Just Set.empty
-        pgProc = 1255
-        uses = case (needed, early) of
-            (AllEdges, Just started) -> wait started
-            _ -> bodyUses (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded only
-    (edges, body) <-
+edgesOf :: Text -> Scope -> Needed -> Connected -> IO ([Edge], [Text])
+edgesOf label scope needed connected@(Connected conn extra _ addresses) = case needed of
+    ReachableFrom starts -> reachableEdges label scope starts connected
+    _ -> do
+        let wantedIds wanted = [ids | (ids, addr) <- Map.toList addresses, addr `Set.member` wanted]
+            only = case needed of
+                BodiesOf wanted -> Just (Set.fromList [oid | (classid, oid, _) <- wantedIds wanted, classid == pgProc])
+                _ -> Just Set.empty
+        (edges, body) <-
+            concurrently
+                ( case needed of
+                    BodiesOf wanted -> dependenciesOn conn addresses (wantedIds wanted)
+                    _ -> pure []
+                )
+                (fmap (first (edgesBetween addresses)) <$> bodyUses (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded only)
+        pure (edges <> maybe [] fst body, bodyNotes label (snd <$> body))
+
+
+pgProc :: Int64
+pgProc = 1255
+
+
+pgClass :: Int64
+pgClass = 1259
+
+
+bodyNotes :: Text -> Maybe Skipped -> [Text]
+bodyNotes label = \case
+    Nothing -> ["schema-diff: plpgsql_check is not installed; PL/pgSQL body dependencies are left out"]
+    Just [] -> []
+    Just skipped ->
+        let n = length skipped
+         in [i|schema-diff: plpgsql_check could not analyse #{n} PL/pgSQL functions on #{label}; their body dependencies are left out:|]
+                : [[i|  #{name}: #{reason}|] | (name, reason) <- skipped]
+
+
+-- | The edges from @pg_depend@ reachable from @starts@, and the body edges of the
+-- PL/pgSQL functions that 'bodiesToAnalyse' picks. A body edge can bring a function into
+-- the closure, whose dependents are then read, and those can make other functions
+-- matter, so it repeats until nothing new is reached or picked.
+reachableEdges :: Text -> Scope -> Set Address -> Connected -> IO ([Edge], [Text])
+reachableEdges label scope starts (Connected conn extra schema addresses) = do
+    let idsOf = Map.fromListWith (<>) [(addr, [ids]) | (ids, addr) <- Map.toList addresses]
+        idsFor = concatMap (\a -> Map.findWithDefault [] a idsOf) . Set.toList
+        -- depend_from.sql reads the dependents of a relation's columns with the relation's.
+        columnsOf = Map.fromListWith (<>) [(rel, [addr]) | ((classid, objid, sub), addr) <- Map.toList addresses, classid == pgClass, sub > 0, Just rel <- [Map.lookup (pgClass, objid, 0) addresses]]
+        withColumns xs = xs <> Set.fromList (concatMap (\a -> Map.findWithDefault [] a columnsOf) (Set.toList xs))
+    -- The definitions are split into words while pg_depend is read, in parts on every core.
+    (edges, functions) <-
         concurrently
-            ( case needed of
-                AllEdges -> dependencies conn addresses
-                BodiesOf wanted -> dependenciesOn conn addresses (wantedIds wanted)
-                NoEdges -> pure []
+            (dependenciesFrom conn addresses (idsFor starts))
+            ( plpgsqlFunctions (fromMaybe conn (listToMaybe extra)) scope.excluded
+                >>= traverse \fs -> do
+                    let split part = do
+                            let described =
+                                    [ (f, addr, bodyText (Map.findWithDefault "" (ObjectKey Definition addr) schema), trigger)
+                                    | f <- part
+                                    , let trigger = f.relid >>= \r -> Map.lookup (pgClass, r, 0) addresses
+                                    , Just addr <- [Map.lookup (pgProc, f.oid, 0) addresses]
+                                    ]
+                            _ <- evaluate (foldl' (\n (_, _, b, _) -> n + HS.size b.wordSet) (0 :: Int) described)
+                            pure described
+                        parts = [[f | (n, f) <- zip [0 :: Int ..] fs.checkable, n `mod` 8 == k] | k <- [0 .. 7]]
+                    described <- concat <$> pooledMapConcurrently split parts
+                    pure (fs, described)
             )
-            (fmap (first (edgesBetween addresses)) <$> uses)
-    pure case body of
-        Nothing -> (edges, ["schema-diff: plpgsql_check is not installed; PL/pgSQL body dependencies are left out"])
-        Just (bodyEdges, skipped) ->
-            let n = length skipped
-                notes
-                    | null skipped = []
-                    | otherwise =
-                        [i|schema-diff: plpgsql_check could not analyse #{n} PL/pgSQL functions on #{label}; their body dependencies are left out:|]
-                            : [[i|  #{name}: #{reason}|] | (name, reason) <- skipped]
-             in (edges <> bodyEdges, notes)
+    case functions of
+        Nothing -> pure (edges, bodyNotes label Nothing)
+        Just (fs, described) -> do
+            let position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
+                implicit = [a | o <- fs.implicit, Just a <- [Map.lookup (pgProc, o, 0) addresses]]
+                -- @explored@ holds the objects whose dependents are in @pgEdges@.
+                go explored pgEdges done bodyEdges failed = do
+                    let dependents = dependentsBy (pgEdges <> bodyEdges)
+                        frontier = (starts <> reachedFrom dependents starts) `Set.difference` explored
+                    more <- dependenciesFrom conn addresses (idsFor frontier)
+                    let pgEdges' = pgEdges <> more
+                        explored' = explored <> withColumns (frontier <> Set.fromList (map (.dependent) more))
+                        dependents' = dependentsBy (pgEdges' <> bodyEdges)
+                        -- No name leads to a cast's or operator's function, so reaching
+                        -- one means analysing every body.
+                        picked
+                            | any (`Set.member` (starts <> reachedFrom dependents' starts)) implicit = [f | (f, _, _, _) <- described]
+                            | otherwise = bodiesToAnalyse dependents' starts described
+                    case [f | f <- picked, f.oid `Set.notMember` done] of
+                        []
+                            | Set.null frontier -> pure (pgEdges' <> bodyEdges, failed)
+                            | otherwise -> go explored' pgEdges' done bodyEdges failed
+                        todo -> do
+                            (uses, failed') <- analyseBodies (conn :| extra) fs todo
+                            go explored' pgEdges' (done <> Set.fromList (map (.oid) todo)) (bodyEdges <> edgesBetween addresses uses) (failed <> failed')
+            (allEdges, failed) <- go (withColumns (starts <> Set.fromList (map (.dependent) edges))) edges Set.empty [] []
+            pure (allEdges, bodyNotes label (Just (fs.unchecked <> L.sortOn (\(name, _) -> Map.lookup name position) failed)))
 
 
 -- | Connections per database; the describe queries run over all of them at once.
 describeConnections :: Int
 describeConnections = 4
-
-
--- | Connections for the PL/pgSQL bodies when their analysis starts before describing.
-bodyConnections :: Int
-bodyConnections = 3
 
 
 -- | A described database with its open connections.
@@ -123,13 +183,6 @@ describeDatabase scope db = do
 -- differs, alongside the body checks; the edges of @--to@ only when @forPlan@.
 readBoth :: Scope -> Text -> Text -> Bool -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
 readBoth scope fromDb toDb forPlan = do
-    -- diff needs every body of --from once anything was dropped or changed, which is
-    -- known only after describing; analysing them takes longest, so it starts now. When
-    -- they turn out not to be needed, the process exits without waiting for them.
-    early <-
-        if forPlan
-            then pure Nothing
-            else Just <$> async (concurrently (connect fromDb) (replicateConcurrently (bodyConnections - 1) (connect fromDb)) >>= \(c, cs) -> bodyUses (c :| cs) scope.excluded Nothing)
     (fromDatabase@(Connected _ _ fromSchema _), toDatabase@(Connected toConn _ toSchema _)) <-
         concurrently (describeDatabase scope fromDb) (describeDatabase scope toDb)
     let plainChanges = diff (\_ a b -> a == b) fromSchema toSchema
@@ -137,8 +190,8 @@ readBoth scope fromDb toDb forPlan = do
     (((fromEdges, fromNotes), (toEdges, toNotes)), checks) <-
         concurrently
             ( concurrently
-                (edgesOf "--from" scope needed fromDatabase early)
-                (if forPlan then edgesOf "--to" scope needed toDatabase Nothing else pure ([], []))
+                (edgesOf "--from" scope needed fromDatabase)
+                (if forPlan then edgesOf "--to" scope needed toDatabase else pure ([], []))
             )
             (bodyChecks scope toConn toSchema plainChanges)
     for_ (fromNotes <> toNotes) (TIO.hPutStrLn stderr)

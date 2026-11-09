@@ -5,6 +5,7 @@ synopsis:           Describe and diff PostgreSQL schemas from their catalogs
 build-type:         Simple
 extra-source-files:
   sql/depend.sql
+  sql/depend_from.sql
   sql/depend_on.sql
   sql/describe/*.sql
   sql/plpgsql/*.sql

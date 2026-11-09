@@ -20,10 +20,15 @@ module Kronor.SchemaDiff.Catalog (
     describeOn,
     dependencies,
     dependenciesOn,
+    dependenciesFrom,
     qualifiedNames,
     Skipped,
     bodyUses,
     BodyUses,
+    PlFunction (..),
+    PlFunctions (..),
+    plpgsqlFunctions,
+    analyseBodies,
     edgesBetween,
     render,
 ) where
@@ -139,7 +144,7 @@ describe conn excluded includePartitions = fst <$> describeOn [conn] excluded in
 -- objects when @onlyTable@ names it, and with each object's catalog ids.
 describeOn :: [Connection.Connection] -> [Text] -> Bool -> Maybe Text -> IO (Schema, Addresses)
 describeOn conns excluded includePartitions onlyTable = do
-    queue <- newIORef describeQueries
+    queue <- newIORef (maybe ordered (const (map (,Nothing) describeQueries)) onlyTable)
     let next = atomicModifyIORef' queue \case
             [] -> ([], Nothing)
             q : rest -> (rest, Just q)
@@ -147,11 +152,20 @@ describeOn conns excluded includePartitions onlyTable = do
     parts <- concat <$> forConcurrently conns (\conn -> qualifiedNames conn (worker conn))
     (,) <$> evaluate (Map.unions (map fst parts)) <*> evaluate (Map.unions (map snd parts))
   where
+    -- The slowest queries go first, each in two halves by object id, so that no single
+    -- query holds up the others.
+    ordered =
+        concat [[(q, Just 0), (q, Just 1)] | q <- byName slowest]
+            <> [(q, Nothing) | q <- byName middling <> [q | q@(f, _) <- describeQueries, takeBaseName f `notElem` (slowest <> middling)]]
+    slowest = ["column", "privileges", "function"]
+    middling = ["constraint", "index", "relation"]
+    byName names = [q | n <- names, q@(f, _) <- describeQueries, takeBaseName f == n]
+
     -- The rows are evaluated here, in the thread that decoded them: the callers read the
     -- results from several threads at once.
-    describeOne conn (file, body) = do
+    describeOne conn ((file, body), half) = do
         rows <-
-            run conn (excluded, includePartitions, onlyTable)
+            run conn (excluded, includePartitions, onlyTable, half)
                 $ Statement.unpreparable (wrap (decodeUtf8Lenient body)) describeParams (D.rowList ((,,) <$> catalogIdRow <*> addressRow <*> textColumn))
         _ <- evaluate (foldl' (\n (_, addr, def) -> n + T.length def + sum (map T.length (addr.objectType : addr.objectNames <> addr.objectArgs))) (0 :: Int) rows)
         let objectAspect = if takeBaseName file == "privileges" then Privileges else Definition
@@ -169,6 +183,7 @@ describeOn conns excluded includePartitions onlyTable = do
             from o
             cross join lateral pg_identify_object_as_address(o.classid, o.objid, o.objsubid) a
             where ($3::text is null or o.relid = to_regclass($3::text))
+                and ($4::int4 is null or o.objid::int8 % 2 = $4::int4)
                 and not exists (
                     select
                     from pg_depend e
@@ -222,6 +237,23 @@ dependOnQuery :: ByteString
 dependOnQuery = $(makeRelativeToProject "sql/depend_on.sql" >>= embedFile)
 
 
+-- | 'dependencies' limited to the edges reachable from @starts@ through dependents.
+dependenciesFrom :: Connection.Connection -> Addresses -> [CatalogId] -> IO [Edge]
+dependenciesFrom _ _ [] = pure []
+dependenciesFrom conn addresses starts = do
+    (c1, o1, s1, c2, o2, s2) <-
+        run conn (unzip3 starts)
+            $ Statement.unpreparable
+                (decodeUtf8Lenient dependFromQuery)
+                catalogIdsParams
+                (D.singleRow ((,,,,,) <$> int8Array <*> int8Array <*> int4Array <*> int8Array <*> int8Array <*> int4Array))
+    pure (edgesBetween addresses (zip (zip3 c1 o1 s1) (zip3 c2 o2 s2)))
+
+
+dependFromQuery :: ByteString
+dependFromQuery = $(makeRelativeToProject "sql/depend_from.sql" >>= embedFile)
+
+
 -- | The edges whose ends are both described.
 edgesBetween :: Addresses -> [(CatalogId, CatalogId)] -> [Edge]
 edgesBetween addresses pairs =
@@ -253,37 +285,75 @@ type BodyUses = ([(CatalogId, CatalogId)], Skipped)
 -- first, so one slow function does not hold up the others.
 bodyUses :: NonEmpty Connection.Connection -> [Text] -> Maybe (Set Int64) -> IO (Maybe BodyUses)
 bodyUses conns@(conn :| _) excluded only =
+    plpgsqlFunctions conn excluded >>= traverse \fs -> do
+        let checkable = maybe fs.checkable (\oids -> [f | f <- fs.checkable, f.oid `Set.member` oids]) only
+        (uses, failed) <- analyseBodies conns fs checkable
+        pure (uses, fs.unchecked <> failed)
+
+
+-- | A PL/pgSQL function plpgsql_check can analyse: its oid, name, trigger table and
+-- estimated cost.
+data PlFunction = PlFunction
+    { oid :: Int64
+    , name :: Text
+    , relid :: Maybe Int64
+    , cost :: Int64
+    }
+
+
+-- | The PL/pgSQL functions to analyse, and the ones that cannot be. @implicit@ holds
+-- the functions behind user-defined casts and operators: plpgsql_check reports a body
+-- that uses one as using the function, though the body never names it.
+data PlFunctions = PlFunctions
+    { query :: Text
+    , checkable :: [PlFunction]
+    , unchecked :: Skipped
+    , implicit :: [Int64]
+    }
+
+
+-- | The PL/pgSQL functions the describe queries cover; 'Nothing' when plpgsql_check is
+-- not installed.
+plpgsqlFunctions :: Connection.Connection -> [Text] -> IO (Maybe PlFunctions)
+plpgsqlFunctions conn excluded =
     qualifiedNames conn
         $ run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
         >>= traverse \extSchema -> do
             functions <- run conn excluded (Statement.unpreparable (decodeUtf8Lenient plpgsqlFunctionsQuery) excludedParam (D.rowList functionRow))
-            let (unchecked, allCheckable) = partitionEithers (map triggerTable functions)
-                checkable = maybe allCheckable (\oids -> [f | f@(oid, _, _) <- allCheckable, oid `Set.member` oids]) only
-                query = TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlDependQuery)
-                cost = Map.fromList [(oid, c) | (oid, _, _, _, c) <- functions]
-                costOf (oid, _, _) = Map.findWithDefault 0 oid cost
-                -- The slowest go first, each on its own, while the rest share the other connections.
-                (slow, fast) = L.partition ((> 0) . costOf) checkable
-            queue <- newIORef (map pure (L.sortOn (Down . costOf) slow) <> chunks fast)
-            let next = atomicModifyIORef' queue \case
-                    [] -> ([], Nothing)
-                    b : rest -> (rest, Just b)
-                worker c = next >>= maybe (pure []) (\b -> (:) <$> inBatches c query b <*> worker c)
-            results <- concat <$> forConcurrently (toList conns) worker
-            let position = Map.fromList (zip [name | (_, name, _) <- checkable] [0 :: Int ..])
-                failed = L.sortOn (\(name, _) -> Map.lookup name position) (concatMap snd results)
-            pure (concatMap fst results, unchecked <> failed)
+            implicit <- run conn () (Statement.unpreparable implicitQuery mempty (D.rowList int8Column))
+            let (unchecked, checkable) = partitionEithers (map triggerTable functions)
+            pure (PlFunctions (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlDependQuery)) checkable unchecked implicit)
+  where
+    implicitQuery = "select castfunc::int8 from pg_cast where castfunc >= 16384 union select oprcode::int8 from pg_operator where oprcode >= 16384"
+    functionRow = (,,,,) <$> D.column (D.nonNullable D.int8) <*> textColumn <*> D.column (D.nonNullable D.bool) <*> D.column (D.nullable D.int8) <*> int8Column
+    triggerTable (oid, name, isTrigger, relid, cost)
+        | isTrigger && isNothing relid = Left (name, "no trigger uses it")
+        | otherwise = Right (PlFunction oid name relid cost)
+
+
+-- | What the bodies of @functions@ use, and the ones plpgsql_check failed on, in the
+-- order of @fs@. Each connection takes the next few functions until none are left, the
+-- slowest first, so one slow function does not hold up the others.
+analyseBodies :: NonEmpty Connection.Connection -> PlFunctions -> [PlFunction] -> IO BodyUses
+analyseBodies conns fs functions = do
+    let
+        -- The slowest go first, each on its own, while the rest share the other connections.
+        (slow, fast) = L.partition ((> 0) . (.cost)) functions
+    queue <- newIORef (map pure (L.sortOn (Down . (.cost)) slow) <> chunks fast)
+    let next = atomicModifyIORef' queue \case
+            [] -> ([], Nothing)
+            b : rest -> (rest, Just b)
+        worker c = next >>= maybe (pure []) (\b -> (:) <$> inBatches c fs.query b <*> worker c)
+    results <- concat <$> forConcurrently (toList conns) worker
+    let position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
+        failed = L.sortOn (\(name, _) -> Map.lookup name position) (concatMap snd results)
+    pure (concatMap fst results, failed)
   where
     chunks xs = case L.splitAt batchSize xs of
         ([], _) -> []
         (b, rest) -> b : chunks rest
 
     batchSize = 16
-
-    functionRow = (,,,,) <$> D.column (D.nonNullable D.int8) <*> textColumn <*> D.column (D.nonNullable D.bool) <*> D.column (D.nullable D.int8) <*> int8Column
-    triggerTable (oid, name, isTrigger, relid, _)
-        | isTrigger && isNothing relid = Left (name, "no trigger uses it")
-        | otherwise = Right (oid, name, relid)
 
     -- One query for all functions; a batch that fails is split until the failing functions stand alone.
     inBatches _ _ [] = pure ([], [])
@@ -292,7 +362,7 @@ bodyUses conns@(conn :| _) excluded only =
             >>= \case
                 Right uses -> pure ([((pgProc, f, 0), (k, o, 0)) | (f, k, o) <- uses], [])
                 Left (Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message _ _ _)))
-                    | [(_, name, _)] <- batch -> pure ([], [(name, message)])
+                    | [f] <- batch -> pure ([], [(f.name, message)])
                     | otherwise -> do
                         let (left, right) = L.splitAt (length batch `div` 2) batch
                         (e1, s1) <- inBatches c query left
@@ -301,8 +371,8 @@ bodyUses conns@(conn :| _) excluded only =
                 Left e -> failWith ("query failed: " <> tshow e)
 
     dependParams =
-        contramap (map (\(oid, _, _) -> oid)) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int8))))
-            <> contramap (map (\(_, _, relid) -> relid)) (E.param (E.nonNullable (E.foldableArray (E.nullable E.int8))))
+        contramap (map (.oid)) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int8))))
+            <> contramap (map (.relid)) (E.param (E.nonNullable (E.foldableArray (E.nullable E.int8))))
 
     useRow = (,,) <$> int8Column <*> int8Column <*> int8Column
 
@@ -328,11 +398,12 @@ excludedParam :: E.Params [Text]
 excludedParam = E.param (E.nonNullable (E.foldableArray (E.nonNullable E.text)))
 
 
-describeParams :: E.Params ([Text], Bool, Maybe Text)
+describeParams :: E.Params ([Text], Bool, Maybe Text, Maybe Int32)
 describeParams =
-    contramap (\(excluded, _, _) -> excluded) excludedParam
-        <> contramap (\(_, includePartitions, _) -> includePartitions) (E.param (E.nonNullable E.bool))
-        <> contramap (\(_, _, onlyTable) -> onlyTable) (E.param (E.nullable E.text))
+    contramap (\(excluded, _, _, _) -> excluded) excludedParam
+        <> contramap (\(_, includePartitions, _, _) -> includePartitions) (E.param (E.nonNullable E.bool))
+        <> contramap (\(_, _, onlyTable, _) -> onlyTable) (E.param (E.nullable E.text))
+        <> contramap (\(_, _, _, half) -> half) (E.param (E.nullable E.int4))
 
 
 catalogIdsParams :: E.Params ([Int64], [Int64], [Int32])
