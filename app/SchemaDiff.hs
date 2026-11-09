@@ -10,6 +10,7 @@ import Data.String.Interpolate (i)
 import Data.Text.IO qualified as TIO
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
+import Kronor.SchemaDiff.Baseline (ensureBaseline)
 import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
 import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge, ObjectKey (..), Schema, UserError (..), bodyDependencies, connect, dependencies, describeOn, failWith, render)
 import Kronor.SchemaDiff.Diff (Change (..), affected, diff)
@@ -92,12 +93,32 @@ bodyChecks scope conn fromSchema toSchema
     addedOrChanged = Map.keysSet (Map.filter (\case Dropped _ -> False; _ -> True) (diff (\_ a b -> a == b) fromSchema toSchema))
 
 
+-- | What @--from@ names: a connection string, or the baseline database built from a revision.
+data Source
+    = Database Text
+    | BaselineAt Text
+
+
+source :: Text -> Source
+source s
+    | s == "master" = BaselineAt s
+    | Just rev <- T.stripPrefix "rev:" s = BaselineAt rev
+    | otherwise = Database s
+
+
+connInfoOf :: Source -> IO Text
+connInfoOf = \case
+    Database db -> pure db
+    BaselineAt rev -> ensureBaseline rev False
+
+
 data Command
     = Describe Text (Maybe FilePath) Bool Scope
-    | Diff Text Text Scope
-    | Plan Text Text Scope
-    | Sqitch Text Text Scope SqitchOptions
+    | Diff Source Text Scope
+    | Plan Source Text Scope
+    | Sqitch Source Text Scope SqitchOptions
     | TableFile FilePath Text TableOptions
+    | BuildBaseline Text Bool
 
 
 data TableOptions = TableOptions
@@ -134,7 +155,9 @@ main =
                     Nothing ->
                         for_ (Map.toList (Map.fromListWith (+) [(k.address.objectType, 1 :: Int) | k <- Map.keys schema])) \(kind, n) ->
                             TIO.putStrLn [i|#{n}\t#{kind}|]
-            Diff fromDb toDb scope -> do
+            BuildBaseline rev rebuild -> ensureBaseline rev rebuild >>= TIO.putStrLn
+            Diff from toDb scope -> do
+                fromDb <- connInfoOf from
                 ((fromSchema, edges), (toConn, toSchema, _)) <- readBoth scope fromDb toDb False
                 checks <- bodyChecks scope toConn fromSchema toSchema
                 let changes = diff (sameDefinition checks) fromSchema toSchema
@@ -146,14 +169,16 @@ main =
                 for_ (Map.toList changes) \(key, change) -> report key change (dependentsOf key)
                 TIO.putStrLn (summary changes)
                 unless (Map.null changes) $ exitWith (ExitFailure 1)
-            Plan fromDb toDb scope -> do
+            Plan from toDb scope -> do
+                fromDb <- connInfoOf from
                 ((fromSchema, fromEdges), (toConn, toSchema, toEdges)) <- readBoth scope fromDb toDb True
                 checks <- bodyChecks scope toConn fromSchema toSchema
                 let steps = plan checks fromSchema toSchema fromEdges toEdges (diff (sameDefinition checks) fromSchema toSchema)
                 for_ steps (TIO.putStrLn . renderStep)
-            Sqitch fromDb toDb scope opts -> do
+            Sqitch from toDb scope opts -> do
                 unless opts.dryRun requireSqitch
                 sqitchPlan <- readPlan (opts.projectDir </> opts.planFile)
+                fromDb <- connInfoOf from
                 ((fromSchema, fromEdges), (toConn, toSchema, toEdges)) <- readBoth scope fromDb toDb True
                 now <- getCurrentTime
                 checks <- bodyChecks scope toConn fromSchema toSchema
@@ -233,6 +258,12 @@ commandParser =
         <> O.command "plan" (O.info (twoDatabases Plan) (O.progDesc "Print the SQL that turns --from into --to"))
         <> O.command "sqitch" (O.info (twoDatabases Sqitch <*> sqitchOptions) (O.progDesc "Write the plan as sqitch changes"))
         <> O.command
+            "baseline"
+            ( O.info
+                baselineParser
+                (O.progDesc "Bring a scratch database to the schema of a revision's sqitch plan and print its connection string")
+            )
+        <> O.command
             "table"
             ( O.info
                 tableParser
@@ -262,7 +293,14 @@ commandParser =
             <*> O.switch (O.long "dry-run" <> O.help "List the changes without writing them")
     twoDatabases constructor =
         constructor
-            <$> O.strOption (O.long "from" <> O.metavar "CONNINFO" <> O.help "The database to change")
+            <$> fmap
+                source
+                ( O.strOption
+                    ( O.long "from"
+                        <> O.metavar "CONNINFO|master|rev:REV"
+                        <> O.help "The database to change; master or rev:REV builds or updates the baseline database at that revision and uses it"
+                    )
+                )
             <*> O.strOption (O.long "to" <> O.metavar "CONNINFO" <> O.help "The database with the desired schema")
             <*> scopeParser
     describeParser =
@@ -272,6 +310,10 @@ commandParser =
             <*> O.switch (O.long "replace" <> O.help "Clear --out first, if schema-diff wrote it")
             <*> scopeParser
     diffParser = twoDatabases Diff
+    baselineParser =
+        BuildBaseline
+            <$> O.strOption (O.long "rev" <> O.metavar "REV" <> O.value "master" <> O.help "The jj revision whose sqitch plan to deploy")
+            <*> O.switch (O.long "rebuild" <> O.help "Recreate the server from its image before deploying")
     scopeParser =
         Scope
             <$> O.many (O.strOption (O.long "exclude-schema" <> O.metavar "SCHEMA"))
