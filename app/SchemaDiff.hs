@@ -30,6 +30,7 @@ import RIO.Map qualified as Map
 import RIO.NonEmpty (nonEmpty)
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
+import System.Environment (lookupEnv)
 import System.Process.Typed (proc, readProcess, setWorkingDir)
 
 
@@ -171,9 +172,19 @@ describeConnections = 4
 data Connected = Connected Connection.Connection [Connection.Connection] Schema Addresses
 
 
+-- | @local@ names the dev stack's database, on @KRONOR_PG_PORT@ (5432 when unset).
+resolveDb :: Text -> IO Text
+resolveDb = \case
+    "local" -> do
+        port <- fromMaybe "5432" <$> lookupEnv "KRONOR_PG_PORT"
+        pure [i|host=localhost port=#{port} user=kronor dbname=kronor|]
+    db -> pure db
+
+
 -- | A database's schema over 'describeConnections' connections.
 describeDatabase :: Scope -> Text -> IO Connected
-describeDatabase scope db = do
+describeDatabase scope name = do
+    db <- resolveDb name
     (conn, extra) <- concurrently (connect db) (replicateConcurrently (describeConnections - 1) (connect db))
     (schema, addresses) <- describeOn (conn : extra) scope.excluded scope.includePartitions Nothing
     pure (Connected conn extra schema addresses)
@@ -261,7 +272,8 @@ main =
     handle (\(UserError message) -> TIO.hPutStrLn stderr ("schema-diff: " <> message) >> exitWith (ExitFailure 2))
         $ O.execParser (O.info (commandParser O.<**> O.helper) O.fullDesc)
         >>= \case
-            Describe db out replace scope -> do
+            Describe name out replace scope -> do
+                db <- resolveDb name
                 conns <- replicateConcurrently describeConnections (connect db)
                 (schema, _) <- describeOn conns scope.excluded scope.includePartitions Nothing
                 case out of
@@ -323,7 +335,7 @@ main =
                     if opts.againstDatabase
                         then pure (LiveTable opts.allowDrops)
                         else BaseFile <$> parse (" at " <> opts.base) original
-                conn <- connect db
+                conn <- connect =<< resolveDb db
                 edit <- compareTable conn baseline table statements
                 let steps = plan Map.empty edit.current edit.desired [] [] edit.changes
                     same = if opts.againstDatabase then "the file matches the table" else "the file has no schema changes since " <> opts.base
@@ -384,7 +396,7 @@ commandParser =
     tableParser =
         TableFile
             <$> O.strArgument (O.metavar "FILE" <> O.help "The table's deploy file, for example database/deploy/runtime/table/payment.sql")
-            <*> O.strOption (O.long "db" <> O.metavar "CONNINFO" <> O.help "A database with the table as it is now; changes are rolled back")
+            <*> O.strOption (O.long "db" <> O.metavar "CONNINFO|local" <> O.help "A database with the table as it is now; changes are rolled back. local is the dev stack's database")
             <*> ( TableOptions
                     <$> O.switch (O.long "write" <> O.help "Add the migration with sqitch and rework the table's change")
                     <*> O.switch (O.long "against-database" <> O.help "Compare with the live table instead of the file at --base; shows drift too")
@@ -408,15 +420,15 @@ commandParser =
                 source
                 ( O.strOption
                     ( O.long "from"
-                        <> O.metavar "CONNINFO|master|rev:REV"
-                        <> O.help "The database to change; master or rev:REV builds or updates the baseline database at that revision and uses it"
+                        <> O.metavar "CONNINFO|local|master|rev:REV"
+                        <> O.help "The database to change; master or rev:REV builds or updates the baseline database at that revision and uses it; local is the dev stack's database"
                     )
                 )
-            <*> O.strOption (O.long "to" <> O.metavar "CONNINFO" <> O.help "The database with the desired schema")
+            <*> O.strOption (O.long "to" <> O.metavar "CONNINFO|local" <> O.help "The database with the desired schema; local is the dev stack's database")
             <*> scopeParser
     describeParser =
         Describe
-            <$> O.strOption (O.long "db" <> O.metavar "CONNINFO")
+            <$> O.strOption (O.long "db" <> O.metavar "CONNINFO|local" <> O.help "local is the dev stack's database")
             <*> O.optional (O.strOption (O.long "out" <> O.metavar "DIR"))
             <*> O.switch (O.long "replace" <> O.help "Clear --out first, if schema-diff wrote it")
             <*> scopeParser
