@@ -427,7 +427,9 @@ commandParser =
     diffParser = twoDatabases Diff
     scopeParser =
         Scope
-            <$> O.many (O.strOption (O.long "exclude-schema" <> O.metavar "SCHEMA"))
+            <$> fmap
+                ("hdb_catalog" :)
+                (O.many (O.strOption (O.long "exclude-schema" <> O.metavar "SCHEMA" <> O.help "Leave this schema out; Hasura's hdb_catalog always is")))
             <*> O.switch (O.long "include-partitions" <> O.help "Also compare partitions and their columns")
             <*> fmap
                 not
