@@ -163,6 +163,23 @@ reachableEdges label scope starts (Connected conn extra schema addresses) = do
             pure (allEdges, bodyNotes label (Just (fs.unchecked <> L.sortOn (\(name, _) -> Map.lookup name position) failed)))
 
 
+-- | For each dropped or changed definition in @changes@, the objects in the database @db@
+-- that depend on it, directly or through others, by @pg_depend@ and PL/pgSQL bodies.
+dependentsIn :: Text -> Map ObjectKey Change -> IO (Map Address (Set Address))
+dependentsIn db changes
+    | Set.null starts = pure Map.empty
+    | otherwise = do
+        connected@(Connected _ _ schema _) <- describeDatabase scope db
+        (edges, notes) <- reachableEdges "--db" scope starts connected
+        for_ notes (TIO.hPutStrLn stderr)
+        let known = Set.fromList [k.address | k <- Map.keys schema, k.aspect == Definition]
+        pure (affected known edges changes)
+  where
+    scope = Scope{excluded = ["hdb_catalog"], includePartitions = False, checkFunctionBodies = False}
+    starts = Set.fromList [k.address | (k, c) <- Map.toList changes, k.aspect == Definition, removesOrChanges c]
+    removesOrChanges = \case Added _ -> False; _ -> True
+
+
 -- | Connections per database; the describe queries run over all of them at once.
 describeConnections :: Int
 describeConnections = 4
@@ -335,18 +352,38 @@ main =
                         else BaseFile <$> parse (" at " <> opts.base) original
                 conn <- connect =<< resolveDb db
                 edit <- compareTable conn baseline table statements
+                dependents <- dependentsIn db edit.changes
                 let steps = plan Map.empty edit.current edit.desired [] [] edit.changes
                     same = if opts.againstDatabase then "the file matches the table" else "the file has no schema changes since " <> opts.base
+                    dropped addr = case Map.lookup (ObjectKey Definition addr) edit.changes of
+                        Just (Dropped _) -> True
+                        _ -> False
+                    -- DROP COLUMN also drops the table's indexes and constraints on the column.
+                    goesWith d = d.objectType == "index" || (d.objectType == "table constraint" && take 2 d.objectNames == [table.schema, table.name])
+                    uses =
+                        [ if dropped addr && goesWith d
+                            then (False, [i|#{render d} depends on #{render addr}, and is dropped with it|])
+                            else (dropped addr, [i|#{render d} depends on #{render addr}|])
+                        | (addr, ds) <- Map.toList dependents
+                        , d <- Set.toList ds
+                        ]
+                    blocking = [line | (True, line) <- uses]
                 for_ edit.ignored \(k, reason) -> do
                     let name = render k.address <> if k.aspect == Privileges then " (privileges)" else ""
                     TIO.putStrLn [i|-- left alone: #{name}: #{reason}|]
                 if not opts.write
-                    then
+                    then do
+                        for_ uses \(_, line) -> TIO.putStrLn ("-- " <> line)
+                        unless (null uses) $ TIO.putStrLn ""
                         if null steps
                             then TIO.putStrLn ("-- " <> same)
                             else for_ steps (TIO.putStrLn . renderStep)
                     else do
                         when (null steps) $ failWith ("nothing to write: " <> same)
+                        for_ uses \(_, line) -> TIO.hPutStrLn stderr ("schema-diff: " <> line)
+                        unless (null blocking) do
+                            let n = length blocking
+                            failWith [i|#{n} dependencies on what the edit drops; change or drop the dependents first|]
                         sqitchPlan <- readPlan (root </> opts.planPath)
                         basePlan <- parsePlan <$> jjShow root opts.base opts.planPath
                         now <- getCurrentTime
