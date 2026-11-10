@@ -234,7 +234,7 @@ source s
 connInfoOf :: Source -> IO Text
 connInfoOf = \case
     Database db -> pure db
-    BaselineAt rev -> ensureBaseline rev False
+    BaselineAt rev -> ensureBaseline rev
 
 
 data Command
@@ -243,7 +243,6 @@ data Command
     | Plan Source Text Scope
     | Sqitch Source Text Scope SqitchOptions
     | TableFile FilePath Text TableOptions
-    | BuildBaseline Text Bool
 
 
 data TableOptions = TableOptions
@@ -281,7 +280,6 @@ main =
                     Nothing ->
                         for_ (Map.toList (Map.fromListWith (+) [(k.address.objectType, 1 :: Int) | k <- Map.keys schema])) \(kind, n) ->
                             TIO.putStrLn [i|#{n}\t#{kind}|]
-            BuildBaseline rev rebuild -> ensureBaseline rev rebuild >>= TIO.putStrLn
             Diff from toDb scope -> do
                 fromDb <- connInfoOf from
                 ((fromSchema, edges), (toSchema, _), checks) <- readBoth scope fromDb toDb False
@@ -381,12 +379,6 @@ commandParser =
         <> O.command "plan" (O.info (twoDatabases Plan) (O.progDesc "Print the SQL that turns --from into --to"))
         <> O.command "sqitch" (O.info (twoDatabases Sqitch <*> sqitchOptions) (O.progDesc "Write the plan as sqitch changes"))
         <> O.command
-            "baseline"
-            ( O.info
-                baselineParser
-                (O.progDesc "Bring a scratch database to the schema of a revision's sqitch plan and print its connection string")
-            )
-        <> O.command
             "table"
             ( O.info
                 tableParser
@@ -433,10 +425,6 @@ commandParser =
             <*> O.switch (O.long "replace" <> O.help "Clear --out first, if schema-diff wrote it")
             <*> scopeParser
     diffParser = twoDatabases Diff
-    baselineParser =
-        BuildBaseline
-            <$> O.strOption (O.long "rev" <> O.metavar "REV" <> O.value "master" <> O.help "The jj revision whose sqitch plan to deploy")
-            <*> O.switch (O.long "rebuild" <> O.help "Recreate the server from its image before deploying")
     scopeParser =
         Scope
             <$> O.many (O.strOption (O.long "exclude-schema" <> O.metavar "SCHEMA"))

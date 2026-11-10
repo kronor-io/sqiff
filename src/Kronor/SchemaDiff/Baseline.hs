@@ -42,9 +42,9 @@ data Paths = Paths
 
 
 -- | Makes sure the baseline database holds the schema of @rev@'s sqitch plan and
--- returns its connection string. Rebuilds from scratch when @rebuild@.
-ensureBaseline :: Text -> Bool -> IO Text
-ensureBaseline rev rebuild = do
+-- returns its connection string.
+ensureBaseline :: Text -> IO Text
+ensureBaseline rev = do
     for_ ["docker", "jj"] \tool -> do
         found <- findExecutable tool
         when (isNothing found) $ failWith [i|#{tool} is not on PATH; the baseline database needs it|]
@@ -54,13 +54,12 @@ ensureBaseline rev rebuild = do
     recorded <- doesFileExist p.stateFile >>= bool (pure Nothing) (Just . T.strip <$> readFileUtf8 p.stateFile)
     hasCheckout <- doesDirectoryExist (p.checkout </> ".jj")
     running <- if hasCheckout then isRunning p else pure False
-    if recorded == Just commit && running && not rebuild
+    if recorded == Just commit && running
         then pure connInfo
         else do
             note [i|bringing the baseline database to #{T.take 12 commit} (#{rev})|]
             whenM (doesFileExist p.stateFile) $ removeFile p.stateFile
             checkoutAt p commit
-            when rebuild $ compose p ["down", "-v"]
             start p
             stale <- staleDeploy p
             when stale do
