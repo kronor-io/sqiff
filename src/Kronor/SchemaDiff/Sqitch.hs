@@ -122,6 +122,7 @@ units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (
 
     verb s
         | s.key.aspect == Privileges = "grant"
+        | s.key.aspect == Comment = "comment"
         | s.phase == DropPhase = "drop"
         | isAdded s.change = "add"
         | otherwise = "alter"

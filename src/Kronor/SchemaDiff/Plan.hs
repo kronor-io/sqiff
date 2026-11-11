@@ -4,7 +4,7 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Orders recipe steps: drops before creates, then by rank, then by dependencies.
-module Kronor.SchemaDiff.Plan (plan, context, invert, renderStep) where
+module Kronor.SchemaDiff.Plan (plan, planWith, context, invert, renderStep, topoOrder) where
 
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
@@ -21,12 +21,17 @@ import RIO.Set qualified as Set
 
 -- | @fromEdges@ come from the database being changed; @toEdges@ and @checks@ from the desired one.
 plan :: Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> [Edge] -> Map ObjectKey Change -> [Step]
-plan checks fromSchema toSchema fromEdges toEdges changes =
+plan = planWith id
+
+
+-- | 'plan' with the context adjusted first.
+planWith :: (Context -> Context) -> Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> [Edge] -> Map ObjectKey Change -> [Step]
+planWith adjust checks fromSchema toSchema fromEdges toEdges changes =
     map snd
         $ L.sortOn
             fst
             [ ((s.phase, s.rank, position s, n), s)
-            | (n, s) <- zip [0 :: Int ..] (concatMap (uncurry (recipe (context checks fromSchema toSchema fromEdges changes))) (Map.toList changes))
+            | (n, s) <- zip [0 :: Int ..] (concatMap (uncurry (recipe (adjust (context checks fromSchema toSchema fromEdges changes)))) (Map.toList changes))
             ]
   where
     stepObjects = Set.fromList [fromAddress k.address | k <- Map.keys changes]
@@ -68,6 +73,8 @@ context checks fromSchema toSchema fromEdges changes =
                 , Table t <- [fromAddress k.address]
                 ]
         , droppedColumns = Set.fromList [(t, c) | (Column t c, Dropped _) <- definitions]
+        , viewsAround = Map.empty
+        , droppedObjects = Set.fromList [k.address | (k, Dropped _) <- Map.toList changes, k.aspect == Definition]
         , newTableColumns =
             Map.fromListWith
                 (flip (<>))

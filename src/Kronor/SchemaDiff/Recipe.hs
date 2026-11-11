@@ -19,7 +19,7 @@ import Data.ByteString qualified as B
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import Kronor.SchemaDiff.Body (BodyCheck (..))
-import Kronor.SchemaDiff.Catalog (Address, Aspect (..), ObjectKey (..))
+import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..))
 import Kronor.SchemaDiff.Diff (Change (..))
 import Kronor.SchemaDiff.Object
 import RIO
@@ -75,12 +75,17 @@ data Context = Context
     , recreatedViews :: Map QName ([Text], Maybe (ObjectKey, Text))
     -- ^ Materialized views dropped and created again, with the index definitions and
     -- privileges to restore on them.
+    , viewsAround :: Map (QName, Text) ([Text], [Text])
+    -- ^ For a column whose type changes, the statements that drop the views reading it
+    -- and the ones that create them again, with their grants, indexes, triggers and comments.
+    , droppedObjects :: Set Address
     }
 
 
 recipe :: Context -> ObjectKey -> Change -> [Step]
 recipe ctx key change = case key.aspect of
     Privileges -> privileges key object change
+    Comment -> comment ctx key change
     Definition -> definition ctx key object change
   where
     object = fromAddress key.address
@@ -249,18 +254,27 @@ definition ctx key object change = case object of
         alterColumn old new =
             let typeChanged = old.colType /= new.colType || old.collation /= new.collation
                 defaultChanged = old.defaultExpr /= new.defaultExpr
+                serialToIdentity = isNothing old.identity && isJust new.identity && isJust (serialSequence old) && isNothing new.defaultExpr
+                identityToSerial = isJust old.identity && isNothing new.identity && isJust (serialSequence new) && isNothing old.defaultExpr
+                sequenceMoves = serialToIdentity || identityToSerial
              in [create (Shared, []) (col <> "drop default") | typeChanged, isJust old.defaultExpr]
                     <> [ create
-                            (Shared, [MayRewriteTable, LongLock, MayFail "fails without a USING clause when there is no assignment cast from the old type"])
-                            (col <> "type " <> new.colType <> maybe "" (" collate " <>) new.collation)
+                            ( Shared
+                            , [MayRewriteTable, LongLock, MayFail "fails when an existing value does not convert to the new type"]
+                                <> [MayFail "recreating a view fails when its query relies on the old type; then edit the view" | Map.member (t, c) ctx.viewsAround]
+                            )
+                            (aroundViews (col <> "type " <> new.colType <> maybe "" (" collate " <>) new.collation <> " using " <> quoteIdent c <> "::" <> new.colType))
                        | typeChanged
                        ]
                     <> case new.defaultExpr of
+                        _ | sequenceMoves -> []
                         Just e | defaultChanged || (typeChanged && isJust old.defaultExpr) -> [create (Shared, []) (col <> "set default " <> e)]
                         Nothing | defaultChanged && not typeChanged -> [create (Shared, []) (col <> "drop default")]
                         _ -> []
                     <> notNullSteps old new
                     <> case (old.identity, new.identity) of
+                        _ | serialToIdentity, Just k <- new.identity -> [create (Shared, []) (toIdentity k)]
+                        _ | identityToSerial -> [create (Shared, []) (toSerial new.colType)]
                         (Nothing, Just k) -> [create (Shared, []) [i|#{col}add generated #{k} as identity|]]
                         (Just _, Nothing) -> [create (Shared, []) (col <> "drop identity")]
                         (Just a, Just b) | a /= b -> [create (Shared, []) (col <> "set generated " <> b)]
@@ -271,6 +285,33 @@ definition ctx key object change = case object of
                                 [create (Shared, [h | k == "stored", h <- [MayRewriteTable, LongLock]]) [i|#{col}set expression as (#{e})|]]
                         (a, b) | a /= b -> manual "generated column added or removed"
                         _ -> []
+        aroundViews statement = case Map.lookup (t, c) ctx.viewsAround of
+            Just (drops, creates) | not (null drops) -> T.intercalate ";\n" (drops <> [statement] <> creates)
+            _ -> statement
+        serialSequence d = d.defaultExpr >>= T.stripPrefix "nextval('" >>= T.stripSuffix "'::regclass)"
+        tableLit = literal (qualified t)
+        columnLit = literal c
+        serialName = let tableName = t.name in qualified (QName t.schema [i|#{tableName}_#{c}_seq|])
+        toIdentity k =
+            [i|do $$
+declare seq text := pg_get_serial_sequence(#{tableLit}, #{columnLit}); last bigint; called boolean;
+begin
+    execute format('select last_value, is_called from %s', seq) into last, called;
+    #{col}drop default;
+    execute format('drop sequence %s', seq);
+    #{col}add generated #{k} as identity;
+    perform setval(pg_get_serial_sequence(#{tableLit}, #{columnLit}), last, called);
+end $$|]
+        toSerial colType =
+            [i|do $$
+declare last bigint; called boolean;
+begin
+    execute format('select last_value, is_called from %s', pg_get_serial_sequence(#{tableLit}, #{columnLit})) into last, called;
+    #{col}drop identity;
+    create sequence #{serialName} as #{colType} owned by #{qualified t}.#{quoteIdent c};
+    perform setval(#{literal serialName}, last, called);
+    #{col}set default nextval(#{literal serialName}::regclass);
+end $$|]
         notNullSteps old new = case (old.notNull, new.notNull) of
             (False, True) ->
                 create (Shared, []) [i|#{alter}add #{named new}not null #{quoteIdent c} not valid|]
@@ -353,7 +394,7 @@ definition ctx key object change = case object of
                  in [ create
                         (None, [IndexBuild])
                         (concurrentBuild (QName ix.schema tmp) (T.replace [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoteIdent tmp} ON |] new))
-                    , create (None, []) ("drop index concurrently " <> qualified ix)
+                    , create (None, []) ("drop index concurrently if exists " <> qualified ix)
                     , create (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
                     ]
       where
@@ -502,6 +543,42 @@ privileges key object change = case (target, change) of
         let (role, rest) = T.breakOn " " line
             (privilege, option) = T.breakOn " with grant option" (T.drop 1 rest)
          in (if role == "public" then role else quoteIdent role, privilege, not (T.null option))
+
+
+comment :: Context -> ObjectKey -> Change -> [Step]
+comment ctx key change = case (target, change) of
+    (Nothing, _) -> []
+    (Just _, Dropped _) | key.address `Set.member` ctx.droppedObjects -> []
+    (Just subject, Dropped _) -> [step (subject <> " is null")]
+    (Just subject, Added new) -> [step (subject <> " is " <> literal new)]
+    (Just subject, Changed _ new) -> [step (subject <> " is " <> literal new)]
+  where
+    addr = key.address
+    step sql = Step CreatePhase commentRank addr object ("comment on " <> sql) Shared [] key change
+    object = fromAddress addr
+    target = case (object, addr.objectType, addr.objectNames) of
+        (Table t, _, _) -> Just ("table " <> qualified t)
+        (View t, _, _) -> Just ("view " <> qualified t)
+        (MaterializedView t, _, _) -> Just ("materialized view " <> qualified t)
+        (Column t c, _, _) -> Just ("column " <> qualified t <> "." <> quoteIdent c)
+        (_, kind, [s, t, c]) | kind `elem` ["view column", "materialized view column"] -> Just ("column " <> qualified (QName s t) <> "." <> quoteIdent c)
+        (Index ix, _, _) -> Just ("index " <> qualified ix)
+        (Sequence s, _, _) -> Just ("sequence " <> qualified s)
+        (TableConstraint t c, _, _) -> Just ("constraint " <> quoteIdent c <> " on " <> qualified t)
+        (DomainConstraint d c, _, _) -> Just ("constraint " <> quoteIdent c <> " on domain " <> d)
+        (Trigger t n, _, _) -> Just ("trigger " <> quoteIdent n <> " on " <> qualified t)
+        (Policy t n, _, _) -> Just ("policy " <> quoteIdent n <> " on " <> qualified t)
+        (Routine Function q args, _, _) -> Just [i|function #{qualified q}(#{T.intercalate ", " args})|]
+        (Routine Procedure q args, _, _) -> Just [i|procedure #{qualified q}(#{T.intercalate ", " args})|]
+        (Routine Aggregate q args, _, _) -> Just [i|aggregate #{qualified q}(#{T.intercalate ", " args})|]
+        (Type t, _, _) -> Just ("type " <> t)
+        (Schema s, _, _) -> Just ("schema " <> quoteIdent s)
+        (Extension e, _, _) -> Just ("extension " <> quoteIdent e)
+        _ -> Nothing
+
+
+commentRank :: Int
+commentRank = 16
 
 
 data ColumnDef = ColumnDef

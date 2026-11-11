@@ -55,7 +55,7 @@ import RIO.Text qualified as T
 import RIO.Text.Partial qualified as TP
 
 
-data Aspect = Definition | Privileges
+data Aspect = Definition | Privileges | Comment
     deriving stock (Eq, Ord, Show)
 
 
@@ -173,7 +173,10 @@ describeOn conns excluded includePartitions onlyTable = do
             run conn (excluded, includePartitions, onlyTable, half)
                 $ Statement.unpreparable (wrap (decodeUtf8Lenient body)) describeParams (D.rowList ((,,) <$> catalogIdRow <*> addressRow <*> textColumn))
         _ <- evaluate (foldl' (\n (_, addr, def) -> n + T.length def + sum (map T.length (addr.objectType : addr.objectNames <> addr.objectArgs))) (0 :: Int) rows)
-        let objectAspect = if takeBaseName file == "privileges" then Privileges else Definition
+        let objectAspect = case takeBaseName file of
+                "privileges" -> Privileges
+                "comment" -> Comment
+                _ -> Definition
         (,)
             <$> evaluate (Map.fromList [(ObjectKey objectAspect addr, def) | (_, addr, def) <- rows])
             <*> evaluate (Map.fromList [(ids, addr) | (ids, addr, _) <- rows])

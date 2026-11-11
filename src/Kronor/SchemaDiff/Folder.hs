@@ -58,6 +58,7 @@ objectPath key = segment addr.objectType </> joinPath (map segment parents) </> 
     extension = case key.aspect of
         Definition -> "sql"
         Privileges -> "privileges"
+        Comment -> "comment"
 
 
 shortHash :: Text -> Text

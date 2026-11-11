@@ -15,8 +15,9 @@ import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
 import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, relationColumns, render)
 import Kronor.SchemaDiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
 import Kronor.SchemaDiff.Folder (writeFolder)
-import Kronor.SchemaDiff.Object (QName (..))
-import Kronor.SchemaDiff.Plan (context, invert, plan, renderStep)
+import Kronor.SchemaDiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
+import Kronor.SchemaDiff.Plan (context, invert, plan, planWith, renderStep, topoOrder)
+import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Phase (..), Step (..), Txn (..), parseColumn, recipe)
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
 import Kronor.SchemaDiff.Sqitch (SqitchPlan (..), Unit (..), UnitKind (..), parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
 import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), compareTable)
@@ -168,9 +169,9 @@ reachableEdges label scope starts (Connected conn extra schema addresses) = do
 -- for each dropped or changed column and dropped relation, the other functions whose
 -- definition names it, with its table for a column, or names a view that reads it, with
 -- the view's schema. A view that keeps the column's name must be named with it.
-dependentsIn :: Text -> Map ObjectKey Change -> IO (Map Address (Set Address), Map Address (Set Address))
+dependentsIn :: Text -> Map ObjectKey Change -> IO Dependents
 dependentsIn db changes
-    | Set.null starts = pure (Map.empty, Map.empty)
+    | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty [])
     | otherwise = do
         connected@(Connected conn _ schema _) <- describeDatabase scope db
         (edges, notes) <- reachableEdges "--db" scope starts connected
@@ -198,7 +199,7 @@ dependentsIn db changes
                         , let wordSets = named addr
                         , not (null wordSets)
                         ]
-        pure (exact, textual)
+        pure (Dependents exact textual schema edges)
   where
     relationKinds = ["table", "view", "materialized view", "foreign table"]
     droppedHere addr = case Map.lookup (ObjectKey Definition addr) changes of
@@ -207,6 +208,62 @@ dependentsIn db changes
     scope = Scope{excluded = ["hdb_catalog"], includePartitions = False, checkFunctionBodies = False}
     starts = Set.fromList [k.address | (k, c) <- Map.toList changes, k.aspect == Definition, removesOrChanges c]
     removesOrChanges = \case Added _ -> False; _ -> True
+
+
+-- | What depends on an edit's dropped or changed objects, in the database it runs on.
+data Dependents = Dependents
+    { exact :: Map Address (Set Address)
+    , named :: Map Address (Set Address)
+    , dbSchema :: Schema
+    , dbEdges :: [Edge]
+    }
+
+
+-- | For each column whose type changes, the statements that drop the views reading it,
+-- dependents first, and the ones that create them again with their grants, indexes,
+-- triggers and comments.
+viewsAroundTypeChanges :: Dependents -> [(QName, Text, Address)] -> Map (QName, Text) ([Text], [Text])
+viewsAroundTypeChanges deps retyped =
+    Map.fromList
+        [ ((t, c), (map dropView (reverse order), concatMap createView order))
+        | (t, c, addr) <- retyped
+        , let views = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.exact), isView a]
+        , not (null views)
+        , let viewSet = Set.fromList views
+              order = topoOrder viewSet [(d, r) | e <- deps.dbEdges, let d = relation e.dependent, let r = relation e.referenced, d `Set.member` viewSet, r `Set.member` viewSet]
+        ]
+  where
+    isView a = a.objectType `elem` ["view", "materialized view"]
+    relation a = case (a.objectType, a.objectNames) of
+        (kind, [s, t, _]) | Just rel <- T.stripSuffix " column" kind -> Address rel [s, t] []
+        _ -> a
+    ctx0 = context Map.empty Map.empty Map.empty [] Map.empty
+    dropView a = "drop " <> a.objectType <> " " <> qualifiedAddress a
+    qualifiedAddress a = case a.objectNames of
+        [s, n] -> qualified (QName s n)
+        ns -> T.intercalate "." ns
+    stepsFor key c = map (.sql) (recipe ctx0 key c)
+    createView a =
+        concat
+            [ stepsFor key (Added def)
+            | aspect <- [Definition, Privileges]
+            , let key = ObjectKey aspect a
+            , Just def <- [Map.lookup key deps.dbSchema]
+            ]
+            <> [ def
+               | (k, def) <- Map.toList deps.dbSchema
+               , k.aspect == Definition
+               , case fromAddress k.address of
+                    Index _ -> [i| ON #{qualifiedAddress a} |] `T.isInfixOf` def
+                    Trigger t _ -> [t.schema, t.name] == a.objectNames
+                    _ -> False
+               ]
+            <> concat
+                [ stepsFor k (Added def)
+                | (k, def) <- Map.toList deps.dbSchema
+                , k.aspect == Comment
+                , k.address == a || (relation k.address == a && k.address /= a)
+                ]
 
 
 -- | Connections per database; the describe queries run over all of them at once.
@@ -300,6 +357,8 @@ data TableOptions = TableOptions
     , top :: FilePath
     , planPath :: FilePath
     , tableTag :: Maybe Text
+    , renames :: [(Text, Text)]
+    , dropAndAdd :: Bool
     }
 
 
@@ -334,7 +393,7 @@ main =
                     affectedBy = affected known edges changes
                     dependentsOf key = case key.aspect of
                         Definition -> Map.findWithDefault Set.empty key.address affectedBy
-                        Privileges -> Set.empty
+                        _ -> Set.empty
                 for_ (Map.toList changes) \(key, change) -> report key change (dependentsOf key)
                 TIO.putStrLn (summary changes)
                 unless (Map.null changes) $ exitWith (ExitFailure 1)
@@ -375,15 +434,51 @@ main =
                 let parse label = either (\e -> failWith (T.pack file <> label <> ": " <> e)) pure . (withoutTransactionControl <=< splitStatements)
                 statements <- parse "" =<< readFileUtf8 absFile
                 original <- jjShow root opts.base (makeRelative root absFile)
+                when (opts.againstDatabase && not (null opts.renames)) $ failWith "--rename works with the file comparison, not --against-database"
+                let renameSql (old, new) = [i|alter table #{qualified table} rename column #{quoteIdent old} to #{quoteIdent new}|]
                 baseline <-
                     if opts.againstDatabase
                         then pure (LiveTable opts.allowDrops)
-                        else BaseFile <$> parse (" at " <> opts.base) original
+                        else BaseFile . (<> map renameSql opts.renames) <$> parse (" at " <> opts.base) original
                 conn <- connect =<< resolveDb db
                 edit <- compareTable conn baseline table statements
-                (dependents, mentions) <- dependentsIn db edit.changes
-                let steps = plan Map.empty edit.current edit.desired [] [] edit.changes
+                let columnAddress c = Address "table column" [table.schema, table.name, c] []
+                    renamedFrom = Set.fromList [columnAddress old | (old, _) <- opts.renames]
+                -- A renamed column counts as dropped for finding what names it; nothing else sees that.
+                deps <- dependentsIn db (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom))
+                let dependents = deps.exact
+                    mentions = deps.named
+                    retyped =
+                        [ (t, c, k.address)
+                        | (k, Changed old new) <- Map.toList edit.changes
+                        , k.aspect == Definition
+                        , let o = parseColumn old
+                              n = parseColumn new
+                        , o.colType /= n.colType || o.collation /= n.collation
+                        , Column t c <- [fromAddress k.address]
+                        ]
+                    retypedAddresses = Set.fromList [a | (_, _, a) <- retyped]
+                    around = viewsAroundTypeChanges deps retyped
+                    withViews c = c{viewsAround = around}
+                    renameSteps =
+                        [ Step DropPhase (-1) addr (Column table new) (renameSql (old, new)) Shared [] (ObjectKey Definition addr) (Changed def def)
+                        | (old, new) <- opts.renames
+                        , let addr = columnAddress new
+                              def = Map.findWithDefault "" (ObjectKey Definition addr) edit.desired
+                        ]
+                    steps = renameSteps <> planWith withViews Map.empty edit.current edit.desired [] [] edit.changes
                     same = if opts.againstDatabase then "the file matches the table" else "the file has no schema changes since " <> opts.base
+                    columnsWhere p = [(c, (parseColumn (changeText ch)).colType) | (k, ch) <- Map.toList edit.changes, k.aspect == Definition, p ch, Column _ c <- [fromAddress k.address]]
+                    changeText = \case Added d -> d; Dropped d -> d; Changed _ d -> d
+                    renameLike =
+                        [ (old, new)
+                        | null opts.renames
+                        , not opts.dropAndAdd
+                        , (old, oldType) <- columnsWhere (\case Dropped _ -> True; _ -> False)
+                        , (new, newType) <- columnsWhere (\case Added _ -> True; _ -> False)
+                        , oldType == newType
+                        ]
+                    renameNotes = [[i|#{old} is dropped and #{new} added with the same type; pass --rename #{old}:#{new} if it is a rename, or --drop-and-add if it is not|] | (old, new) <- renameLike]
                     dropped addr = case Map.lookup (ObjectKey Definition addr) edit.changes of
                         Just (Dropped _) -> True
                         _ -> False
@@ -398,37 +493,54 @@ main =
                     section heading = \case
                         [] -> []
                         ds -> ("  " <> heading) : map (("    " <>) . short) ds
-                    report =
+                    isView d = d.objectType `elem` ["view", "materialized view"]
+                    recreated addr d = addr `Set.member` retypedAddresses && (isView d || (d.objectType == "trigger" && any (\v -> isView v && v.objectNames == take 2 d.objectNames) (Map.findWithDefault Set.empty addr dependents)))
+                    -- ALTER COLUMN TYPE rebuilds the column's indexes and constraints itself.
+                    rebuiltWith d = d.objectType `elem` ["index", "table constraint", "sequence"]
+                    usage =
                         concat
                             [ T.intercalate "." addr.objectNames
-                                : section "used by" users
+                                : section (if addr `Set.member` renamedFrom then "used by, and follows the rename" else "used by") users
                                     <> section "dropped with it" with
+                                    <> section "dropped and created again around it" again
                                     <> section "named in" (Set.toList (Map.findWithDefault Set.empty addr mentions))
                             | addr <- Set.toList (Map.keysSet dependents <> Map.keysSet mentions)
-                            , let (with, users) = L.partition (\d -> dropped addr && goesWith d) (Set.toList (Map.findWithDefault Set.empty addr dependents))
+                            , let (with, rest) = L.partition (\d -> dropped addr && goesWith d) (Set.toList (Map.findWithDefault Set.empty addr dependents))
+                                  (again, users) = L.partition (recreated addr) rest
                             ]
-                    blocking = [d | (addr, ds) <- Map.toList dependents, dropped addr, d <- Set.toList ds, not (goesWith d)]
+                            <> renameNotes
+                    blocking =
+                        [d | (addr, ds) <- Map.toList dependents, dropped addr, d <- Set.toList ds, not (goesWith d)]
+                            <> [d | (addr, ds) <- Map.toList dependents, addr `Set.member` retypedAddresses, d <- Set.toList ds, not (recreated addr d), not (rebuiltWith d)]
                 for_ edit.ignored \(k, reason) -> do
                     let name = render k.address <> if k.aspect == Privileges then " (privileges)" else ""
                     TIO.putStrLn [i|-- left alone: #{name}: #{reason}|]
                 if not opts.write
                     then do
-                        for_ report \line -> TIO.putStrLn ("-- " <> line)
-                        unless (null report) $ TIO.putStrLn ""
+                        for_ usage \line -> TIO.putStrLn ("-- " <> line)
+                        unless (null usage) $ TIO.putStrLn ""
                         if null steps
                             then TIO.putStrLn ("-- " <> same)
                             else for_ steps (TIO.putStrLn . renderStep)
                     else do
                         when (null steps) $ failWith ("nothing to write: " <> same)
-                        for_ report (TIO.hPutStrLn stderr)
+                        for_ usage (TIO.hPutStrLn stderr)
                         unless (null blocking) do
                             let n = length blocking
-                            failWith [i|#{n} dependencies on what the edit drops; change or drop the dependents first|]
+                            failWith [i|#{n} dependencies on what the edit drops or retypes; change or drop the dependents first|]
+                        unless (null renameLike) $ failWith "a column is dropped and another added with the same type; say whether it is a rename with --rename or --drop-and-add"
                         sqitchPlan <- readPlan (root </> opts.planPath)
                         basePlan <- parsePlan <$> jjShow root opts.base opts.planPath
                         now <- getCurrentTime
-                        let inverseCtx = context Map.empty edit.desired edit.current [] (Map.map invert edit.changes)
-                            written = units False inverseCtx sqitchPlan now steps
+                        let inverseCtx = withViews (context Map.empty edit.desired edit.current [] (Map.map invert edit.changes))
+                            renameBack =
+                                [ Step DropPhase (-1) (columnAddress old) (Column table old) (renameSql (new, old)) Shared [] s.key s.change
+                                | (s, (old, new)) <- zip renameSteps opts.renames
+                                ]
+                            withRenameBack u
+                                | any (`elem` renameSteps) u.deploy = u{revert = u.revert <> renameBack}
+                                | otherwise = u
+                            written = map withRenameBack (units False inverseCtx sqitchPlan now steps)
                             tagName = fromMaybe (T.pack (formatTime defaultTimeLocale "%Y-%m-%d" now) <> "_schema_diff") opts.tableTag
                             entries p = length (filter (== changeName) p.changes)
                             alreadyReworked = entries sqitchPlan > entries basePlan
@@ -475,7 +587,12 @@ commandParser =
                     <*> O.strOption (O.long "top-dir" <> O.metavar "DIR" <> O.value "database")
                     <*> O.strOption (O.long "plan-file" <> O.metavar "FILE" <> O.value "database/sqitch.plan")
                     <*> O.optional (O.strOption (O.long "tag" <> O.metavar "NAME" <> O.help "Tag to add when the rework needs one"))
+                    <*> O.many (O.option (O.eitherReader renameArg) (O.long "rename" <> O.metavar "OLD:NEW" <> O.help "Column OLD is renamed to NEW; repeat for more columns"))
+                    <*> O.switch (O.long "drop-and-add" <> O.help "A column dropped and one added with the same type are not a rename")
                 )
+    renameArg s = case T.split (== ':') (T.pack s) of
+        [old, new] | not (T.null old), not (T.null new) -> Right (old, new)
+        _ -> Left "expected OLD:NEW"
     sqitchOptions =
         SqitchOptions
             <$> O.strOption (O.long "project" <> O.metavar "DIR" <> O.value "." <> O.help "Where sqitch.conf is")
@@ -541,6 +658,7 @@ report key change dependents = do
     suffix = case key.aspect of
         Definition -> ""
         Privileges -> " (privileges)"
+        Comment -> " (comment)"
 
 
 summary :: Map ObjectKey Change -> Text
