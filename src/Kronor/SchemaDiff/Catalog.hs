@@ -31,6 +31,7 @@ module Kronor.SchemaDiff.Catalog (
     analyseBodies,
     edgesBetween,
     relationColumns,
+    bodyErrors,
     render,
 ) where
 
@@ -399,6 +400,49 @@ render addr = addr.objectType <> " " <> T.intercalate "." addr.objectNames <> ar
     args
         | null addr.objectArgs = ""
         | otherwise = let list = T.intercalate ", " addr.objectArgs in [i|(#{list})|]
+
+
+-- | plpgsql_check's errors, as (function, line, message), for the functions with these
+-- signatures, inside the transaction @conn@ is in; 'Nothing' when plpgsql_check is not
+-- installed. A trigger function is checked against its first trigger's table, or against
+-- @table@ when that trigger's table has been moved aside under @aside@.
+bodyErrors :: Connection.Connection -> Text -> Text -> [Text] -> IO (Maybe (Set (Text, Int32, Text)))
+bodyErrors conn aside table signatures =
+    run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
+        >>= traverse \extSchema -> do
+            _ <- guarded (Connection.use conn (Session.script (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))))
+            Set.fromList . concat <$> for signatures \signature ->
+                either (const []) (map (\(line, message) -> (signature, line, message)))
+                    <$> guarded (Connection.use conn (Session.statement (signature, table) (Statement.unpreparable (query extSchema) params decoder)))
+  where
+    guarded action = do
+        _ <- Connection.use conn (Session.script "savepoint schema_diff_check")
+        result <- action
+        _ <- Connection.use conn (Session.script (either (const "rollback to savepoint schema_diff_check") (const "release savepoint schema_diff_check") result))
+        pure result
+    params = contramap fst (E.param (E.nonNullable E.text)) <> contramap snd (E.param (E.nonNullable E.text))
+    decoder = D.rowList ((,) <$> D.column (D.nonNullable D.int4) <*> textColumn)
+    query extSchema =
+        [i|
+            select coalesce(c.lineno, 0)::int4, c.message
+            from pg_proc f
+            left join lateral (select t.tgrelid from pg_trigger t where t.tgfoid = f.oid order by t.oid limit 1) t on true
+            cross join lateral #{extSchema}.plpgsql_check_function_tb(
+                f.oid::regprocedure,
+                coalesce(
+                    case
+                        when (select n.nspname from pg_class k join pg_namespace n on n.oid = k.relnamespace where k.oid = t.tgrelid) = #{literal aside} then to_regclass($2)
+                        else t.tgrelid::regclass
+                    end,
+                    0::regclass
+                ),
+                fatal_errors => false
+            ) c
+            where f.oid = to_regprocedure($1)
+                and not (f.prorettype = 'trigger'::regtype and t.tgrelid is null)
+                and c.level = 'error'
+        |]
+    literal t = [i|'#{TP.replace "'" "''" t}'|] :: Text
 
 
 -- | The column names of the given relations, by schema and name.

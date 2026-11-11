@@ -10,6 +10,8 @@ module Kronor.SchemaDiff.TableEdit (
     TableEdit (..),
     Baseline (..),
     compareTable,
+    compareTableWith,
+    aside,
 ) where
 
 import Data.String.Interpolate (i)
@@ -51,14 +53,21 @@ data Baseline
 
 
 compareTable :: Connection.Connection -> Baseline -> QName -> [Text] -> IO TableEdit
-compareTable conn baseline table statements = do
-    (current, desired) <-
+compareTable conn baseline table statements = fst <$> compareTableWith conn baseline table statements (pure ()) (const (pure ()))
+
+
+-- | 'compareTable' that also runs @before@ in the transaction before anything changes,
+-- and @after@ once the table is what the edited file creates.
+compareTableWith :: Connection.Connection -> Baseline -> QName -> [Text] -> IO b -> (b -> IO a) -> IO (TableEdit, a)
+compareTableWith conn baseline table statements beforeEdit afterEdit = do
+    (current, desired, afterResult) <-
         ( do
             script "begin"
             xact <- currentXact
             script "set local lock_timeout = '5s'"
             exists <- script' [i|select 1 from pg_class where oid = to_regclass(#{literal (qualified table)})|]
             unless exists $ failWith (qualified table <> " does not exist yet; a new table only needs its own change")
+            beforeResult <- beforeEdit
             -- Owned sequences would move with the table; the ones the files name stay.
             owned <-
                 Connection.use conn (Session.statement () ownedSequences)
@@ -77,18 +86,21 @@ compareTable conn baseline table statements = do
                     schema <- describeTable (QName aside table.name)
                     pure (Map.fromList [(moveBack k, restore def) | (k, def) <- Map.toList schema, belongsTo (QName aside table.name) k def])
             desired <- build xact "as edited" statements
-            pure (current, desired)
+            afterResult <- afterEdit beforeResult
+            pure (current, desired, afterResult)
         )
             `finally` void (Connection.use conn (Session.script "rollback"))
     let all' = diff (\_ a b -> a == b) current (Map.mapWithKey (keepSettings current) desired)
         reasons = Map.mapMaybeWithKey leftOut all'
     pure
-        TableEdit
+        ( TableEdit
             { current
             , desired
             , changes = all' `Map.difference` reasons
             , ignored = Map.toList reasons
             }
+        , afterResult
+        )
   where
     script sql = Connection.use conn (Session.script sql) >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
 

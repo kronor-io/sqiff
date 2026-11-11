@@ -12,7 +12,7 @@ import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
 import Kronor.SchemaDiff.Baseline (ensureBaseline)
 import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
-import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, relationColumns, render)
+import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, relationColumns, render)
 import Kronor.SchemaDiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
 import Kronor.SchemaDiff.Folder (writeFolder)
 import Kronor.SchemaDiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
@@ -20,7 +20,7 @@ import Kronor.SchemaDiff.Plan (context, invert, plan, planWith, renderStep, topo
 import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Phase (..), Step (..), Txn (..), parseColumn, recipe)
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
 import Kronor.SchemaDiff.Sqitch (SqitchPlan (..), Unit (..), UnitKind (..), parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
-import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), compareTable)
+import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), aside, compareTable, compareTableWith)
 import Options.Applicative qualified as O
 import RIO
 import RIO.Directory (makeAbsolute)
@@ -446,8 +446,23 @@ main =
                     renamedFrom = Set.fromList [columnAddress old | (old, _) <- opts.renames]
                 -- A renamed column counts as dropped for finding what names it; nothing else sees that.
                 deps <- dependentsIn db (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom))
-                let dependents = deps.exact
-                    mentions = deps.named
+                -- The PL/pgSQL functions the text match found, checked before the edit and
+                -- after it; an error that only the edited table brings means the function breaks.
+                let plpgsql = [a | a <- Set.toList (fold deps.named), Just def <- [Map.lookup (ObjectKey Definition a) deps.dbSchema], "LANGUAGE plpgsql" `T.isInfixOf` def]
+                    signature a = case a.objectNames of
+                        [s, n] -> let args = T.intercalate ", " a.objectArgs in [i|#{quoteIdent s}.#{quoteIdent n}(#{args})|]
+                        _ -> render a
+                    bySignature = Map.fromList [(signature a, a) | a <- plpgsql]
+                    check = bodyErrors conn aside (qualified table) (Map.keys bySignature)
+                checked <-
+                    if null plpgsql
+                        then pure Nothing
+                        else snd <$> compareTableWith conn baseline table statements check (\before -> (\after -> Set.difference <$> after <*> before) <$> check)
+                let breaking = Map.fromListWith (\_ earlier -> earlier) [(a, message) | (s, _, message) <- maybe [] Set.toList checked, Just a <- [Map.lookup s bySignature]]
+                    passed = Set.fromList [a | isJust checked, a <- plpgsql, a `Map.notMember` breaking, Just def <- [Map.lookup (ObjectKey Definition a) deps.dbSchema], not ("execute" `T.isInfixOf` T.toLower def)]
+                    breaksFor addr = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.named), a `Map.member` breaking]
+                    dependents = deps.exact
+                    mentions = Map.map (Set.filter (\a -> a `Map.notMember` breaking && a `Set.notMember` passed)) deps.named
                     retyped =
                         [ (t, c, k.address)
                         | (k, Changed old new) <- Map.toList edit.changes
@@ -493,6 +508,9 @@ main =
                     section heading = \case
                         [] -> []
                         ds -> ("  " <> heading) : map (("    " <>) . short) ds
+                    breaksSection = \case
+                        [] -> []
+                        fs -> "  breaks, by plpgsql_check" : concat [["    " <> short f, "      " <> Map.findWithDefault "" f breaking] | f <- fs]
                     isView d = d.objectType `elem` ["view", "materialized view"]
                     recreated addr d = addr `Set.member` retypedAddresses && (isView d || (d.objectType == "trigger" && any (\v -> isView v && v.objectNames == take 2 d.objectNames) (Map.findWithDefault Set.empty addr dependents)))
                     -- ALTER COLUMN TYPE rebuilds the column's indexes and constraints itself.
@@ -503,8 +521,10 @@ main =
                                 : section (if addr `Set.member` renamedFrom then "used by, and follows the rename" else "used by") users
                                     <> section "dropped with it" with
                                     <> section "dropped and created again around it" again
+                                    <> breaksSection (breaksFor addr)
                                     <> section "named in" (Set.toList (Map.findWithDefault Set.empty addr mentions))
-                            | addr <- Set.toList (Map.keysSet dependents <> Map.keysSet mentions)
+                            | addr <- Set.toList (Map.keysSet dependents <> Map.keysSet deps.named)
+                            , not (null (Map.findWithDefault Set.empty addr dependents)) || not (null (breaksFor addr)) || not (null (Map.findWithDefault Set.empty addr mentions))
                             , let (with, rest) = L.partition (\d -> dropped addr && goesWith d) (Set.toList (Map.findWithDefault Set.empty addr dependents))
                                   (again, users) = L.partition (recreated addr) rest
                             ]
@@ -512,6 +532,7 @@ main =
                     blocking =
                         [d | (addr, ds) <- Map.toList dependents, dropped addr, d <- Set.toList ds, not (goesWith d)]
                             <> [d | (addr, ds) <- Map.toList dependents, addr `Set.member` retypedAddresses, d <- Set.toList ds, not (recreated addr d), not (rebuiltWith d)]
+                            <> Map.keys breaking
                 for_ edit.ignored \(k, reason) -> do
                     let name = render k.address <> if k.aspect == Privileges then " (privileges)" else ""
                     TIO.putStrLn [i|-- left alone: #{name}: #{reason}|]
