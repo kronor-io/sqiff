@@ -30,6 +30,7 @@ module Kronor.SchemaDiff.Catalog (
     plpgsqlFunctions,
     analyseBodies,
     edgesBetween,
+    relationColumns,
     render,
 ) where
 
@@ -99,6 +100,10 @@ plpgsqlFunctionsQuery = $(makeRelativeToProject "sql/plpgsql/functions.sql" >>= 
 
 plpgsqlDependQuery :: ByteString
 plpgsqlDependQuery = $(makeRelativeToProject "sql/plpgsql/depend.sql" >>= embedFile)
+
+
+plpgsqlTempTablesScript :: ByteString
+plpgsqlTempTablesScript = $(makeRelativeToProject "sql/plpgsql/temp_tables.sql" >>= embedFile)
 
 
 -- | A failure the command line reports as one line.
@@ -306,6 +311,7 @@ data PlFunction = PlFunction
 -- that uses one as using the function, though the body never names it.
 data PlFunctions = PlFunctions
     { query :: Text
+    , tempTables :: Text
     , checkable :: [PlFunction]
     , unchecked :: Skipped
     , implicit :: [Int64]
@@ -322,7 +328,8 @@ plpgsqlFunctions conn excluded =
             functions <- run conn excluded (Statement.unpreparable (decodeUtf8Lenient plpgsqlFunctionsQuery) excludedParam (D.rowList functionRow))
             implicit <- run conn () (Statement.unpreparable implicitQuery mempty (D.rowList int8Column))
             let (unchecked, checkable) = partitionEithers (map triggerTable functions)
-            pure (PlFunctions (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlDependQuery)) checkable unchecked implicit)
+            let withSchema = TP.replace "@extschema@" extSchema . decodeUtf8Lenient
+            pure (PlFunctions (withSchema plpgsqlDependQuery) (withSchema plpgsqlTempTablesScript) checkable unchecked implicit)
   where
     implicitQuery = "select castfunc::int8 from pg_cast where castfunc >= 16384 union select oprcode::int8 from pg_operator where oprcode >= 16384"
     functionRow = (,,,,) <$> D.column (D.nonNullable D.int8) <*> textColumn <*> D.column (D.nonNullable D.bool) <*> D.column (D.nullable D.int8) <*> int8Column
@@ -343,7 +350,10 @@ analyseBodies conns fs functions = do
     let next = atomicModifyIORef' queue \case
             [] -> ([], Nothing)
             b : rest -> (rest, Just b)
-        worker c = next >>= maybe (pure []) (\b -> (:) <$> inBatches c fs.query b <*> worker c)
+        work c = next >>= maybe (pure []) (\b -> (:) <$> inBatches c fs.query b <*> work c)
+        worker c = do
+            void (Connection.use c (Session.script fs.tempTables))
+            work c `finally` void (Connection.use c (Session.script "discard temp; reset client_min_messages"))
     results <- concat <$> forConcurrently (toList conns) worker
     let position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
         failed = L.sortOn (\(name, _) -> Map.lookup name position) (concatMap snd results)
@@ -386,6 +396,22 @@ render addr = addr.objectType <> " " <> T.intercalate "." addr.objectNames <> ar
     args
         | null addr.objectArgs = ""
         | otherwise = let list = T.intercalate ", " addr.objectArgs in [i|(#{list})|]
+
+
+-- | The column names of the given relations, by schema and name.
+relationColumns :: Connection.Connection -> [(Text, Text)] -> IO (Map (Text, Text) (Set Text))
+relationColumns conn relations =
+    Map.fromListWith (<>)
+        . map (\(s, r, c) -> ((s, r), Set.singleton c))
+        <$> run conn relations (Statement.unpreparable query params (D.rowList ((,,) <$> textColumn <*> textColumn <*> textColumn)))
+  where
+    query =
+        "select n.nspname::text, c.relname::text, a.attname::text \
+        \from unnest($1::text[], $2::text[]) u(s, r) \
+        \join pg_namespace n on n.nspname = u.s \
+        \join pg_class c on c.relnamespace = n.oid and c.relname = u.r \
+        \join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped"
+    params = contramap (map fst) excludedParam <> contramap (map snd) excludedParam
 
 
 run :: Connection.Connection -> params -> Statement.Statement params a -> IO a

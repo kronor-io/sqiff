@@ -12,7 +12,7 @@ import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
 import Kronor.SchemaDiff.Baseline (ensureBaseline)
 import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
-import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, render)
+import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, relationColumns, render)
 import Kronor.SchemaDiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
 import Kronor.SchemaDiff.Folder (writeFolder)
 import Kronor.SchemaDiff.Object (QName (..))
@@ -164,17 +164,46 @@ reachableEdges label scope starts (Connected conn extra schema addresses) = do
 
 
 -- | For each dropped or changed definition in @changes@, the objects in the database @db@
--- that depend on it, directly or through others, by @pg_depend@ and PL/pgSQL bodies.
-dependentsIn :: Text -> Map ObjectKey Change -> IO (Map Address (Set Address))
+-- that depend on it, directly or through others, by @pg_depend@ and PL/pgSQL bodies; and
+-- for each dropped or changed column and dropped relation, the other functions whose
+-- definition names it, with its table for a column, or names a view that reads it, with
+-- the view's schema. A view that keeps the column's name must be named with it.
+dependentsIn :: Text -> Map ObjectKey Change -> IO (Map Address (Set Address), Map Address (Set Address))
 dependentsIn db changes
-    | Set.null starts = pure Map.empty
+    | Set.null starts = pure (Map.empty, Map.empty)
     | otherwise = do
-        connected@(Connected _ _ schema _) <- describeDatabase scope db
+        connected@(Connected conn _ schema _) <- describeDatabase scope db
         (edges, notes) <- reachableEdges "--db" scope starts connected
         for_ notes (TIO.hPutStrLn stderr)
         let known = Set.fromList [k.address | k <- Map.keys schema, k.aspect == Definition]
-        pure (affected known edges changes)
+            exact = affected known edges changes
+            viewsOf addr = [(s, v) | a <- Set.toList (Map.findWithDefault Set.empty addr exact), a.objectType `elem` ["view", "materialized view"], [s, v] <- [a.objectNames]]
+        viewColumns <- relationColumns conn (Set.toList (Set.fromList (concatMap viewsOf (Set.toList starts))))
+        let routines = [(k.address, bodyText def) | (k, def) <- Map.toList schema, k.aspect == Definition, k.address.objectType `elem` ["function", "procedure"]]
+            skip = Set.fromList (map (.address) (Map.keys changes)) <> fold exact
+            throughViews column addr =
+                [ T.toLower s : T.toLower v : [T.toLower c | Just c <- [column], keepsName c]
+                | (s, v) <- viewsOf addr
+                , let keepsName c = c `Set.member` Map.findWithDefault Set.empty (s, v) viewColumns
+                ]
+            named addr = case (addr.objectType, addr.objectNames) of
+                ("table column", [_, t, c]) -> [T.toLower t, T.toLower c] : throughViews (Just c) addr
+                (kind, [_, t]) | kind `elem` relationKinds, droppedHere addr -> [T.toLower t] : throughViews Nothing addr
+                _ -> []
+            textual =
+                Map.filter (not . Set.null)
+                    $ Map.fromList
+                        [ (addr, Set.fromList [r | (r, body) <- routines, any (all (`HS.member` body.wordSet)) wordSets, r `Set.notMember` skip])
+                        | addr <- Set.toList starts
+                        , let wordSets = named addr
+                        , not (null wordSets)
+                        ]
+        pure (exact, textual)
   where
+    relationKinds = ["table", "view", "materialized view", "foreign table"]
+    droppedHere addr = case Map.lookup (ObjectKey Definition addr) changes of
+        Just (Dropped _) -> True
+        _ -> False
     scope = Scope{excluded = ["hdb_catalog"], includePartitions = False, checkFunctionBodies = False}
     starts = Set.fromList [k.address | (k, c) <- Map.toList changes, k.aspect == Definition, removesOrChanges c]
     removesOrChanges = \case Added _ -> False; _ -> True
@@ -352,7 +381,7 @@ main =
                         else BaseFile <$> parse (" at " <> opts.base) original
                 conn <- connect =<< resolveDb db
                 edit <- compareTable conn baseline table statements
-                dependents <- dependentsIn db edit.changes
+                (dependents, mentions) <- dependentsIn db edit.changes
                 let steps = plan Map.empty edit.current edit.desired [] [] edit.changes
                     same = if opts.againstDatabase then "the file matches the table" else "the file has no schema changes since " <> opts.base
                     dropped addr = case Map.lookup (ObjectKey Definition addr) edit.changes of
@@ -360,27 +389,38 @@ main =
                         _ -> False
                     -- DROP COLUMN also drops the table's indexes and constraints on the column.
                     goesWith d = d.objectType == "index" || (d.objectType == "table constraint" && take 2 d.objectNames == [table.schema, table.name])
-                    uses =
-                        [ if dropped addr && goesWith d
-                            then (False, [i|#{render d} depends on #{render addr}, and is dropped with it|])
-                            else (dropped addr, [i|#{render d} depends on #{render addr}|])
-                        | (addr, ds) <- Map.toList dependents
-                        , d <- Set.toList ds
-                        ]
-                    blocking = [line | (True, line) <- uses]
+                    listed = fold dependents <> fold mentions
+                    overloaded = Map.keysSet (Map.filter (> (1 :: Int)) (Map.fromListWith (+) [((a.objectType, a.objectNames), 1) | a <- Set.toList listed]))
+                    short a =
+                        (if a.objectType `elem` ["function", "procedure"] then "" else a.objectType <> " ")
+                            <> T.intercalate "." a.objectNames
+                            <> if (a.objectType, a.objectNames) `Set.member` overloaded then let args = T.intercalate ", " a.objectArgs in [i|(#{args})|] else ""
+                    section heading = \case
+                        [] -> []
+                        ds -> ("  " <> heading) : map (("    " <>) . short) ds
+                    report =
+                        concat
+                            [ T.intercalate "." addr.objectNames
+                                : section "used by" users
+                                    <> section "dropped with it" with
+                                    <> section "named in" (Set.toList (Map.findWithDefault Set.empty addr mentions))
+                            | addr <- Set.toList (Map.keysSet dependents <> Map.keysSet mentions)
+                            , let (with, users) = L.partition (\d -> dropped addr && goesWith d) (Set.toList (Map.findWithDefault Set.empty addr dependents))
+                            ]
+                    blocking = [d | (addr, ds) <- Map.toList dependents, dropped addr, d <- Set.toList ds, not (goesWith d)]
                 for_ edit.ignored \(k, reason) -> do
                     let name = render k.address <> if k.aspect == Privileges then " (privileges)" else ""
                     TIO.putStrLn [i|-- left alone: #{name}: #{reason}|]
                 if not opts.write
                     then do
-                        for_ uses \(_, line) -> TIO.putStrLn ("-- " <> line)
-                        unless (null uses) $ TIO.putStrLn ""
+                        for_ report \line -> TIO.putStrLn ("-- " <> line)
+                        unless (null report) $ TIO.putStrLn ""
                         if null steps
                             then TIO.putStrLn ("-- " <> same)
                             else for_ steps (TIO.putStrLn . renderStep)
                     else do
                         when (null steps) $ failWith ("nothing to write: " <> same)
-                        for_ uses \(_, line) -> TIO.hPutStrLn stderr ("schema-diff: " <> line)
+                        for_ report (TIO.hPutStrLn stderr)
                         unless (null blocking) do
                             let n = length blocking
                             failWith [i|#{n} dependencies on what the edit drops; change or drop the dependents first|]
