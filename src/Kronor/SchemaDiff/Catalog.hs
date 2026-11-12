@@ -442,9 +442,7 @@ bodyErrors conn aside table made signatures sqlSignatures =
         >>= traverse \extSchema -> do
             tempTables <- made >>= maybe (pure (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))) pure
             _ <- timed "bodyErrors.tempTables" $ guarded (Connection.use conn (Session.script tempTables))
-            plErrors <- for signatures \signature ->
-                either (const []) (map (\(line, message) -> (signature, line, message)))
-                    <$> timed ("bodyErrors.fn " <> signature) (guarded (Connection.use conn (Session.statement (signature, table) (Statement.unpreparable (query extSchema) params decoder))))
+            plErrors <- for (chunks signatures) (timed "bodyErrors.batch" . inBatches extSchema)
             -- A SQL function with a string body is parsed again by its language's validator.
             sqlErrors <- for sqlSignatures \signature ->
                 either (\e -> [(signature, 0, errorText e)]) (const [])
@@ -458,29 +456,48 @@ bodyErrors conn aside table made signatures sqlSignatures =
         result <- action
         _ <- Connection.use conn (Session.script (either (const "rollback to savepoint schema_diff_check") (const "release savepoint schema_diff_check") result))
         pure result
-    params = contramap fst (E.param (E.nonNullable E.text)) <> contramap snd (E.param (E.nonNullable E.text))
-    decoder = D.rowList ((,) <$> D.column (D.nonNullable D.int4) <*> textColumn)
+    -- One statement for several functions; a batch that fails is split until the failing
+    -- functions stand alone, and those report nothing.
+    inBatches _ [] = pure []
+    inBatches extSchema batch =
+        guarded (Connection.use conn (Session.statement (batch, table) (Statement.unpreparable (query extSchema) params decoder))) >>= \case
+            Right errors -> pure errors
+            Left _
+                | [_] <- batch -> pure []
+                | otherwise -> do
+                    let (left, right) = L.splitAt (length batch `div` 2) batch
+                    (<>) <$> inBatches extSchema left <*> inBatches extSchema right
+    chunks xs = case L.splitAt 16 xs of
+        ([], _) -> []
+        (b, rest) -> b : chunks rest
+    params = contramap fst (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.text)))) <> contramap snd (E.param (E.nonNullable E.text))
+    decoder = D.rowList ((,,) <$> textColumn <*> D.column (D.nonNullable D.int4) <*> textColumn)
     query extSchema =
         [i|
-            select coalesce(c.lineno, 0)::int4, c.message
-            from pg_proc f
-            left join lateral (select t.tgrelid, t.tgoldtable, t.tgnewtable from pg_trigger t where t.tgfoid = f.oid order by t.oid limit 1) t on true
-            cross join lateral #{extSchema}.plpgsql_check_function_tb(
-                f.oid::regprocedure,
-                coalesce(
-                    case
-                        when (select n.nspname from pg_class k join pg_namespace n on n.oid = k.relnamespace where k.oid = t.tgrelid) = #{literal aside} then to_regclass($2)
-                        else t.tgrelid::regclass
-                    end,
-                    0::regclass
-                ),
-                fatal_errors => false,
-                oldtable => t.tgoldtable,
-                newtable => t.tgnewtable
-            ) c
-            where f.oid = to_regprocedure($1)
-                and not (f.prorettype = 'trigger'::regtype and t.tgrelid is null)
-                and c.level = 'error'
+            select s.signature, e.lineno, e.message
+            from unnest($1::text[]) with ordinality s (signature, n)
+            cross join lateral (
+                select coalesce(c.lineno, 0)::int4 as lineno, c.message
+                from pg_proc f
+                left join lateral (select t.tgrelid, t.tgoldtable, t.tgnewtable from pg_trigger t where t.tgfoid = f.oid order by t.oid limit 1) t on true
+                cross join lateral #{extSchema}.plpgsql_check_function_tb(
+                    f.oid::regprocedure,
+                    coalesce(
+                        case
+                            when (select n.nspname from pg_class k join pg_namespace n on n.oid = k.relnamespace where k.oid = t.tgrelid) = #{literal aside} then to_regclass($2)
+                            else t.tgrelid::regclass
+                        end,
+                        0::regclass
+                    ),
+                    fatal_errors => false,
+                    oldtable => t.tgoldtable,
+                    newtable => t.tgnewtable
+                ) c
+                where f.oid = to_regprocedure(s.signature)
+                    and not (f.prorettype = 'trigger'::regtype and t.tgrelid is null)
+                    and c.level = 'error'
+            ) e
+            order by s.n
         |]
     literal t = [i|'#{TP.replace "'" "''" t}'|] :: Text
 
