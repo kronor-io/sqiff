@@ -166,17 +166,22 @@ reachableEdges label scope starts (Connected conn extra schema addresses) = time
             pure (allEdges, bodyNotes label (Just (fs.unchecked <> L.sortOn (\(name, _) -> Map.lookup name position) failed)))
 
 
--- | For each dropped or changed definition in @changes@, the objects in the database @db@
--- that depend on it, directly or through others, by @pg_depend@ and PL/pgSQL bodies; and
--- for each dropped or changed column and dropped relation, the other functions whose
--- definition names it, with its table for a column, or names a view that reads it, with
--- the view's schema. A view that keeps the column's name must be named with it.
-dependentsIn :: Text -> Map ObjectKey Change -> IO Dependents
-dependentsIn db changes
+-- | How 'dependentsIn' describes the database.
+dependentsScope :: Scope
+dependentsScope = Scope{excluded = ["hdb_catalog"], includePartitions = False, checkFunctionBodies = False}
+
+
+-- | For each dropped or changed definition in @changes@, the objects in the database
+-- @described@ gives that depend on it, directly or through others, by @pg_depend@ and
+-- PL/pgSQL bodies; and for each dropped or changed column and dropped relation, the other
+-- functions whose definition names it, with its table for a column, or names a view that
+-- reads it, with the view's schema. A view that keeps the column's name must be named with it.
+dependentsIn :: IO Connected -> Map ObjectKey Change -> IO Dependents
+dependentsIn described changes
     | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty [])
     | otherwise = do
-        connected@(Connected conn _ schema _) <- timed "deps.describeDatabase" $ describeDatabase scope db
-        (edges, notes) <- timed "deps.reachableEdges" $ reachableEdges "--db" scope starts connected
+        connected@(Connected conn _ schema _) <- timed "deps.describeDatabase" described
+        (edges, notes) <- timed "deps.reachableEdges" $ reachableEdges "--db" dependentsScope starts connected
         for_ notes (TIO.hPutStrLn stderr)
         let known = Set.fromList [k.address | k <- Map.keys schema, k.aspect == Definition]
             exact = affected known edges changes
@@ -209,7 +214,6 @@ dependentsIn db changes
     droppedHere addr = case Map.lookup (ObjectKey Definition addr) changes of
         Just (Dropped _) -> True
         _ -> False
-    scope = Scope{excluded = ["hdb_catalog"], includePartitions = False, checkFunctionBodies = False}
     starts = Set.fromList [k.address | (k, c) <- Map.toList changes, k.aspect == Definition, removesOrChanges c]
     removesOrChanges = \case Added _ -> False; _ -> True
 
@@ -487,7 +491,16 @@ main =
                     _ -> failWith (T.pack file <> " is not a table's own deploy file (<schema>/table/<name>.sql)")
                 let parse label = either (\e -> failWith (T.pack file <> label <> ": " <> e)) pure . (withoutTransactionControl <=< splitStatements)
                 statements <- parse "" =<< readFileUtf8 absFile
+                -- Other connections describe the database while the table is compared, which
+                -- happens in a transaction that is rolled back; waited for only when needed.
+                early <- if opts.againstDatabase || not (null opts.renames) then Just <$> async (describeDatabase dependentsScope db) else pure Nothing
                 original <- timed "table.jjShow" $ jjShow root opts.base (makeRelative root absFile)
+                -- A file unchanged since --base has nothing to describe the database for.
+                described <- case early of
+                    Just a -> pure (wait a)
+                    Nothing
+                        | Right statements == (withoutTransactionControl <=< splitStatements) original -> pure (describeDatabase dependentsScope db)
+                        | otherwise -> wait <$> async (describeDatabase dependentsScope db)
                 when (opts.againstDatabase && not (null opts.renames)) $ failWith "--rename works with the file comparison, not --against-database"
                 let renameSql (old, new) = [i|alter table #{qualified table} rename column #{quoteIdent old} to #{quoteIdent new}|]
                 baseline <-
@@ -499,7 +512,7 @@ main =
                 let columnAddress c = Address "table column" [table.schema, table.name, c] []
                     renamedFrom = Set.fromList [columnAddress old | (old, _) <- opts.renames]
                 -- A renamed column counts as dropped for finding what names it; nothing else sees that.
-                deps <- timed "table.dependentsIn" $ dependentsIn db (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom))
+                deps <- timed "table.dependentsIn" $ dependentsIn described (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom))
                 -- The PL/pgSQL functions and SQL functions with a string body that depend on the
                 -- edit or name it, checked before the edit and after it; an error that only the
                 -- edited table brings means the function breaks.
