@@ -27,6 +27,7 @@ import Hasql.Statement qualified as Statement
 import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, describeOn, errorText, failWith)
 import Kronor.SchemaDiff.Diff (Change (..), diff)
 import Kronor.SchemaDiff.Object
+import Kronor.SchemaDiff.Timing (timed)
 import RIO
 import RIO.Map qualified as Map
 
@@ -115,7 +116,7 @@ compareTableWith conn baseline table statements beforeEdit afterEdit = do
             script "set local lock_timeout = '5s'"
             exists <- script' [i|select 1 from pg_class where oid = to_regclass(#{literal (qualified table)})|]
             unless exists $ failWith (qualified table <> " does not exist yet; a new table only needs its own change")
-            beforeResult <- beforeEdit
+            beforeResult <- timed "tableEdit.before" beforeEdit
             -- Owned sequences would move with the table; the ones the files name stay.
             owned <-
                 Connection.use conn (Session.statement () ownedSequences)
@@ -124,7 +125,7 @@ compareTableWith conn baseline table statements beforeEdit afterEdit = do
                 script [i|alter sequence #{tableSchemaRef}#{quoteIdent s} owned by none|]
             script ("create schema " <> aside)
             script ("alter table " <> qualified table <> " set schema " <> aside)
-            current <- case baseline of
+            current <- timed "tableEdit.current" case baseline of
                 BaseFile base -> do
                     script "savepoint schema_diff_base"
                     built <- build xact "before the edit" base
@@ -133,8 +134,8 @@ compareTableWith conn baseline table statements beforeEdit afterEdit = do
                 LiveTable _ -> do
                     schema <- describeTable (QName aside table.name)
                     pure (Map.fromList [(moveBack k, restore def) | (k, def) <- Map.toList schema, belongsTo (QName aside table.name) k def])
-            desired <- build xact "as edited" statements
-            afterResult <- afterEdit beforeResult
+            desired <- timed "tableEdit.desired" $ build xact "as edited" statements
+            afterResult <- timed "tableEdit.after" $ afterEdit beforeResult
             pure (current, desired, afterResult)
         )
             `finally` void (Connection.use conn (Session.script "rollback"))
@@ -170,7 +171,7 @@ compareTableWith conn baseline table statements beforeEdit afterEdit = do
         Connection.use conn (Session.statement () (Statement.unpreparable "select pg_current_xact_id()::text" E.noParams (D.singleRow (D.column (D.nonNullable D.text)))))
             >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
 
-    describeTable q = fst <$> describeOn [conn] [] False (Just (qualified q))
+    describeTable q = timed "tableEdit.describeTable" $ fst <$> describeOn [conn] [] False (Just (qualified q))
 
     ownedSequences =
         Statement.unpreparable

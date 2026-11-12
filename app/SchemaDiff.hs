@@ -21,6 +21,7 @@ import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
 import Kronor.SchemaDiff.Sqitch (SqitchPlan (..), Unit (..), UnitKind (..), parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
 import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), aside, compareTable, compareTableWith, firstFailure, foreignKeyError, typeChangeFacts)
+import Kronor.SchemaDiff.Timing (measure, timed)
 import Options.Applicative qualified as O
 import RIO
 import RIO.Directory (makeAbsolute)
@@ -70,7 +71,7 @@ neededFor forPlan changes
 -- | Edges from @pg_depend@ and, when plpgsql_check is installed, from PL/pgSQL bodies,
 -- with notes for stderr. @label@ names the database in the notes.
 edgesOf :: Text -> Scope -> Needed -> Connected -> IO ([Edge], [Text])
-edgesOf label scope needed connected@(Connected conn extra _ addresses) = case needed of
+edgesOf label scope needed connected@(Connected conn extra _ addresses) = timed ("edgesOf " <> label) case needed of
     ReachableFrom starts -> reachableEdges label scope starts connected
     _ -> do
         let wantedIds wanted = [ids | (ids, addr) <- Map.toList addresses, addr `Set.member` wanted]
@@ -79,11 +80,11 @@ edgesOf label scope needed connected@(Connected conn extra _ addresses) = case n
                 _ -> Just Set.empty
         (edges, body) <-
             concurrently
-                ( case needed of
+                ( timed ("edgesOf.dependOn " <> label) case needed of
                     BodiesOf wanted -> dependenciesOn conn addresses (wantedIds wanted)
                     _ -> pure []
                 )
-                (fmap (first (edgesBetween addresses)) <$> bodyUses (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded only)
+                (timed ("edgesOf.bodyUses " <> label) $ fmap (first (edgesBetween addresses)) <$> bodyUses (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded only)
         pure (edges <> maybe [] fst body, bodyNotes label (snd <$> body))
 
 
@@ -110,7 +111,7 @@ bodyNotes label = \case
 -- the closure, whose dependents are then read, and those can make other functions
 -- matter, so it repeats until nothing new is reached or picked.
 reachableEdges :: Text -> Scope -> Set Address -> Connected -> IO ([Edge], [Text])
-reachableEdges label scope starts (Connected conn extra schema addresses) = do
+reachableEdges label scope starts (Connected conn extra schema addresses) = timed ("reachableEdges " <> label) do
     let idsOf = Map.fromListWith (<>) [(addr, [ids]) | (ids, addr) <- Map.toList addresses]
         idsFor = concatMap (\a -> Map.findWithDefault [] a idsOf) . Set.toList
         -- depend_from.sql reads the dependents of a relation's columns with the relation's.
@@ -119,8 +120,9 @@ reachableEdges label scope starts (Connected conn extra schema addresses) = do
     -- The definitions are split into words while pg_depend is read, in parts on every core.
     (edges, functions) <-
         concurrently
-            (dependenciesFrom conn addresses (idsFor starts))
-            ( plpgsqlFunctions (fromMaybe conn (listToMaybe extra)) scope.excluded
+            (timed "reach.dependFrom0" $ dependenciesFrom conn addresses (idsFor starts))
+            ( timed "reach.functionsAndWords"
+                $ plpgsqlFunctions (fromMaybe conn (listToMaybe extra)) scope.excluded
                 >>= traverse \fs -> do
                     let split part = do
                             let described =
@@ -144,7 +146,7 @@ reachableEdges label scope starts (Connected conn extra schema addresses) = do
                 go explored pgEdges done bodyEdges failed = do
                     let dependents = dependentsBy (pgEdges <> bodyEdges)
                         frontier = (starts <> reachedFrom dependents starts) `Set.difference` explored
-                    more <- dependenciesFrom conn addresses (idsFor frontier)
+                    more <- timed "reach.dependFrom" $ dependenciesFrom conn addresses (idsFor frontier)
                     let pgEdges' = pgEdges <> more
                         explored' = explored <> withColumns (frontier <> Set.fromList (map (.dependent) more))
                         dependents' = dependentsBy (pgEdges' <> bodyEdges)
@@ -158,7 +160,7 @@ reachableEdges label scope starts (Connected conn extra schema addresses) = do
                             | Set.null frontier -> pure (pgEdges' <> bodyEdges, failed)
                             | otherwise -> go explored' pgEdges' done bodyEdges failed
                         todo -> do
-                            (uses, failed') <- analyseBodies (conn :| extra) fs todo
+                            (uses, failed') <- timed [i|reach.analyseBodies n=#{length todo}|] $ analyseBodies (conn :| extra) fs todo
                             go explored' pgEdges' (done <> Set.fromList (map (.oid) todo)) (bodyEdges <> edgesBetween addresses uses) (failed <> failed')
             (allEdges, failed) <- go (withColumns (starts <> Set.fromList (map (.dependent) edges))) edges Set.empty [] []
             pure (allEdges, bodyNotes label (Just (fs.unchecked <> L.sortOn (\(name, _) -> Map.lookup name position) failed)))
@@ -173,13 +175,14 @@ dependentsIn :: Text -> Map ObjectKey Change -> IO Dependents
 dependentsIn db changes
     | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty [])
     | otherwise = do
-        connected@(Connected conn _ schema _) <- describeDatabase scope db
-        (edges, notes) <- reachableEdges "--db" scope starts connected
+        connected@(Connected conn _ schema _) <- timed "deps.describeDatabase" $ describeDatabase scope db
+        (edges, notes) <- timed "deps.reachableEdges" $ reachableEdges "--db" scope starts connected
         for_ notes (TIO.hPutStrLn stderr)
         let known = Set.fromList [k.address | k <- Map.keys schema, k.aspect == Definition]
             exact = affected known edges changes
             viewsOf addr = [(s, v) | a <- Set.toList (Map.findWithDefault Set.empty addr exact), a.objectType `elem` ["view", "materialized view"], [s, v] <- [a.objectNames]]
-        viewColumns <- relationColumns conn (Set.toList (Set.fromList (concatMap viewsOf (Set.toList starts))))
+        measure "deps.affected" (Map.foldl' (\n s -> n + Set.size s) (0 :: Int) exact)
+        viewColumns <- timed "deps.relationColumns" $ relationColumns conn (Set.toList (Set.fromList (concatMap viewsOf (Set.toList starts))))
         let routines = [(k.address, bodyText def) | (k, def) <- Map.toList schema, k.aspect == Definition, k.address.objectType `elem` ["function", "procedure"]]
             skip = Set.fromList (map (.address) (Map.keys changes)) <> fold exact
             throughViews column addr =
@@ -199,6 +202,7 @@ dependentsIn db changes
                         , let wordSets = named addr
                         , not (null wordSets)
                         ]
+        measure "deps.textMatch" (Map.foldl' (\n s -> n + Set.size s) (0 :: Int) textual)
         pure (Dependents exact textual schema edges)
   where
     relationKinds = ["table", "view", "materialized view", "foreign table"]
@@ -343,16 +347,18 @@ describeDatabase scope name = do
 readBoth :: Scope -> Text -> Text -> Bool -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
 readBoth scope fromDb toDb forPlan = do
     (fromDatabase@(Connected _ _ fromSchema _), toDatabase@(Connected toConn _ toSchema _)) <-
-        concurrently (describeDatabase scope fromDb) (describeDatabase scope toDb)
+        timed "readBoth.describe" $ concurrently (timed "describe --from" $ describeDatabase scope fromDb) (timed "describe --to" $ describeDatabase scope toDb)
     let plainChanges = diff (\_ a b -> a == b) fromSchema toSchema
         needed = neededFor forPlan plainChanges
+    measure "readBoth.plainDiff" (Map.size plainChanges)
     (((fromEdges, fromNotes), (toEdges, toNotes)), checks) <-
-        concurrently
-            ( concurrently
-                (edgesOf "--from" scope needed fromDatabase)
-                (if forPlan then edgesOf "--to" scope needed toDatabase else pure ([], []))
-            )
-            (bodyChecks scope toConn toSchema plainChanges)
+        timed "readBoth.edgesAndChecks"
+            $ concurrently
+                ( concurrently
+                    (edgesOf "--from" scope needed fromDatabase)
+                    (if forPlan then edgesOf "--to" scope needed toDatabase else pure ([], []))
+                )
+                (bodyChecks scope toConn toSchema plainChanges)
     for_ (fromNotes <> toNotes) (TIO.hPutStrLn stderr)
     pure ((fromSchema, fromEdges), (toSchema, toEdges), checks)
 
@@ -360,7 +366,7 @@ readBoth scope fromDb toDb forPlan = do
 -- | Body checks for the definitions that are added or changed: no other check is consulted.
 bodyChecks :: Scope -> Connection.Connection -> Schema -> Map ObjectKey Change -> IO (Map ObjectKey BodyCheck)
 bodyChecks scope conn toSchema plainChanges
-    | scope.checkFunctionBodies = checkBodies conn (Map.restrictKeys toSchema addedOrChanged)
+    | scope.checkFunctionBodies = timed "bodyChecks" $ checkBodies conn (Map.restrictKeys toSchema addedOrChanged)
     | otherwise = pure Map.empty
   where
     addedOrChanged = Map.keysSet (Map.filter (\case Dropped _ -> False; _ -> True) plainChanges)
@@ -423,41 +429,44 @@ main =
         >>= \case
             Describe name out replace scope -> do
                 db <- resolveDb name
-                conns <- replicateConcurrently describeConnections (connect db)
-                (schema, _) <- describeOn conns scope.excluded scope.includePartitions Nothing
+                conns <- timed "describe.connect" $ replicateConcurrently describeConnections (connect db)
+                (schema, _) <- timed "describe.describeOn" $ describeOn conns scope.excluded scope.includePartitions Nothing
                 case out of
                     Just dir -> writeFolder replace dir schema
                     Nothing ->
                         for_ (Map.toList (Map.fromListWith (+) [(k.address.objectType, 1 :: Int) | k <- Map.keys schema])) \(kind, n) ->
                             TIO.putStrLn [i|#{n}\t#{kind}|]
             Diff from toDb scope -> do
-                fromDb <- connInfoOf from
-                ((fromSchema, edges), (toSchema, _), checks) <- readBoth scope fromDb toDb False
+                fromDb <- timed "connInfoOf" $ connInfoOf from
+                ((fromSchema, edges), (toSchema, _), checks) <- timed "readBoth" $ readBoth scope fromDb toDb False
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     known = Set.fromList [k.address | k <- Map.keys fromSchema, k.aspect == Definition]
                     affectedBy = affected known edges changes
                     dependentsOf key = case key.aspect of
                         Definition -> Map.findWithDefault Set.empty key.address affectedBy
                         _ -> Set.empty
+                measure "diff.diffAndAffected" (Map.size changes + Map.foldl' (\n s -> n + Set.size s) 0 affectedBy)
                 for_ (Map.toList changes) \(key, change) -> report key change (dependentsOf key)
                 TIO.putStrLn (summary changes)
                 unless (Map.null changes) $ exitWith (ExitFailure 1)
             Plan from toDb scope -> do
-                fromDb <- connInfoOf from
-                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- readBoth scope fromDb toDb True
+                fromDb <- timed "connInfoOf" $ connInfoOf from
+                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope fromDb toDb True
                 let steps = plan checks fromSchema toSchema fromEdges toEdges (diff (sameDefinition checks) fromSchema toSchema)
+                measure "plan.planRender" (T.length (T.unlines (map renderStep steps)))
                 for_ steps (TIO.putStrLn . renderStep)
             Sqitch from toDb scope opts -> do
                 unless opts.dryRun requireSqitch
                 sqitchPlan <- readPlan (opts.projectDir </> opts.planFile)
-                fromDb <- connInfoOf from
-                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- readBoth scope fromDb toDb True
+                fromDb <- timed "connInfoOf" $ connInfoOf from
+                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope fromDb toDb True
                 now <- getCurrentTime
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     steps = plan checks fromSchema toSchema fromEdges toEdges changes
                     inverseCtx = context Map.empty toSchema fromSchema toEdges (Map.map invert changes)
                     written = units True inverseCtx sqitchPlan now steps
                     tagName = fromMaybe (T.pack (formatTime defaultTimeLocale "%Y-%m-%d" now) <> "_schema_diff") opts.tag
+                measure "sqitch.planUnits" (sum [length u.deploy + length u.revert | u <- written])
                 if opts.dryRun
                     then for_ written \u -> do
                         let kind = case u.kind of AddChange -> "add" :: Text; ReworkChange -> "rework"
@@ -478,19 +487,19 @@ main =
                     _ -> failWith (T.pack file <> " is not a table's own deploy file (<schema>/table/<name>.sql)")
                 let parse label = either (\e -> failWith (T.pack file <> label <> ": " <> e)) pure . (withoutTransactionControl <=< splitStatements)
                 statements <- parse "" =<< readFileUtf8 absFile
-                original <- jjShow root opts.base (makeRelative root absFile)
+                original <- timed "table.jjShow" $ jjShow root opts.base (makeRelative root absFile)
                 when (opts.againstDatabase && not (null opts.renames)) $ failWith "--rename works with the file comparison, not --against-database"
                 let renameSql (old, new) = [i|alter table #{qualified table} rename column #{quoteIdent old} to #{quoteIdent new}|]
                 baseline <-
                     if opts.againstDatabase
                         then pure (LiveTable opts.allowDrops)
                         else BaseFile . (<> map renameSql opts.renames) <$> parse (" at " <> opts.base) original
-                conn <- connect =<< resolveDb db
-                edit <- compareTable conn baseline table statements
+                conn <- timed "table.connect" $ connect =<< resolveDb db
+                edit <- timed "table.compare1" $ compareTable conn baseline table statements
                 let columnAddress c = Address "table column" [table.schema, table.name, c] []
                     renamedFrom = Set.fromList [columnAddress old | (old, _) <- opts.renames]
                 -- A renamed column counts as dropped for finding what names it; nothing else sees that.
-                deps <- dependentsIn db (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom))
+                deps <- timed "table.dependentsIn" $ dependentsIn db (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom))
                 -- The PL/pgSQL functions and SQL functions with a string body that depend on the
                 -- edit or name it, checked before the edit and after it; an error that only the
                 -- edited table brings means the function breaks.
@@ -502,14 +511,15 @@ main =
                         [s, n] -> let args = T.intercalate ", " a.objectArgs in [i|#{quoteIdent s}.#{quoteIdent n}(#{args})|]
                         _ -> render a
                     bySignature = Map.fromList [(signature a, a) | a <- plpgsql <> sqlBodies]
-                    check = bodyErrors conn aside (qualified table) (map signature plpgsql) (map signature sqlBodies)
+                    check = timed [i|table.bodyErrors n=#{Map.size bySignature}|] $ bodyErrors conn aside (qualified table) (map signature plpgsql) (map signature sqlBodies)
                     -- The rebuilt table has a new row type, so a call that passes its rows finds no function.
                     rowTypeCall message = "function " `T.isPrefixOf` message && any (\end -> (qualified table <> end) `T.isInfixOf` message) [")", ","]
                 checked <-
                     if null plpgsql && null sqlBodies
                         then pure Nothing
                         else
-                            fmap (Set.filter (\(_, _, message) -> not (rowTypeCall message)))
+                            timed "table.compare2"
+                                $ fmap (Set.filter (\(_, _, message) -> not (rowTypeCall message)))
                                 . snd
                                 <$> compareTableWith conn baseline table statements check (\before -> (\after -> Set.difference <$> after <*> before) <$> check)
                 let retyped =
@@ -526,7 +536,7 @@ main =
                         [] -> (.colType) . parseColumn <$> Map.lookup (ObjectKey Definition (Address "table column" [s, t, c] [])) deps.dbSchema
                 -- A foreign key on a retyped column has to be rebuilt with the new type.
                 foreignKeyBreaks <-
-                    Map.fromListWith (<>) . catMaybes <$> for
+                    timed "table.foreignKeys" $ Map.fromListWith (<>) . catMaybes <$> for
                         [ (addr, k, types)
                         | (_, _, addr, _) <- retyped
                         , k <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
@@ -537,7 +547,7 @@ main =
                         \(addr, k, types) -> fmap (\err -> (addr, [(k, err)])) <$> foreignKeyError conn types
                 -- Whether each type change rewrites the table, as PostgreSQL decides it.
                 typeFacts <-
-                    Map.fromList . catMaybes <$> for retyped \(_, _, addr, newType) ->
+                    timed "table.typeChangeFacts" $ Map.fromList . catMaybes <$> for retyped \(_, _, addr, newType) ->
                         case parseColumn <$> Map.lookup (ObjectKey Definition addr) edit.current of
                             Just o -> fmap (addr,) <$> typeChangeFacts conn o.colType newType
                             Nothing -> pure Nothing
@@ -635,6 +645,7 @@ main =
                             <> [d | (addr, ds) <- Map.toList dependents, addr `Set.member` retypedAddresses, d <- Set.toList ds, not (recreated addr d), not (rebuiltWith d), d `Set.notMember` passed]
                             <> Map.keys breaking
                             <> [k | ks <- Map.elems foreignKeyBreaks, (k, _) <- ks]
+                measure "table.planRender" (T.length (T.unlines (map renderStep steps <> usage)) + length blocking)
                 -- An object left alone takes its comment with it.
                 let leftAlone = Set.fromList [k.address | (k, _) <- edit.ignored, k.aspect == Definition]
                 for_ [(k, reason) | (k, reason) <- edit.ignored, not (k.aspect == Comment && k.address `Set.member` leftAlone)] \(k, reason) -> do
@@ -672,7 +683,7 @@ main =
                         -- sqitch reverts the reworked change before the migrations, so its
                         -- revert, the previous file, meets the edited table.
                         previous <- parse (" at " <> opts.base) original
-                        oldFileFails <- snd <$> compareTableWith conn baseline table statements (pure ()) (const (firstFailure conn previous))
+                        oldFileFails <- timed "table.compare3" $ snd <$> compareTableWith conn baseline table statements (pure ()) (const (firstFailure conn previous))
                         let baseRev = opts.base
                         for_ oldFileFails \err ->
                             TIO.putStrLn [i|the file at #{baseRev} fails on the edited table (#{err}); the rework's revert does nothing and the migrations revert the table|]

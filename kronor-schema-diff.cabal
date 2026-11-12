@@ -34,6 +34,7 @@ library
     Kronor.SchemaDiff.Script
     Kronor.SchemaDiff.Sqitch
     Kronor.SchemaDiff.TableEdit
+    Kronor.SchemaDiff.Timing
 
   build-depends:
     , base

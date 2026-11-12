@@ -46,6 +46,7 @@ import Hasql.Encoders qualified as E
 import Hasql.Errors qualified as Errors
 import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
+import Kronor.SchemaDiff.Timing (timed)
 import Pqi.Ffi qualified
 import RIO
 import RIO.FilePath (takeBaseName)
@@ -170,7 +171,7 @@ describeOn conns excluded includePartitions onlyTable = do
 
     -- The rows are evaluated here, in the thread that decoded them: the callers read the
     -- results from several threads at once.
-    describeOne conn ((file, body), half) = do
+    describeOne conn ((file, body), half) = timed [i|describeQuery #{takeBaseName file} #{maybe "" show half}|] do
         rows <-
             run conn (excluded, includePartitions, onlyTable, half)
                 $ Statement.unpreparable (wrap (decodeUtf8Lenient body)) describeParams (D.rowList ((,,) <$> catalogIdRow <*> addressRow <*> textColumn))
@@ -233,7 +234,7 @@ dependencies conn addresses = do
 -- | 'dependencies' limited to the edges whose referenced end is one of @targets@.
 dependenciesOn :: Connection.Connection -> Addresses -> [CatalogId] -> IO [Edge]
 dependenciesOn _ _ [] = pure []
-dependenciesOn conn addresses targets = do
+dependenciesOn conn addresses targets = timed [i|dependenciesOn n=#{length targets}|] do
     (c1, o1, s1, c2, o2, s2) <-
         run conn (unzip3 (Map.keys addresses), unzip3 targets)
             $ Statement.unpreparable
@@ -250,7 +251,7 @@ dependOnQuery = $(makeRelativeToProject "sql/depend_on.sql" >>= embedFile)
 -- | 'dependencies' limited to the edges reachable from @starts@ through dependents.
 dependenciesFrom :: Connection.Connection -> Addresses -> [CatalogId] -> IO [Edge]
 dependenciesFrom _ _ [] = pure []
-dependenciesFrom conn addresses starts = do
+dependenciesFrom conn addresses starts = timed [i|dependenciesFrom n=#{length starts}|] do
     (c1, o1, s1, c2, o2, s2) <-
         run conn (unzip3 starts)
             $ Statement.unpreparable
@@ -327,7 +328,8 @@ data PlFunctions = PlFunctions
 -- not installed.
 plpgsqlFunctions :: Connection.Connection -> [Text] -> IO (Maybe PlFunctions)
 plpgsqlFunctions conn excluded =
-    qualifiedNames conn
+    timed "plpgsqlFunctions"
+        $ qualifiedNames conn
         $ run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
         >>= traverse \extSchema -> do
             functions <- run conn excluded (Statement.unpreparable (decodeUtf8Lenient plpgsqlFunctionsQuery) excludedParam (D.rowList functionRow))
@@ -355,9 +357,9 @@ analyseBodies conns fs functions = do
     let next = atomicModifyIORef' queue \case
             [] -> ([], Nothing)
             b : rest -> (rest, Just b)
-        work c = next >>= maybe (pure []) (\b -> (:) <$> inBatches c fs.query b <*> work c)
+        work c = next >>= maybe (pure []) (\b -> let firstName = maybe "" (\f -> f.name) (listToMaybe b) in (:) <$> timed [i|analyse.batch n=#{length b} first=#{firstName}|] (inBatches c fs.query b) <*> work c)
         worker c = do
-            void (Connection.use c (Session.script fs.tempTables))
+            void (timed "analyse.tempTables" $ Connection.use c (Session.script fs.tempTables))
             work c `finally` void (Connection.use c (Session.script "discard temp; reset client_min_messages"))
     results <- concat <$> forConcurrently (toList conns) worker
     let position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
@@ -411,14 +413,14 @@ bodyErrors :: Connection.Connection -> Text -> Text -> [Text] -> [Text] -> IO (M
 bodyErrors conn aside table signatures sqlSignatures =
     run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
         >>= traverse \extSchema -> do
-            _ <- guarded (Connection.use conn (Session.script (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))))
+            _ <- timed "bodyErrors.tempTables" $ guarded (Connection.use conn (Session.script (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))))
             plErrors <- for signatures \signature ->
                 either (const []) (map (\(line, message) -> (signature, line, message)))
-                    <$> guarded (Connection.use conn (Session.statement (signature, table) (Statement.unpreparable (query extSchema) params decoder)))
+                    <$> timed ("bodyErrors.fn " <> signature) (guarded (Connection.use conn (Session.statement (signature, table) (Statement.unpreparable (query extSchema) params decoder))))
             -- A SQL function with a string body is parsed again by its language's validator.
             sqlErrors <- for sqlSignatures \signature ->
                 either (\e -> [(signature, 0, errorText e)]) (const [])
-                    <$> guarded (Connection.use conn (Session.statement signature (Statement.unpreparable validate (E.param (E.nonNullable E.text)) (D.singleRow (D.column (D.nullable D.text))))))
+                    <$> timed ("bodyErrors.sql " <> signature) (guarded (Connection.use conn (Session.statement signature (Statement.unpreparable validate (E.param (E.nonNullable E.text)) (D.singleRow (D.column (D.nullable D.text)))))))
             pure (Set.fromList (concat (plErrors <> sqlErrors)))
   where
     -- Selecting the void result keeps the planner from skipping the call.
