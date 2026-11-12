@@ -362,10 +362,14 @@ describeDatabase scope name = do
 
 -- | Reads both databases at the same time, then the edges each command needs, given what
 -- differs, alongside the body checks; the edges of @--to@ only when @forPlan@.
-readBoth :: Scope -> Text -> Text -> Bool -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
-readBoth scope fromDb toDb forPlan = do
+readBoth :: Scope -> Source -> Text -> Bool -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
+readBoth scope from toDb forPlan = do
+    -- @--to@ is described while @--from@'s connection string is found, which can mean
+    -- checking or building the baseline database; that comes first if both fail.
+    toDescribed <- async (timed "describe --to" $ describeDatabase scope toDb)
+    fromDb <- timed "connInfoOf" $ connInfoOf from
     (fromDatabase@(Connected _ _ fromSchema _), toDatabase@(Connected toConn _ toSchema _)) <-
-        timed "readBoth.describe" $ concurrently (timed "describe --from" $ describeDatabase scope fromDb) (timed "describe --to" $ describeDatabase scope toDb)
+        timed "readBoth.describe" $ concurrently (timed "describe --from" $ describeDatabase scope fromDb) (wait toDescribed)
     let plainChanges = diff (\_ a b -> a == b) fromSchema toSchema
         needed = neededFor forPlan plainChanges
     measure "readBoth.plainDiff" (Map.size plainChanges)
@@ -455,8 +459,7 @@ main =
                         for_ (Map.toList (Map.fromListWith (+) [(k.address.objectType, 1 :: Int) | k <- Map.keys schema])) \(kind, n) ->
                             TIO.putStrLn [i|#{n}\t#{kind}|]
             Diff from toDb scope -> do
-                fromDb <- timed "connInfoOf" $ connInfoOf from
-                ((fromSchema, edges), (toSchema, _), checks) <- timed "readBoth" $ readBoth scope fromDb toDb False
+                ((fromSchema, edges), (toSchema, _), checks) <- timed "readBoth" $ readBoth scope from toDb False
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     known = Set.fromList [k.address | k <- Map.keys fromSchema, k.aspect == Definition]
                     affectedBy = affected known edges changes
@@ -468,16 +471,14 @@ main =
                 TIO.putStrLn (summary changes)
                 unless (Map.null changes) $ exitWith (ExitFailure 1)
             Plan from toDb scope -> do
-                fromDb <- timed "connInfoOf" $ connInfoOf from
-                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope fromDb toDb True
+                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope from toDb True
                 let steps = plan checks fromSchema toSchema fromEdges toEdges (diff (sameDefinition checks) fromSchema toSchema)
                 measure "plan.planRender" (T.length (T.unlines (map renderStep steps)))
                 for_ steps (TIO.putStrLn . renderStep)
             Sqitch from toDb scope opts -> do
                 unless opts.dryRun requireSqitch
                 sqitchPlan <- readPlan (opts.projectDir </> opts.planFile)
-                fromDb <- timed "connInfoOf" $ connInfoOf from
-                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope fromDb toDb True
+                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope from toDb True
                 now <- getCurrentTime
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     steps = plan checks fromSchema toSchema fromEdges toEdges changes
