@@ -26,6 +26,7 @@ import Kronor.SchemaDiff.Diff (Change (..))
 import Kronor.SchemaDiff.Object
 import Kronor.SchemaDiff.Plan (invert)
 import Kronor.SchemaDiff.Recipe
+import Kronor.SchemaDiff.Timing (timed)
 import RIO
 import RIO.Directory (doesFileExist, findExecutable)
 import RIO.FilePath ((<.>), (</>))
@@ -251,7 +252,7 @@ reworkEdited root topDir sqitchPlan tag changeName note original emptyRevert = d
 
 runSqitch :: FilePath -> [Text] -> IO ()
 runSqitch root args = do
-    code <- runProcess (setWorkingDir root (proc "sqitch" (map T.unpack args)))
+    code <- timed ("sqitch " <> T.unwords (take 1 args)) $ runProcess (setWorkingDir root (proc "sqitch" (map T.unpack args)))
     case code of
         ExitSuccess -> pure ()
         ExitFailure n -> failWith [S.i|sqitch #{T.unwords args} failed with exit code #{n}; changes before it were written|]

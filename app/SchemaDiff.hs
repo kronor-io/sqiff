@@ -698,8 +698,8 @@ main =
                             let n = length blocking
                             failWith [i|#{n} dependencies on what the edit drops or retypes; change or drop the dependents first|]
                         unless (null renameLike) $ failWith "a column is dropped and another added with the same type; say whether it is a rename with --rename or --drop-and-add"
-                        sqitchPlan <- readPlan (root </> opts.planPath)
-                        basePlan <- parsePlan <$> jjShow root opts.base opts.planPath
+                        sqitchPlan <- timed "write.readPlan" $ readPlan (root </> opts.planPath)
+                        basePlan <- timed "write.basePlan" $ parsePlan <$> jjShow root opts.base opts.planPath
                         now <- getCurrentTime
                         let inverseCtx = withViews (context Map.empty edit.desired edit.current [] (Map.map invert edit.changes))
                             renameBack =
@@ -720,8 +720,9 @@ main =
                         let baseRev = opts.base
                         for_ oldFileFails \err ->
                             TIO.putStrLn [i|the file at #{baseRev} fails on the edited table (#{err}); the rework's revert does nothing and the migrations revert the table|]
-                        writeUnits root opts.top sqitchPlan tagName written
+                        timed "write.writeUnits" $ writeUnits root opts.top sqitchPlan tagName written
                         unless alreadyReworked
+                            $ timed "write.reworkEdited"
                             $ reworkEdited root opts.top sqitchPlan tagName changeName [i|schema-diff: #{changeName} as edited|] original (isJust oldFileFails)
                         for_ written \u -> TIO.putStrLn ("added " <> u.changeName)
                         TIO.putStrLn (if alreadyReworked then "already reworked on this branch: " <> changeName else "reworked " <> changeName)
