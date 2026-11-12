@@ -8,6 +8,9 @@ module Kronor.SchemaDiff.Recipe (
     Phase (..),
     Txn (..),
     Hazard (..),
+    hazardText,
+    referencedTable,
+    revokeGranted,
     Step (..),
     Context (..),
     ColumnDef (..),
@@ -42,11 +45,47 @@ data Txn = Shared | Own | None
 data Hazard
     = DeletesData
     | MayRewriteTable
-    | LongLock
+    | RewritesTable
+    | -- | ACCESS EXCLUSIVE for the whole statement.
+      LongLock
+    | WriteLock
+    | LocksOther Text
+    | RechecksForeignKey Text
+    | EveryPartition
     | IndexBuild
     | MayFail Text
     | Manual Text
     deriving stock (Eq, Ord, Show)
+
+
+hazardText :: Hazard -> Text
+hazardText = \case
+    DeletesData -> "hazard: deletes data"
+    MayRewriteTable -> "hazard: may rewrite the table"
+    RewritesTable -> "hazard: rewrites the table and its indexes"
+    LongLock -> "hazard: holds an ACCESS EXCLUSIVE lock, which blocks reads and writes, while it runs"
+    WriteLock -> "hazard: holds a lock that blocks writes while it runs"
+    LocksOther t -> [i|hazard: also locks #{t} while it runs|]
+    RechecksForeignKey t -> [i|hazard: checks the foreign key between the table and #{t} again, reading every row|]
+    EveryPartition -> "hazard: the lock and any rewrite cover every partition"
+    IndexBuild -> "hazard: builds an index"
+    MayFail why -> "hazard: " <> why
+    Manual why -> "manual: " <> why
+
+
+-- | Takes back from a relation every grant but its owner's, such as the ones default
+-- privileges give a view created again, before its own grants are restored.
+revokeGranted :: Text -> Text
+revokeGranted relation =
+    [i|do $$ declare g text; begin for g in select distinct case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end from pg_class c cross join aclexplode(c.relacl) x where c.oid = #{literal relation}::regclass and x.grantee <> c.relowner loop execute format('revoke all on table %s from %s', #{literal relation}, g); end loop; end $$|]
+
+
+-- | The table a foreign key constraint's definition references.
+referencedTable :: Text -> Maybe Text
+referencedTable def = do
+    guard ("FOREIGN KEY " `T.isPrefixOf` def)
+    let (_, rest) = T.breakOn " REFERENCES " def
+    T.takeWhile (/= '(') <$> T.stripPrefix " REFERENCES " rest
 
 
 data Step = Step
@@ -148,6 +187,7 @@ definition ctx key object change = case object of
     Table t -> table t
     Column t c
         | t `Set.member` ctx.droppedTables -> []
+        | t `Set.member` ctx.partitionedTables -> map onEveryPartition (column t c)
         | otherwise -> column t c
     TableConstraint t c
         | t `Set.member` ctx.droppedTables -> []
@@ -172,6 +212,9 @@ definition ctx key object change = case object of
     createAt rank (txn, hazards) sql = Step CreatePhase rank addr object sql txn hazards key change
     remove (txn, hazards) sql = Step DropPhase (dropRank object) addr object sql txn hazards key change
     manual why = [create (Shared, [Manual why]) ("-- " <> why)]
+    onEveryPartition s
+        | any (`elem` [DeletesData, MayRewriteTable, LongLock]) s.hazards = s{hazards = s.hazards <> [EveryPartition]}
+        | otherwise = s
     -- A definition that names a column the edit drops or retypes has to go before it.
     namesAlteredColumn t = namesAlteredColumnOf (== t)
     namesAlteredColumnOf onTable def =
@@ -353,16 +396,17 @@ end $$|]
 
     tableConstraint t c = case change of
         Added def -> addConstraint def
-        Dropped _ -> [dropConstraint]
-        Changed _ new -> dropConstraint : addConstraint new
+        Dropped old -> [dropConstraint old]
+        Changed old new -> dropConstraint old : addConstraint new
       where
         alterT = [i|alter table #{qualified t} |]
-        dropConstraint =
+        dropConstraint old =
             remove
-                (Shared, [MayFail "other objects depend on it, such as foreign keys; drop them first" | dependedOn])
+                (Shared, [MayFail "other objects depend on it, such as foreign keys; drop them first" | dependedOn] <> locksOther old)
                 (alterT <> "drop constraint " <> quoteIdent c)
         dependedOn = any (`Set.member` ctx.withDependents) [TableConstraint t c, Index (QName t.schema c)]
-        plain hazards def = create (Shared, hazards) (alterT <> "add constraint " <> quoteIdent c <> " " <> def)
+        locksOther def = [LocksOther r | Just r <- [referencedTable def], r /= qualified t]
+        plain hazards def = create (Shared, hazards <> locksOther def) (alterT <> "add constraint " <> quoteIdent c <> " " <> def)
         addConstraint def
             | t `Set.member` ctx.newTables = [plain [] def]
             | validatable def && not (" NOT VALID" `T.isSuffixOf` def) =
@@ -417,7 +461,7 @@ end $$|]
                     ]
       where
         addIndex def
-            | onOnly def = [create (Shared, [LongLock, IndexBuild]) (T.replace " ON ONLY " " ON " def)]
+            | onOnly def = [create (Shared, [WriteLock, EveryPartition, IndexBuild]) (T.replace " ON ONLY " " ON " def)]
             | indexTable def `elem` map (Just . qualified) (Set.toList ctx.newTables) = [create (Shared, []) def]
             | otherwise = [create (None, [IndexBuild]) (concurrentBuild ix (T.replace " INDEX " " INDEX CONCURRENTLY " def))]
         onOnly def = " ON ONLY " `T.isInfixOf` def
@@ -498,7 +542,7 @@ end $$|]
         Dropped _ -> [remove (Shared, []) ("drop view " <> qualified v)]
 
     materializedView v = case change of
-        Added def -> [create (Shared, [LongLock]) ("create materialized view " <> viewHead v def <> viewBody def)]
+        Added def -> [create (Shared, []) ("create materialized view " <> viewHead v def <> viewBody def)]
         Changed _ new ->
             [ remove (Shared, [MayFail "fails when other objects depend on it"]) ("drop materialized view " <> qualified v)
             , create (Shared, [LongLock]) ("create materialized view " <> viewHead v new <> viewBody new)
@@ -510,6 +554,7 @@ end $$|]
         Nothing -> []
         Just (indexes, grants) ->
             [create (Shared, [IndexBuild]) def | def <- indexes]
+                <> [createAt privilegesRank (Shared, []) (revokeGranted (qualified v)) | isJust grants]
                 <> maybe [] (\(k, def) -> privileges k (fromAddress k.address) (Added def)) grants
 
     trigger t n = case change of

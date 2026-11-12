@@ -138,17 +138,10 @@ renderStep :: Step -> Text
 renderStep s =
     T.unlines
         $ ["-- " <> render s.address]
-        <> ["-- " <> note | note <- txnNote <> map hazardNote s.hazards]
+        <> ["-- " <> note | note <- txnNote <> map hazardText s.hazards]
         <> [s.sql <> if "--" `T.isPrefixOf` s.sql then "" else ";"]
   where
     txnNote = case s.txn of
         Shared -> []
         Own -> ["own transaction"]
         None -> ["outside a transaction"]
-    hazardNote = \case
-        DeletesData -> "hazard: deletes data"
-        MayRewriteTable -> "hazard: may rewrite the table"
-        LongLock -> "hazard: holds a lock that blocks writes while it runs"
-        IndexBuild -> "hazard: builds an index"
-        MayFail why -> "hazard: " <> why
-        Manual why -> "manual: " <> why

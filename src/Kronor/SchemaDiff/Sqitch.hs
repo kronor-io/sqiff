@@ -191,17 +191,7 @@ renderScript header migration steps =
             . T.replace "create unique index concurrently " "create unique index concurrently if not exists "
             . T.replace "drop index concurrently " "drop index concurrently if exists "
             $ sql
-    hazardNotes s =
-        map
-            ( \case
-                DeletesData -> "hazard: deletes data"
-                MayRewriteTable -> "hazard: may rewrite the table"
-                LongLock -> "hazard: holds a lock that blocks writes while it runs"
-                IndexBuild -> "hazard: builds an index"
-                MayFail why -> "hazard: " <> why
-                Manual why -> "manual: " <> why
-            )
-            s.hazards
+    hazardNotes s = map hazardText s.hazards
 
 
 requireSqitch :: IO ()

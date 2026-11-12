@@ -13,6 +13,7 @@ module Kronor.SchemaDiff.TableEdit (
     compareTableWith,
     foreignKeyError,
     firstFailure,
+    typeChangeFacts,
     aside,
 ) where
 
@@ -21,10 +22,9 @@ import Data.Text qualified as T
 import Hasql.Connection qualified as Connection
 import Hasql.Decoders qualified as D
 import Hasql.Encoders qualified as E
-import Hasql.Errors qualified as Errors
 import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, describeOn, failWith)
+import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, describeOn, errorText, failWith)
 import Kronor.SchemaDiff.Diff (Change (..), diff)
 import Kronor.SchemaDiff.Object
 import RIO
@@ -46,6 +46,24 @@ foreignKeyError conn types = do
     columns side = T.intercalate ", " [[i|c#{n} #{side ty}|] | (n, ty) <- zip [1 :: Int ..] types]
 
 
+-- | Whether changing a column from @old@ to @new@ rewrites the table, and whether @new@ is
+-- a domain, found on a temporary table in a transaction that is rolled back.
+typeChangeFacts :: Connection.Connection -> Text -> Text -> IO (Maybe (Bool, Bool))
+typeChangeFacts conn old new = do
+    _ <- Connection.use conn (Session.script [i|begin; create temp table schema_diff_retype (c #{old})|])
+    before <- fileNode
+    altered <- Connection.use conn (Session.script [i|alter table pg_temp.schema_diff_retype alter column c type #{new} using c::#{new}|])
+    after <- fileNode
+    domain <- Connection.use conn (Session.statement () (Statement.unpreparable [i|select coalesce((select typtype = 'd' from pg_type where oid = to_regtype(#{literalText new})), false)|] E.noParams (D.singleRow (D.column (D.nonNullable D.bool)))))
+    _ <- Connection.use conn (Session.script "rollback")
+    pure case (before, altered, after, domain) of
+        (Right b, Right (), Right a, Right d) -> Just (a /= b, d)
+        _ -> Nothing
+  where
+    fileNode = Connection.use conn (Session.statement () (Statement.unpreparable "select relfilenode::int8 from pg_class where oid = 'pg_temp.schema_diff_retype'::regclass" E.noParams (D.singleRow (D.column (D.nonNullable D.int8)))))
+    literalText t = [i|'#{T.replace "'" "''" t}'|] :: Text
+
+
 -- | The first of @statements@ that fails, with its error. Runs inside the caller's
 -- transaction under a savepoint that is rolled back.
 firstFailure :: Connection.Connection -> [Text] -> IO (Maybe Text)
@@ -57,13 +75,6 @@ firstFailure conn statements = do
   where
     go [] = pure Nothing
     go ((n, s) : rest) = Connection.use conn (Session.script s) >>= either (\e -> pure (Just [i|statement #{n}: #{errorText e}|])) (const (go rest))
-
-
-errorText :: Errors.SessionError -> Text
-errorText = \case
-    Errors.ScriptSessionError _ (Errors.ServerError _ message detail _ _) -> message <> maybe "" ("; " <>) detail
-    Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message detail _ _)) -> message <> maybe "" ("; " <>) detail
-    e -> tshow e
 
 
 data TableEdit = TableEdit
@@ -109,7 +120,7 @@ compareTableWith conn baseline table statements beforeEdit afterEdit = do
             owned <-
                 Connection.use conn (Session.statement () ownedSequences)
                     >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
-            for_ (filter (\s -> any (s `T.isInfixOf`) (statements <> baseStatements)) owned) \s ->
+            for_ (filter (\s -> any ((s `T.isInfixOf`) . withoutLineComments) (statements <> baseStatements)) owned) \s ->
                 script [i|alter sequence #{tableSchemaRef}#{quoteIdent s} owned by none|]
             script ("create schema " <> aside)
             script ("alter table " <> qualified table <> " set schema " <> aside)
@@ -171,6 +182,8 @@ compareTableWith conn baseline table statements beforeEdit afterEdit = do
             |]
             E.noParams
             (D.rowList (D.column (D.nonNullable D.text)))
+
+    withoutLineComments = T.unlines . map (fst . T.breakOn "--") . T.lines
 
     script' :: Text -> IO Bool
     script' sql = do

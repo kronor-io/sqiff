@@ -32,6 +32,7 @@ module Kronor.SchemaDiff.Catalog (
     edgesBetween,
     relationColumns,
     bodyErrors,
+    errorText,
     render,
 ) where
 
@@ -406,15 +407,22 @@ render addr = addr.objectType <> " " <> T.intercalate "." addr.objectNames <> ar
 -- signatures, inside the transaction @conn@ is in; 'Nothing' when plpgsql_check is not
 -- installed. A trigger function is checked against its first trigger's table, or against
 -- @table@ when that trigger's table has been moved aside under @aside@.
-bodyErrors :: Connection.Connection -> Text -> Text -> [Text] -> IO (Maybe (Set (Text, Int32, Text)))
-bodyErrors conn aside table signatures =
+bodyErrors :: Connection.Connection -> Text -> Text -> [Text] -> [Text] -> IO (Maybe (Set (Text, Int32, Text)))
+bodyErrors conn aside table signatures sqlSignatures =
     run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
         >>= traverse \extSchema -> do
             _ <- guarded (Connection.use conn (Session.script (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))))
-            Set.fromList . concat <$> for signatures \signature ->
+            plErrors <- for signatures \signature ->
                 either (const []) (map (\(line, message) -> (signature, line, message)))
                     <$> guarded (Connection.use conn (Session.statement (signature, table) (Statement.unpreparable (query extSchema) params decoder)))
+            -- A SQL function with a string body is parsed again by its language's validator.
+            sqlErrors <- for sqlSignatures \signature ->
+                either (\e -> [(signature, 0, errorText e)]) (const [])
+                    <$> guarded (Connection.use conn (Session.statement signature (Statement.unpreparable validate (E.param (E.nonNullable E.text)) (D.singleRow (D.column (D.nullable D.text))))))
+            pure (Set.fromList (concat (plErrors <> sqlErrors)))
   where
+    -- Selecting the void result keeps the planner from skipping the call.
+    validate = "select pg_catalog.fmgr_sql_validator(to_regprocedure($1))::text"
     guarded action = do
         _ <- Connection.use conn (Session.script "savepoint schema_diff_check")
         result <- action
@@ -426,7 +434,7 @@ bodyErrors conn aside table signatures =
         [i|
             select coalesce(c.lineno, 0)::int4, c.message
             from pg_proc f
-            left join lateral (select t.tgrelid from pg_trigger t where t.tgfoid = f.oid order by t.oid limit 1) t on true
+            left join lateral (select t.tgrelid, t.tgoldtable, t.tgnewtable from pg_trigger t where t.tgfoid = f.oid order by t.oid limit 1) t on true
             cross join lateral #{extSchema}.plpgsql_check_function_tb(
                 f.oid::regprocedure,
                 coalesce(
@@ -436,13 +444,22 @@ bodyErrors conn aside table signatures =
                     end,
                     0::regclass
                 ),
-                fatal_errors => false
+                fatal_errors => false,
+                oldtable => t.tgoldtable,
+                newtable => t.tgnewtable
             ) c
             where f.oid = to_regprocedure($1)
                 and not (f.prorettype = 'trigger'::regtype and t.tgrelid is null)
                 and c.level = 'error'
         |]
     literal t = [i|'#{TP.replace "'" "''" t}'|] :: Text
+
+
+errorText :: Errors.SessionError -> Text
+errorText = \case
+    Errors.ScriptSessionError _ (Errors.ServerError _ message detail _ _) -> message <> maybe "" ("; " <>) detail
+    Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message detail _ _)) -> message <> maybe "" ("; " <>) detail
+    e -> tshow e
 
 
 -- | The column names of the given relations, by schema and name.

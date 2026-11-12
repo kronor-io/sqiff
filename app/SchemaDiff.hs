@@ -17,10 +17,10 @@ import Kronor.SchemaDiff.Diff (BodyText (..), Change (..), affected, bodiesToAna
 import Kronor.SchemaDiff.Folder (writeFolder)
 import Kronor.SchemaDiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
 import Kronor.SchemaDiff.Plan (context, invert, plan, planWith, renderStep, topoOrder)
-import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Phase (..), Step (..), Txn (..), parseColumn, recipe)
+import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), parseColumn, recipe, referencedTable, revokeGranted)
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
 import Kronor.SchemaDiff.Sqitch (SqitchPlan (..), Unit (..), UnitKind (..), parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
-import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), aside, compareTable, compareTableWith, firstFailure, foreignKeyError)
+import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), aside, compareTable, compareTableWith, firstFailure, foreignKeyError, typeChangeFacts)
 import Options.Applicative qualified as O
 import RIO
 import RIO.Directory (makeAbsolute)
@@ -250,7 +250,6 @@ viewsAroundTypeChanges deps retyped =
                 Nothing -> False
             more = Set.filter (\r -> isRoutine r && r `Set.notMember` members && holds r) closure
          in if Set.null more then members else held column closure (members <> more)
-    standardBody def = "BEGIN ATOMIC" `T.isInfixOf` def || any ("RETURN " `T.isPrefixOf`) (T.lines def)
     signature = T.unlines . takeWhile (\l -> not (" AS " `T.isPrefixOf` l || "BEGIN ATOMIC" `T.isInfixOf` l)) . T.lines
     relation a = case (a.objectType, a.objectNames) of
         (kind, [s, t, _]) | Just rel <- T.stripSuffix " column" kind -> Address rel [s, t] []
@@ -266,7 +265,7 @@ viewsAroundTypeChanges deps retyped =
     stepsFor key c = map (.sql) (recipe ctx0 key c)
     createView a =
         concat
-            [ stepsFor key (Added def)
+            [ [revokeGranted (qualifiedAddress a) | aspect == Privileges, isView a] <> stepsFor key (Added def)
             | aspect <- [Definition, Privileges]
             , let key = ObjectKey aspect a
             , Just def <- [Map.lookup key deps.dbSchema]
@@ -285,6 +284,11 @@ viewsAroundTypeChanges deps retyped =
                 , k.aspect == Comment
                 , k.address == a || (relation k.address == a && k.address /= a)
                 ]
+
+
+-- | A SQL-standard body, which PostgreSQL parses once and tracks in pg_depend.
+standardBody :: Text -> Bool
+standardBody def = "BEGIN ATOMIC" `T.isInfixOf` def || any ("RETURN " `T.isPrefixOf`) (T.lines def)
 
 
 -- | For a foreign key constraint's definition, each of its columns' types paired with the
@@ -487,18 +491,27 @@ main =
                     renamedFrom = Set.fromList [columnAddress old | (old, _) <- opts.renames]
                 -- A renamed column counts as dropped for finding what names it; nothing else sees that.
                 deps <- dependentsIn db (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom))
-                -- The PL/pgSQL functions the text match found, checked before the edit and
-                -- after it; an error that only the edited table brings means the function breaks.
-                let plpgsql = [a | a <- Set.toList (fold deps.named), Just def <- [Map.lookup (ObjectKey Definition a) deps.dbSchema], "LANGUAGE plpgsql" `T.isInfixOf` def]
+                -- The PL/pgSQL functions and SQL functions with a string body that depend on the
+                -- edit or name it, checked before the edit and after it; an error that only the
+                -- edited table brings means the function breaks.
+                let definitionOf a = Map.lookup (ObjectKey Definition a) deps.dbSchema
+                    routines = Set.toList (Set.filter (\a -> a.objectType `elem` ["function", "procedure"]) (fold deps.named <> fold deps.exact))
+                    plpgsql = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE plpgsql" `T.isInfixOf` def]
+                    sqlBodies = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE sql" `T.isInfixOf` def, not (standardBody def)]
                     signature a = case a.objectNames of
                         [s, n] -> let args = T.intercalate ", " a.objectArgs in [i|#{quoteIdent s}.#{quoteIdent n}(#{args})|]
                         _ -> render a
-                    bySignature = Map.fromList [(signature a, a) | a <- plpgsql]
-                    check = bodyErrors conn aside (qualified table) (Map.keys bySignature)
+                    bySignature = Map.fromList [(signature a, a) | a <- plpgsql <> sqlBodies]
+                    check = bodyErrors conn aside (qualified table) (map signature plpgsql) (map signature sqlBodies)
+                    -- The rebuilt table has a new row type, so a call that passes its rows finds no function.
+                    rowTypeCall message = "function " `T.isPrefixOf` message && any (\end -> (qualified table <> end) `T.isInfixOf` message) [")", ","]
                 checked <-
-                    if null plpgsql
+                    if null plpgsql && null sqlBodies
                         then pure Nothing
-                        else snd <$> compareTableWith conn baseline table statements check (\before -> (\after -> Set.difference <$> after <*> before) <$> check)
+                        else
+                            fmap (Set.filter (\(_, _, message) -> not (rowTypeCall message)))
+                                . snd
+                                <$> compareTableWith conn baseline table statements check (\before -> (\after -> Set.difference <$> after <*> before) <$> check)
                 let retyped =
                         [ (t, c, k.address, n.colType)
                         | (k, Changed old new) <- Map.toList edit.changes
@@ -522,9 +535,34 @@ main =
                         , Just types <- [foreignKeyTypes typeIn k def]
                         ]
                         \(addr, k, types) -> fmap (\err -> (addr, [(k, err)])) <$> foreignKeyError conn types
+                -- Whether each type change rewrites the table, as PostgreSQL decides it.
+                typeFacts <-
+                    Map.fromList . catMaybes <$> for retyped \(_, _, addr, newType) ->
+                        case parseColumn <$> Map.lookup (ObjectKey Definition addr) edit.current of
+                            Just o -> fmap (addr,) <$> typeChangeFacts conn o.colType newType
+                            Nothing -> pure Nothing
+                let otherTables addr =
+                        Set.toList
+                            . Set.fromList
+                            $ [ other
+                              | k <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
+                              , k.objectType == "table constraint"
+                              , [s, t, _] <- [k.objectNames]
+                              , Just def <- [Map.lookup (ObjectKey Definition k) deps.dbSchema]
+                              , Just referenced <- [referencedTable def]
+                              , let other = if QName s t == table then referenced else qualified (QName s t)
+                              , other /= qualified table
+                              ]
+                    convertNote = MayFail "fails when an existing value does not convert to the new type"
+                    withTypeFacts s = case Map.lookup s.address typeFacts of
+                        Just (rewrites, domain)
+                            | MayRewriteTable `elem` s.hazards ->
+                                let kept = concatMap (\h -> if h == MayRewriteTable then [RewritesTable | rewrites] else [h | h /= convertNote || rewrites || domain]) s.hazards
+                                 in s{hazards = kept <> concat [LocksOther o : [RechecksForeignKey o | rewrites] | o <- otherTables s.address]}
+                        _ -> s
                 let breaking = Map.fromListWith (\_ earlier -> earlier) [(a, message) | (s, _, message) <- maybe [] Set.toList checked, Just a <- [Map.lookup s bySignature]]
-                    passed = Set.fromList [a | isJust checked, a <- plpgsql, a `Map.notMember` breaking, Just def <- [Map.lookup (ObjectKey Definition a) deps.dbSchema], not ("execute" `T.isInfixOf` T.toLower def)]
-                    breaksFor addr = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.named), a `Map.member` breaking]
+                    passed = Set.fromList [a | isJust checked, a <- plpgsql <> sqlBodies, a `Map.notMember` breaking, Just def <- [definitionOf a], not ("execute" `T.isInfixOf` T.toLower def)]
+                    breaksFor addr = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.named <> Map.findWithDefault Set.empty addr deps.exact), a `Map.member` breaking]
                     dependents = deps.exact
                     mentions = Map.map (Set.filter (\a -> a `Map.notMember` breaking && a `Set.notMember` passed)) deps.named
                     retypedAddresses = Set.fromList [a | (_, _, a, _) <- retyped]
@@ -538,7 +576,7 @@ main =
                         , let addr = columnAddress new
                               def = Map.findWithDefault "" (ObjectKey Definition addr) edit.desired
                         ]
-                    steps = renameSteps <> planWith withViews Map.empty edit.current edit.desired [] [] edit.changes
+                    steps = renameSteps <> map withTypeFacts (planWith withViews Map.empty edit.current edit.desired [] [] edit.changes)
                     same = if opts.againstDatabase then "the file matches the table" else "the file has no schema changes since " <> opts.base
                     columnsWhere p = [(c, (parseColumn (changeText ch)).colType) | (k, ch) <- Map.toList edit.changes, k.aspect == Definition, p ch, Column _ c <- [fromAddress k.address]]
                     changeText = \case Added d -> d; Dropped d -> d; Changed _ d -> d
@@ -567,7 +605,7 @@ main =
                         ds -> ("  " <> heading) : map (("    " <>) . short) ds
                     breaksSection = \case
                         [] -> []
-                        fs -> "  breaks, by plpgsql_check" : concat [["    " <> short f, "      " <> Map.findWithDefault "" f breaking] | f <- fs]
+                        fs -> "  breaks" : concat [["    " <> short f, "      " <> Map.findWithDefault "" f breaking] | f <- fs]
                     foreignKeySection = \case
                         [] -> []
                         ks -> "  cannot be rebuilt with the new type" : concat [["    " <> short k, "      " <> err] | (k, err) <- ks]
@@ -587,15 +625,19 @@ main =
                             | addr <- Set.toList (Map.keysSet dependents <> Map.keysSet deps.named)
                             , not (null (Map.findWithDefault Set.empty addr dependents)) || not (null (breaksFor addr)) || not (null (Map.findWithDefault Set.empty addr mentions))
                             , let (with, rest) = L.partition (\d -> dropped addr && goesWith d) (Set.toList (Map.findWithDefault Set.empty addr dependents))
-                                  (again, users) = L.partition (recreated addr) rest
+                                  (again, users) = L.partition (recreated addr) (filter (`Map.notMember` breaking) rest)
                             ]
                             <> renameNotes
                     blocking =
-                        [d | (addr, ds) <- Map.toList dependents, dropped addr, d <- Set.toList ds, not (goesWith d)]
-                            <> [d | (addr, ds) <- Map.toList dependents, addr `Set.member` retypedAddresses, d <- Set.toList ds, not (recreated addr d), not (rebuiltWith d)]
+                        Set.toList
+                            . Set.fromList
+                            $ [d | (addr, ds) <- Map.toList dependents, dropped addr, d <- Set.toList ds, not (goesWith d)]
+                            <> [d | (addr, ds) <- Map.toList dependents, addr `Set.member` retypedAddresses, d <- Set.toList ds, not (recreated addr d), not (rebuiltWith d), d `Set.notMember` passed]
                             <> Map.keys breaking
                             <> [k | ks <- Map.elems foreignKeyBreaks, (k, _) <- ks]
-                for_ edit.ignored \(k, reason) -> do
+                -- An object left alone takes its comment with it.
+                let leftAlone = Set.fromList [k.address | (k, _) <- edit.ignored, k.aspect == Definition]
+                for_ [(k, reason) | (k, reason) <- edit.ignored, not (k.aspect == Comment && k.address `Set.member` leftAlone)] \(k, reason) -> do
                     let name = render k.address <> if k.aspect == Privileges then " (privileges)" else ""
                     TIO.putStrLn [i|-- left alone: #{name}: #{reason}|]
                 if not opts.write
