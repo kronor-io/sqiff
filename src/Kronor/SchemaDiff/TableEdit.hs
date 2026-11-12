@@ -11,6 +11,7 @@ module Kronor.SchemaDiff.TableEdit (
     Baseline (..),
     compareTable,
     compareTableWith,
+    withEditedTable,
     foreignKeyError,
     firstFailure,
     typeChangeFacts,
@@ -108,7 +109,17 @@ compareTable conn baseline table statements = fst <$> compareTableWith conn base
 -- | 'compareTable' that also runs @before@ in the transaction before anything changes,
 -- and @after@ once the table is what the edited file creates.
 compareTableWith :: Connection.Connection -> Baseline -> QName -> [Text] -> IO b -> (b -> IO a) -> IO (TableEdit, a)
-compareTableWith conn baseline table statements beforeEdit afterEdit = do
+compareTableWith = editTable True
+
+
+-- | 'compareTableWith' for the result of @after@ alone: the table is neither built from
+-- the file before the edit nor described.
+withEditedTable :: Connection.Connection -> Baseline -> QName -> [Text] -> IO b -> (b -> IO a) -> IO a
+withEditedTable conn baseline table statements beforeEdit afterEdit = snd <$> editTable False conn baseline table statements beforeEdit afterEdit
+
+
+editTable :: Bool -> Connection.Connection -> Baseline -> QName -> [Text] -> IO b -> (b -> IO a) -> IO (TableEdit, a)
+editTable describing conn baseline table statements beforeEdit afterEdit = do
     (current, desired, afterResult) <-
         ( do
             script "begin"
@@ -126,6 +137,7 @@ compareTableWith conn baseline table statements beforeEdit afterEdit = do
             script ("create schema " <> aside)
             script ("alter table " <> qualified table <> " set schema " <> aside)
             current <- timed "tableEdit.current" case baseline of
+                _ | not describing -> pure Map.empty
                 BaseFile base -> do
                     script "savepoint schema_diff_base"
                     built <- build xact "before the edit" base
@@ -164,8 +176,11 @@ compareTableWith conn baseline table statements beforeEdit afterEdit = do
             after <- currentXact
             when (after /= xact)
                 $ failWith [i|statement #{n} of the file #{label} ended the transaction the comparison runs in|]
-        schema <- describeTable table
-        pure (Map.fromList [(k, def) | (k, def) <- Map.toList schema, belongsTo table k def])
+        if describing
+            then do
+                schema <- describeTable table
+                pure (Map.fromList [(k, def) | (k, def) <- Map.toList schema, belongsTo table k def])
+            else pure Map.empty
 
     currentXact =
         Connection.use conn (Session.statement () (Statement.unpreparable "select pg_current_xact_id()::text" E.noParams (D.singleRow (D.column (D.nonNullable D.text)))))

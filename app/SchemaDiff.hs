@@ -20,7 +20,7 @@ import Kronor.SchemaDiff.Plan (context, invert, plan, planWith, renderStep, topo
 import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), parseColumn, recipe, referencedTable, revokeGranted)
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
 import Kronor.SchemaDiff.Sqitch (SqitchPlan (..), Unit (..), UnitKind (..), parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
-import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), aside, compareTable, compareTableWith, firstFailure, foreignKeyError, typeChangeFacts)
+import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), aside, compareTable, firstFailure, foreignKeyError, typeChangeFacts, withEditedTable)
 import Kronor.SchemaDiff.Timing (measure, timed)
 import Options.Applicative qualified as O
 import RIO
@@ -548,8 +548,7 @@ main =
                         else
                             timed "table.compare2"
                                 $ fmap (Set.filter (\(_, _, message) -> not (rowTypeCall message)))
-                                . snd
-                                <$> compareTableWith conn baseline table statements check (\before -> (\after -> Set.difference <$> after <*> before) <$> check)
+                                <$> withEditedTable conn baseline table statements check (\before -> (\after -> Set.difference <$> after <*> before) <$> check)
                 let retyped =
                         [ (t, c, k.address, n.colType)
                         | (k, Changed old new) <- Map.toList edit.changes
@@ -711,7 +710,7 @@ main =
                         -- sqitch reverts the reworked change before the migrations, so its
                         -- revert, the previous file, meets the edited table.
                         previous <- parse (" at " <> opts.base) original
-                        oldFileFails <- timed "table.compare3" $ snd <$> compareTableWith conn baseline table statements (pure ()) (const (firstFailure conn previous))
+                        oldFileFails <- timed "table.compare3" $ withEditedTable conn baseline table statements (pure ()) (const (firstFailure conn previous))
                         let baseRev = opts.base
                         for_ oldFileFails \err ->
                             TIO.putStrLn [i|the file at #{baseRev} fails on the edited table (#{err}); the rework's revert does nothing and the migrations revert the table|]
