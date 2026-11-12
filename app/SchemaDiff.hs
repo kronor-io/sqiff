@@ -72,7 +72,7 @@ neededFor forPlan changes
 -- with notes for stderr. @label@ names the database in the notes.
 edgesOf :: Text -> Scope -> Needed -> Connected -> IO ([Edge], [Text])
 edgesOf label scope needed connected@(Connected conn extra _ addresses) = timed ("edgesOf " <> label) case needed of
-    ReachableFrom starts -> reachableEdges label scope starts connected
+    ReachableFrom starts -> let Connected _ _ schema _ = connected in reachableEdges label scope starts connected (routineWords schema)
     _ -> do
         let wantedIds wanted = [ids | (ids, addr) <- Map.toList addresses, addr `Set.member` wanted]
             only = case needed of
@@ -110,8 +110,8 @@ bodyNotes label = \case
 -- PL/pgSQL functions that 'bodiesToAnalyse' picks. A body edge can bring a function into
 -- the closure, whose dependents are then read, and those can make other functions
 -- matter, so it repeats until nothing new is reached or picked.
-reachableEdges :: Text -> Scope -> Set Address -> Connected -> IO ([Edge], [Text])
-reachableEdges label scope starts (Connected conn extra schema addresses) = timed ("reachableEdges " <> label) do
+reachableEdges :: Text -> Scope -> Set Address -> Connected -> IO (Map Address BodyText) -> IO ([Edge], [Text])
+reachableEdges label scope starts (Connected conn extra schema addresses) splitWords = timed ("reachableEdges " <> label) do
     let idsOf = Map.fromListWith (<>) [(addr, [ids]) | (ids, addr) <- Map.toList addresses]
         idsFor = concatMap (\a -> Map.findWithDefault [] a idsOf) . Set.toList
         -- depend_from.sql reads the dependents of a relation's columns with the relation's.
@@ -124,9 +124,11 @@ reachableEdges label scope starts (Connected conn extra schema addresses) = time
             ( timed "reach.functionsAndWords"
                 $ plpgsqlFunctions (fromMaybe conn (listToMaybe extra)) scope.excluded
                 >>= traverse \fs -> do
-                    let split part = do
+                    split_ <- splitWords
+                    let wordsAt addr = fromMaybe (bodyText (Map.findWithDefault "" (ObjectKey Definition addr) schema)) (Map.lookup addr split_)
+                        split part = do
                             let described =
-                                    [ (f, addr, bodyText (Map.findWithDefault "" (ObjectKey Definition addr) schema), trigger)
+                                    [ (f, addr, wordsAt addr, trigger)
                                     | f <- part
                                     , let trigger = f.relid >>= \r -> Map.lookup (pgClass, r, 0) addresses
                                     , Just addr <- [Map.lookup (pgProc, f.oid, 0) addresses]
@@ -166,6 +168,18 @@ reachableEdges label scope starts (Connected conn extra schema addresses) = time
             pure (allEdges, bodyNotes label (Just (fs.unchecked <> L.sortOn (\(name, _) -> Map.lookup name position) failed)))
 
 
+-- | The words of every function's and procedure's definition, split on every core.
+routineWords :: Schema -> IO (Map Address BodyText)
+routineWords schema = do
+    let routines = [(k.address, def) | (k, def) <- Map.toList schema, k.aspect == Definition, k.address.objectType `elem` ["function", "procedure"]]
+        split part = do
+            let split_ = [(addr, bodyText def) | (addr, def) <- part]
+            _ <- evaluate (foldl' (\n (_, b) -> n + HS.size b.wordSet + T.length b.lowered) (0 :: Int) split_)
+            pure split_
+        parts = [[r | (n, r) <- zip [0 :: Int ..] routines, n `mod` 8 == k] | k <- [0 .. 7]]
+    Map.fromList . concat <$> pooledMapConcurrently split parts
+
+
 -- | How 'dependentsIn' describes the database.
 dependentsScope :: Scope
 dependentsScope = Scope{excluded = ["hdb_catalog"], includePartitions = False, checkFunctionBodies = False}
@@ -176,19 +190,19 @@ dependentsScope = Scope{excluded = ["hdb_catalog"], includePartitions = False, c
 -- PL/pgSQL bodies; and for each dropped or changed column and dropped relation, the other
 -- functions whose definition names it, with its table for a column, or names a view that
 -- reads it, with the view's schema. A view that keeps the column's name must be named with it.
-dependentsIn :: IO Connected -> Map ObjectKey Change -> IO Dependents
+dependentsIn :: IO (Connected, Map Address BodyText) -> Map ObjectKey Change -> IO Dependents
 dependentsIn described changes
     | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty [])
     | otherwise = do
-        connected@(Connected conn _ schema _) <- timed "deps.describeDatabase" described
-        (edges, notes) <- timed "deps.reachableEdges" $ reachableEdges "--db" dependentsScope starts connected
+        (connected@(Connected conn _ schema _), split_) <- timed "deps.describeDatabase" described
+        (edges, notes) <- timed "deps.reachableEdges" $ reachableEdges "--db" dependentsScope starts connected (pure split_)
         for_ notes (TIO.hPutStrLn stderr)
         let known = Set.fromList [k.address | k <- Map.keys schema, k.aspect == Definition]
             exact = affected known edges changes
             viewsOf addr = [(s, v) | a <- Set.toList (Map.findWithDefault Set.empty addr exact), a.objectType `elem` ["view", "materialized view"], [s, v] <- [a.objectNames]]
         measure "deps.affected" (Map.foldl' (\n s -> n + Set.size s) (0 :: Int) exact)
         viewColumns <- timed "deps.relationColumns" $ relationColumns conn (Set.toList (Set.fromList (concatMap viewsOf (Set.toList starts))))
-        let routines = [(k.address, bodyText def) | (k, def) <- Map.toList schema, k.aspect == Definition, k.address.objectType `elem` ["function", "procedure"]]
+        let routines = Map.toList split_
             skip = Set.fromList (map (.address) (Map.keys changes)) <> fold exact
             throughViews column addr =
                 [ T.toLower s : T.toLower v : [T.toLower c | Just c <- [column], keepsName c]
@@ -493,14 +507,15 @@ main =
                 statements <- parse "" =<< readFileUtf8 absFile
                 -- Other connections describe the database while the table is compared, which
                 -- happens in a transaction that is rolled back; waited for only when needed.
-                early <- if opts.againstDatabase || not (null opts.renames) then Just <$> async (describeDatabase dependentsScope db) else pure Nothing
+                let describeWithWords = describeDatabase dependentsScope db >>= \c@(Connected _ _ schema _) -> (c,) <$> routineWords schema
+                early <- if opts.againstDatabase || not (null opts.renames) then Just <$> async describeWithWords else pure Nothing
                 original <- timed "table.jjShow" $ jjShow root opts.base (makeRelative root absFile)
                 -- A file unchanged since --base has nothing to describe the database for.
                 described <- case early of
                     Just a -> pure (wait a)
                     Nothing
-                        | Right statements == (withoutTransactionControl <=< splitStatements) original -> pure (describeDatabase dependentsScope db)
-                        | otherwise -> wait <$> async (describeDatabase dependentsScope db)
+                        | Right statements == (withoutTransactionControl <=< splitStatements) original -> pure describeWithWords
+                        | otherwise -> wait <$> async describeWithWords
                 when (opts.againstDatabase && not (null opts.renames)) $ failWith "--rename works with the file comparison, not --against-database"
                 let renameSql (old, new) = [i|alter table #{qualified table} rename column #{quoteIdent old} to #{quoteIdent new}|]
                 baseline <-
