@@ -27,3 +27,15 @@ where d.classoid in (
     and n.nspname <> 'information_schema'
     and n.nspname !~ '^pg_'
     and not (y.oid is not null and y.typrelid <> 0 and y.typtype = 'c' and exists (select from pg_class x where x.oid = y.typrelid and x.relkind <> 'c'))
+    -- For one table ($3), only the comments that can belong to it, found by index.
+    and ($3::text is null or d.objoid in (
+        select to_regclass($3::text)::oid
+        union all
+        select ix.indexrelid from pg_index ix where ix.indrelid = to_regclass($3::text)
+        union all
+        select ck.oid from pg_constraint ck where ck.conrelid = to_regclass($3::text)
+        union all
+        select tg.oid from pg_trigger tg where tg.tgrelid = to_regclass($3::text)
+        union all
+        select po.oid from pg_policy po where po.polrelid = to_regclass($3::text)
+    ))

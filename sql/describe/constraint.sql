@@ -12,3 +12,5 @@ where con.contype not in ('n', 't')
     and con.conparentid = 0
     and n.nspname <> 'information_schema'
     and n.nspname !~ '^pg_'
+    -- For one table ($3), only its constraints, found by index.
+    and ($3::text is null or con.conrelid = to_regclass($3::text))
