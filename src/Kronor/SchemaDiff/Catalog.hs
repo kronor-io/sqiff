@@ -357,10 +357,15 @@ analyseBodies conns fs functions = do
     let next = atomicModifyIORef' queue \case
             [] -> ([], Nothing)
             b : rest -> (rest, Just b)
-        work c = next >>= maybe (pure []) (\b -> let firstName = maybe "" (\f -> f.name) (listToMaybe b) in (:) <$> timed [i|analyse.batch n=#{length b} first=#{firstName}|] (inBatches c fs.query b) <*> work c)
-        worker c = do
-            void (timed "analyse.tempTables" $ Connection.use c (Session.script fs.tempTables))
-            work c `finally` void (Connection.use c (Session.script "discard temp; reset client_min_messages"))
+        batch c b = let firstName = maybe "" (\f -> f.name) (listToMaybe b) in (:) <$> timed [i|analyse.batch n=#{length b} first=#{firstName}|] (inBatches c fs.query b) <*> work c
+        work c = next >>= maybe (pure []) (batch c)
+        -- A connection makes the temp tables once it has a batch to analyse.
+        worker c =
+            next >>= \case
+                Nothing -> pure []
+                Just b -> do
+                    void (timed "analyse.tempTables" $ Connection.use c (Session.script fs.tempTables))
+                    batch c b `finally` void (Connection.use c (Session.script "discard temp; reset client_min_messages"))
     results <- concat <$> forConcurrently (toList conns) worker
     let position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
         failed = L.sortOn (\(name, _) -> Map.lookup name position) (concatMap snd results)
