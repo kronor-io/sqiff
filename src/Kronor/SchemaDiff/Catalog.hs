@@ -33,6 +33,7 @@ module Kronor.SchemaDiff.Catalog (
     relationColumns,
     bodyErrors,
     errorText,
+    tempTableStatements,
     render,
 ) where
 
@@ -294,12 +295,31 @@ type BodyUses = ([(CatalogId, CatalogId)], Skipped)
 -- 'Nothing' when it is not installed. With @only@, analyses just the functions with those
 -- oids. Each connection takes the next few functions until none are left, the slowest
 -- first, so one slow function does not hold up the others.
-bodyUses :: NonEmpty Connection.Connection -> [Text] -> Maybe (Set Int64) -> IO (Maybe BodyUses)
-bodyUses conns@(conn :| _) excluded only =
+bodyUses :: NonEmpty Connection.Connection -> [Text] -> Maybe (Set Int64) -> IO (Maybe Text) -> IO (Maybe BodyUses)
+bodyUses conns@(conn :| _) excluded only madeTempTables =
     plpgsqlFunctions conn excluded >>= traverse \fs -> do
         let checkable = maybe fs.checkable (\oids -> [f | f <- fs.checkable, f.oid `Set.member` oids]) only
-        (uses, failed) <- analyseBodies conns fs checkable
+        (uses, failed) <- analyseBodies conns fs{tempTables = madeTempTables >>= maybe fs.tempTables pure} checkable
         pure (uses, fs.unchecked <> failed)
+
+
+-- | The statements temp_tables.sql runs on a connection that has no temp tables, to make
+-- the same tables on others; empty when it fails or plpgsql_check is not installed. Runs
+-- in a transaction that is rolled back.
+tempTableStatements :: Connection.Connection -> IO Text
+tempTableStatements conn =
+    timed "tempTableStatements"
+        $ run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
+        >>= \case
+            Nothing -> pure ""
+            Just extSchema -> do
+                result <-
+                    Connection.use conn do
+                        Session.script "begin"
+                        Session.script (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))
+                        Session.statement () (Statement.unpreparable "select coalesce(current_setting('schema_diff.temp_tables', true), '')" mempty (D.singleRow textColumn))
+                _ <- Connection.use conn (Session.script "rollback")
+                pure (either (const "") ("set client_min_messages = error;\n" <>) result)
 
 
 -- | A PL/pgSQL function plpgsql_check can analyse: its oid, name, trigger table and
@@ -317,7 +337,7 @@ data PlFunction = PlFunction
 -- that uses one as using the function, though the body never names it.
 data PlFunctions = PlFunctions
     { query :: Text
-    , tempTables :: Text
+    , tempTables :: IO Text
     , checkable :: [PlFunction]
     , unchecked :: Skipped
     , implicit :: [Int64]
@@ -336,7 +356,7 @@ plpgsqlFunctions conn excluded =
             implicit <- run conn () (Statement.unpreparable implicitQuery mempty (D.rowList int8Column))
             let (unchecked, checkable) = partitionEithers (map triggerTable functions)
             let withSchema = TP.replace "@extschema@" extSchema . decodeUtf8Lenient
-            pure (PlFunctions (withSchema plpgsqlDependQuery) (withSchema plpgsqlTempTablesScript) checkable unchecked implicit)
+            pure (PlFunctions (withSchema plpgsqlDependQuery) (pure (withSchema plpgsqlTempTablesScript)) checkable unchecked implicit)
   where
     implicitQuery = "select castfunc::int8 from pg_cast where castfunc >= 16384 union select oprcode::int8 from pg_operator where oprcode >= 16384"
     functionRow = (,,,,) <$> D.column (D.nonNullable D.int8) <*> textColumn <*> D.column (D.nonNullable D.bool) <*> D.column (D.nullable D.int8) <*> int8Column
@@ -364,7 +384,7 @@ analyseBodies conns fs functions = do
             next >>= \case
                 Nothing -> pure []
                 Just b -> do
-                    void (timed "analyse.tempTables" $ Connection.use c (Session.script fs.tempTables))
+                    void (timed "analyse.tempTables" $ fs.tempTables >>= Connection.use c . Session.script)
                     batch c b `finally` void (Connection.use c (Session.script "discard temp; reset client_min_messages"))
     results <- concat <$> forConcurrently (toList conns) worker
     let position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
@@ -413,12 +433,15 @@ render addr = addr.objectType <> " " <> T.intercalate "." addr.objectNames <> ar
 -- | plpgsql_check's errors, as (function, line, message), for the functions with these
 -- signatures, inside the transaction @conn@ is in; 'Nothing' when plpgsql_check is not
 -- installed. A trigger function is checked against its first trigger's table, or against
--- @table@ when that trigger's table has been moved aside under @aside@.
-bodyErrors :: Connection.Connection -> Text -> Text -> [Text] -> [Text] -> IO (Maybe (Set (Text, Int32, Text)))
-bodyErrors conn aside table signatures sqlSignatures =
+-- @table@ when that trigger's table has been moved aside under @aside@. The temp tables
+-- are made by the statements @made@ gives, from 'tempTableStatements', or by
+-- temp_tables.sql when it gives none.
+bodyErrors :: Connection.Connection -> Text -> Text -> IO (Maybe Text) -> [Text] -> [Text] -> IO (Maybe (Set (Text, Int32, Text)))
+bodyErrors conn aside table made signatures sqlSignatures =
     run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
         >>= traverse \extSchema -> do
-            _ <- timed "bodyErrors.tempTables" $ guarded (Connection.use conn (Session.script (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))))
+            tempTables <- made >>= maybe (pure (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))) pure
+            _ <- timed "bodyErrors.tempTables" $ guarded (Connection.use conn (Session.script tempTables))
             plErrors <- for signatures \signature ->
                 either (const []) (map (\(line, message) -> (signature, line, message)))
                     <$> timed ("bodyErrors.fn " <> signature) (guarded (Connection.use conn (Session.statement (signature, table) (Statement.unpreparable (query extSchema) params decoder))))

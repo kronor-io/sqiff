@@ -12,7 +12,7 @@ import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
 import Kronor.SchemaDiff.Baseline (ensureBaseline)
 import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
-import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, relationColumns, render)
+import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, relationColumns, render, tempTableStatements)
 import Kronor.SchemaDiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
 import Kronor.SchemaDiff.Folder (writeFolder)
 import Kronor.SchemaDiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
@@ -71,8 +71,8 @@ neededFor forPlan changes
 -- | Edges from @pg_depend@ and, when plpgsql_check is installed, from PL/pgSQL bodies,
 -- with notes for stderr. @label@ names the database in the notes.
 edgesOf :: Text -> Scope -> Needed -> Connected -> IO ([Edge], [Text])
-edgesOf label scope needed connected@(Connected conn extra _ addresses) = timed ("edgesOf " <> label) case needed of
-    ReachableFrom starts -> let Connected _ _ schema _ = connected in reachableEdges label scope starts connected (routineWords schema)
+edgesOf label scope needed connected@(Connected conn extra _ addresses made) = timed ("edgesOf " <> label) case needed of
+    ReachableFrom starts -> let Connected _ _ schema _ _ = connected in reachableEdges label scope starts connected (routineWords schema)
     _ -> do
         let wantedIds wanted = [ids | (ids, addr) <- Map.toList addresses, addr `Set.member` wanted]
             only = case needed of
@@ -84,7 +84,7 @@ edgesOf label scope needed connected@(Connected conn extra _ addresses) = timed 
                     BodiesOf wanted -> dependenciesOn conn addresses (wantedIds wanted)
                     _ -> pure []
                 )
-                (timed ("edgesOf.bodyUses " <> label) $ fmap (first (edgesBetween addresses)) <$> bodyUses (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded only)
+                (timed ("edgesOf.bodyUses " <> label) $ fmap (first (edgesBetween addresses)) <$> bodyUses (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded only made)
         pure (edges <> maybe [] fst body, bodyNotes label (snd <$> body))
 
 
@@ -111,7 +111,7 @@ bodyNotes label = \case
 -- the closure, whose dependents are then read, and those can make other functions
 -- matter, so it repeats until nothing new is reached or picked.
 reachableEdges :: Text -> Scope -> Set Address -> Connected -> IO (Map Address BodyText) -> IO ([Edge], [Text])
-reachableEdges label scope starts (Connected conn extra schema addresses) splitWords = timed ("reachableEdges " <> label) do
+reachableEdges label scope starts (Connected conn extra schema addresses made) splitWords = timed ("reachableEdges " <> label) do
     let idsOf = Map.fromListWith (<>) [(addr, [ids]) | (ids, addr) <- Map.toList addresses]
         idsFor = concatMap (\a -> Map.findWithDefault [] a idsOf) . Set.toList
         -- depend_from.sql reads the dependents of a relation's columns with the relation's.
@@ -162,7 +162,7 @@ reachableEdges label scope starts (Connected conn extra schema addresses) splitW
                             | Set.null frontier -> pure (pgEdges' <> bodyEdges, failed)
                             | otherwise -> go explored' pgEdges' done bodyEdges failed
                         todo -> do
-                            (uses, failed') <- timed [i|reach.analyseBodies n=#{length todo}|] $ analyseBodies (conn :| extra) fs todo
+                            (uses, failed') <- timed [i|reach.analyseBodies n=#{length todo}|] $ analyseBodies (conn :| extra) fs{tempTables = made >>= maybe fs.tempTables pure} todo
                             go explored' pgEdges' (done <> Set.fromList (map (.oid) todo)) (bodyEdges <> edgesBetween addresses uses) (failed <> failed')
             (allEdges, failed) <- go (withColumns (starts <> Set.fromList (map (.dependent) edges))) edges Set.empty [] []
             pure (allEdges, bodyNotes label (Just (fs.unchecked <> L.sortOn (\(name, _) -> Map.lookup name position) failed)))
@@ -192,9 +192,9 @@ dependentsScope = Scope{excluded = ["hdb_catalog"], includePartitions = False, c
 -- reads it, with the view's schema. A view that keeps the column's name must be named with it.
 dependentsIn :: IO (Connected, Map Address BodyText) -> Map ObjectKey Change -> IO Dependents
 dependentsIn described changes
-    | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty [])
+    | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty [] (pure Nothing))
     | otherwise = do
-        (connected@(Connected conn _ schema _), split_) <- timed "deps.describeDatabase" described
+        (connected@(Connected conn _ schema _ made), split_) <- timed "deps.describeDatabase" described
         (edges, notes) <- timed "deps.reachableEdges" $ reachableEdges "--db" dependentsScope starts connected (pure split_)
         for_ notes (TIO.hPutStrLn stderr)
         let known = Set.fromList [k.address | k <- Map.keys schema, k.aspect == Definition]
@@ -222,7 +222,7 @@ dependentsIn described changes
                         , not (null wordSets)
                         ]
         measure "deps.textMatch" (Map.foldl' (\n s -> n + Set.size s) (0 :: Int) textual)
-        pure (Dependents exact textual schema edges)
+        pure (Dependents exact textual schema edges made)
   where
     relationKinds = ["table", "view", "materialized view", "foreign table"]
     droppedHere addr = case Map.lookup (ObjectKey Definition addr) changes of
@@ -238,6 +238,8 @@ data Dependents = Dependents
     , named :: Map Address (Set Address)
     , dbSchema :: Schema
     , dbEdges :: [Edge]
+    , dbTempTables :: IO (Maybe Text)
+    -- ^ The statements that make plpgsql_check's temp tables there, from 'tempTableStatements'.
     }
 
 
@@ -338,8 +340,10 @@ describeConnections :: Int
 describeConnections = 4
 
 
--- | A described database with its open connections.
-data Connected = Connected Connection.Connection [Connection.Connection] Schema Addresses
+-- | A described database with its open connections, and the statements that make
+-- plpgsql_check's temp tables there, worked out on a connection of their own while it is
+-- described; 'Nothing' when that fails.
+data Connected = Connected Connection.Connection [Connection.Connection] Schema Addresses (IO (Maybe Text))
 
 
 -- | @local@ names the dev stack's database, on @KRONOR_PG_PORT@ (5432 when unset).
@@ -355,9 +359,10 @@ resolveDb = \case
 describeDatabase :: Scope -> Text -> IO Connected
 describeDatabase scope name = do
     db <- resolveDb name
+    tempTables <- async (either (const Nothing) Just <$> tryAny (bracket (connect db) Connection.release tempTableStatements))
     (conn, extra) <- concurrently (connect db) (replicateConcurrently (describeConnections - 1) (connect db))
     (schema, addresses) <- describeOn (conn : extra) scope.excluded scope.includePartitions Nothing
-    pure (Connected conn extra schema addresses)
+    pure (Connected conn extra schema addresses (wait tempTables))
 
 
 -- | Reads both databases at the same time, then the edges each command needs, given what
@@ -368,7 +373,7 @@ readBoth scope from toDb forPlan = do
     -- checking or building the baseline database; that comes first if both fail.
     toDescribed <- async (timed "describe --to" $ describeDatabase scope toDb)
     fromDb <- timed "connInfoOf" $ connInfoOf from
-    (fromDatabase@(Connected _ _ fromSchema _), toDatabase@(Connected toConn _ toSchema _)) <-
+    (fromDatabase@(Connected _ _ fromSchema _ _), toDatabase@(Connected toConn _ toSchema _ _)) <-
         timed "readBoth.describe" $ concurrently (timed "describe --from" $ describeDatabase scope fromDb) (wait toDescribed)
     let plainChanges = diff (\_ a b -> a == b) fromSchema toSchema
         needed = neededFor forPlan plainChanges
@@ -508,7 +513,7 @@ main =
                 statements <- parse "" =<< readFileUtf8 absFile
                 -- Other connections describe the database while the table is compared, which
                 -- happens in a transaction that is rolled back; waited for only when needed.
-                let describeWithWords = describeDatabase dependentsScope db >>= \c@(Connected _ _ schema _) -> (c,) <$> routineWords schema
+                let describeWithWords = describeDatabase dependentsScope db >>= \c@(Connected _ _ schema _ _) -> (c,) <$> routineWords schema
                 early <- if opts.againstDatabase || not (null opts.renames) then Just <$> async describeWithWords else pure Nothing
                 original <- timed "table.jjShow" $ jjShow root opts.base (makeRelative root absFile)
                 -- A file unchanged since --base has nothing to describe the database for.
@@ -540,7 +545,7 @@ main =
                         [s, n] -> let args = T.intercalate ", " a.objectArgs in [i|#{quoteIdent s}.#{quoteIdent n}(#{args})|]
                         _ -> render a
                     bySignature = Map.fromList [(signature a, a) | a <- plpgsql <> sqlBodies]
-                    check = timed [i|table.bodyErrors n=#{Map.size bySignature}|] $ bodyErrors conn aside (qualified table) (map signature plpgsql) (map signature sqlBodies)
+                    check made = timed [i|table.bodyErrors n=#{Map.size bySignature}|] $ bodyErrors conn aside (qualified table) made (map signature plpgsql) (map signature sqlBodies)
                     -- The rebuilt table has a new row type, so a call that passes its rows finds no function.
                     rowTypeCall message = "function " `T.isPrefixOf` message && any (\end -> (qualified table <> end) `T.isInfixOf` message) [")", ","]
                 checked <-
@@ -549,7 +554,7 @@ main =
                         else
                             timed "table.compare2"
                                 $ fmap (Set.filter (\(_, _, message) -> not (rowTypeCall message)))
-                                <$> withEditedTable conn baseline table statements check (\before -> (\after -> Set.difference <$> after <*> before) <$> check)
+                                <$> withEditedTable conn baseline table statements (check deps.dbTempTables) (\before -> (\after -> Set.difference <$> after <*> before) <$> check (pure Nothing))
                 let retyped =
                         [ (t, c, k.address, n.colType)
                         | (k, Changed old new) <- Map.toList edit.changes
