@@ -4,7 +4,7 @@
 -- index, directly or through the view rules, column defaults and types that stand for
 -- it. From a relation it also steps to its columns, which views and constraints depend
 -- on instead of the relation; those steps are not edges. It also follows objects that
--- are not described; the caller drops their edges.
+-- are not described; the caller drops their edges. A view's columns stand for the view.
 with recursive
 -- The starts, then every step, as (dependent, referenced, whether it is an edge); a start
 -- has no referenced end.
@@ -112,6 +112,7 @@ select
     coalesce(array_agg(s.objsubid::int4), '{}'),
     coalesce(array_agg(s.refclassid::int8), '{}'),
     coalesce(array_agg(s.refobjid::int8), '{}'),
-    coalesce(array_agg(s.refobjsubid::int4), '{}')
+    coalesce(array_agg(case when k.relkind in ('v', 'm') then 0 else s.refobjsubid end::int4), '{}')
 from step s
+left join pg_class k on s.refclassid = 'pg_class'::regclass and k.oid = s.refobjid
 where s.edge

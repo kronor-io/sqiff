@@ -1,6 +1,7 @@
 -- Edges between the objects in $1, $2 and $3 (class, object and sub-object ids), as one
 -- row of arrays. View rules, column defaults, table row types and arrays of either stand
--- for the view, column, table or element type they belong to.
+-- for the view, column, table or element type they belong to. A view's columns stand for
+-- the view.
 with remap (classid, objid, toclassid, toobjid, tosubid) as (
     select 'pg_rewrite'::regclass::oid, rw.oid, 'pg_class'::regclass::oid, rw.ev_class, 0
     from pg_rewrite rw
@@ -31,10 +32,11 @@ edge as (
         coalesce(ma.tosubid, d.objsubid) as objsubid,
         coalesce(mb.toclassid, d.refclassid) as refclassid,
         coalesce(mb.toobjid, d.refobjid) as refobjid,
-        coalesce(mb.tosubid, d.refobjsubid) as refobjsubid
+        case when rk.relkind in ('v', 'm') then 0 else coalesce(mb.tosubid, d.refobjsubid) end as refobjsubid
     from pg_depend d
     left join remap ma on ma.classid = d.classid and ma.objid = d.objid
     left join remap mb on mb.classid = d.refclassid and mb.objid = d.refobjid
+    left join pg_class rk on d.refclassid = 'pg_class'::regclass and rk.oid = d.refobjid
     where d.deptype in ('n', 'a', 'i')
         and d.objid >= 16384
         and d.refobjid >= 16384

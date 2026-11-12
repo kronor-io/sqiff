@@ -20,7 +20,7 @@ import Kronor.SchemaDiff.Plan (context, invert, plan, planWith, renderStep, topo
 import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Phase (..), Step (..), Txn (..), parseColumn, recipe)
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
 import Kronor.SchemaDiff.Sqitch (SqitchPlan (..), Unit (..), UnitKind (..), parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
-import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), aside, compareTable, compareTableWith)
+import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), aside, compareTable, compareTableWith, firstFailure, foreignKeyError)
 import Options.Applicative qualified as O
 import RIO
 import RIO.Directory (makeAbsolute)
@@ -219,26 +219,47 @@ data Dependents = Dependents
     }
 
 
--- | For each column whose type changes, the statements that drop the views reading it,
--- dependents first, and the ones that create them again with their grants, indexes,
+-- | For each column whose type changes, the statements that drop the views reading it, the
+-- policies and triggers on it, and the routines PostgreSQL ties to the column or to those
+-- views, dependents first, and the ones that create them again with their grants, indexes,
 -- triggers and comments.
-viewsAroundTypeChanges :: Dependents -> [(QName, Text, Address)] -> Map (QName, Text) ([Text], [Text])
+viewsAroundTypeChanges :: Dependents -> [(QName, Text, Address)] -> Map (QName, Text) (Set Address, ([Text], [Text]))
 viewsAroundTypeChanges deps retyped =
     Map.fromList
-        [ ((t, c), (map dropView (reverse order), concatMap createView order))
+        [ ((t, c), (members, (map dropView (reverse order), concatMap createView order)))
         | (t, c, addr) <- retyped
-        , let views = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.exact), isView a]
-        , not (null views)
-        , let viewSet = Set.fromList views
-              order = topoOrder viewSet [(d, r) | e <- deps.dbEdges, let d = relation e.dependent, let r = relation e.referenced, d `Set.member` viewSet, r `Set.member` viewSet]
+        , let closure = Map.findWithDefault Set.empty addr deps.exact
+              -- PostgreSQL refuses the type change while a policy or a trigger's when clause
+              -- or column list uses the column.
+              onColumn = Set.filter (\a -> a.objectType `elem` ["policy", "trigger"] && any (\e -> e.dependent == a && e.referenced == addr) deps.dbEdges) closure
+              members = held addr closure (Set.filter isView closure <> onColumn)
+              order = topoOrder members [(d, r) | e <- deps.dbEdges, let d = relation e.dependent, let r = relation e.referenced, d `Set.member` members, r `Set.member` members]
+        , not (Set.null members)
         ]
   where
     isView a = a.objectType `elem` ["view", "materialized view"]
+    isRoutine a = a.objectType `elem` ["function", "procedure"]
+    -- A SQL-standard body records what it reads in pg_depend; any other routine is held
+    -- only by a view's row type in its signature.
+    held column closure members =
+        let views = Set.filter isView members
+            holds r = case Map.lookup (ObjectKey Definition r) deps.dbSchema of
+                Just def
+                    | standardBody def -> any (\e -> e.dependent == r && (e.referenced == column || relation e.referenced `Set.member` members)) deps.dbEdges
+                    | otherwise -> any (\v -> qualifiedAddress v `T.isInfixOf` signature def) views
+                Nothing -> False
+            more = Set.filter (\r -> isRoutine r && r `Set.notMember` members && holds r) closure
+         in if Set.null more then members else held column closure (members <> more)
+    standardBody def = "BEGIN ATOMIC" `T.isInfixOf` def || any ("RETURN " `T.isPrefixOf`) (T.lines def)
+    signature = T.unlines . takeWhile (\l -> not (" AS " `T.isPrefixOf` l || "BEGIN ATOMIC" `T.isInfixOf` l)) . T.lines
     relation a = case (a.objectType, a.objectNames) of
         (kind, [s, t, _]) | Just rel <- T.stripSuffix " column" kind -> Address rel [s, t] []
         _ -> a
     ctx0 = context Map.empty Map.empty Map.empty [] Map.empty
-    dropView a = "drop " <> a.objectType <> " " <> qualifiedAddress a
+    dropView a
+        | isRoutine a = let kind = a.objectType; args = T.intercalate ", " a.objectArgs in [i|drop #{kind} #{qualifiedAddress a}(#{args})|]
+        | [s, t, n] <- a.objectNames, a.objectType `elem` ["policy", "trigger"] = "drop " <> a.objectType <> " " <> quoteIdent n <> " on " <> qualified (QName s t)
+        | otherwise = "drop " <> a.objectType <> " " <> qualifiedAddress a
     qualifiedAddress a = case a.objectNames of
         [s, n] -> qualified (QName s n)
         ns -> T.intercalate "." ns
@@ -264,6 +285,26 @@ viewsAroundTypeChanges deps retyped =
                 , k.aspect == Comment
                 , k.address == a || (relation k.address == a && k.address /= a)
                 ]
+
+
+-- | For a foreign key constraint's definition, each of its columns' types paired with the
+-- referenced column's, by @typeIn schema table column@.
+foreignKeyTypes :: (Text -> Text -> Text -> Maybe Text) -> Address -> Text -> Maybe [(Text, Text)]
+foreignKeyTypes typeIn k def = do
+    [s, t, _] <- Just k.objectNames
+    rest <- T.stripPrefix "FOREIGN KEY " def
+    let (cols, afterCols) = columnList rest
+    refPart <- T.stripPrefix " REFERENCES " afterCols
+    let (refTable, refRest) = T.break (== '(') refPart
+        (refCols, _) = columnList refRest
+        (rs, rt) = case T.break (== '.') refTable of
+            (name, "") -> ("public", unquote name)
+            (schema, name) -> (unquote schema, unquote (T.drop 1 name))
+    guard (length cols == length refCols && not (null cols))
+    for (zip cols refCols) \(a, b) -> (,) <$> typeIn s t a <*> typeIn rs rt b
+  where
+    columnList x = let (inside, after) = T.break (== ')') (T.drop 1 x) in (map (unquote . T.strip) (T.split (== ',') inside), T.drop 1 after)
+    unquote c = fromMaybe c (T.stripPrefix "\"" c >>= T.stripSuffix "\"")
 
 
 -- | Connections per database; the describe queries run over all of them at once.
@@ -458,13 +499,8 @@ main =
                     if null plpgsql
                         then pure Nothing
                         else snd <$> compareTableWith conn baseline table statements check (\before -> (\after -> Set.difference <$> after <*> before) <$> check)
-                let breaking = Map.fromListWith (\_ earlier -> earlier) [(a, message) | (s, _, message) <- maybe [] Set.toList checked, Just a <- [Map.lookup s bySignature]]
-                    passed = Set.fromList [a | isJust checked, a <- plpgsql, a `Map.notMember` breaking, Just def <- [Map.lookup (ObjectKey Definition a) deps.dbSchema], not ("execute" `T.isInfixOf` T.toLower def)]
-                    breaksFor addr = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.named), a `Map.member` breaking]
-                    dependents = deps.exact
-                    mentions = Map.map (Set.filter (\a -> a `Map.notMember` breaking && a `Set.notMember` passed)) deps.named
-                    retyped =
-                        [ (t, c, k.address)
+                let retyped =
+                        [ (t, c, k.address, n.colType)
                         | (k, Changed old new) <- Map.toList edit.changes
                         , k.aspect == Definition
                         , let o = parseColumn old
@@ -472,9 +508,30 @@ main =
                         , o.colType /= n.colType || o.collation /= n.collation
                         , Column t c <- [fromAddress k.address]
                         ]
-                    retypedAddresses = Set.fromList [a | (_, _, a) <- retyped]
-                    around = viewsAroundTypeChanges deps retyped
-                    withViews c = c{viewsAround = around}
+                    typeIn s t c = case [ty | (QName s' t', c', _, ty) <- retyped, (s', t', c') == (s, t, c)] of
+                        ty : _ -> Just ty
+                        [] -> (.colType) . parseColumn <$> Map.lookup (ObjectKey Definition (Address "table column" [s, t, c] [])) deps.dbSchema
+                -- A foreign key on a retyped column has to be rebuilt with the new type.
+                foreignKeyBreaks <-
+                    Map.fromListWith (<>) . catMaybes <$> for
+                        [ (addr, k, types)
+                        | (_, _, addr, _) <- retyped
+                        , k <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
+                        , k.objectType == "table constraint"
+                        , Just def <- [Map.lookup (ObjectKey Definition k) deps.dbSchema]
+                        , Just types <- [foreignKeyTypes typeIn k def]
+                        ]
+                        \(addr, k, types) -> fmap (\err -> (addr, [(k, err)])) <$> foreignKeyError conn types
+                let breaking = Map.fromListWith (\_ earlier -> earlier) [(a, message) | (s, _, message) <- maybe [] Set.toList checked, Just a <- [Map.lookup s bySignature]]
+                    passed = Set.fromList [a | isJust checked, a <- plpgsql, a `Map.notMember` breaking, Just def <- [Map.lookup (ObjectKey Definition a) deps.dbSchema], not ("execute" `T.isInfixOf` T.toLower def)]
+                    breaksFor addr = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.named), a `Map.member` breaking]
+                    dependents = deps.exact
+                    mentions = Map.map (Set.filter (\a -> a `Map.notMember` breaking && a `Set.notMember` passed)) deps.named
+                    retypedAddresses = Set.fromList [a | (_, _, a, _) <- retyped]
+                    around = viewsAroundTypeChanges deps [(t, c, a) | (t, c, a, _) <- retyped]
+                    withViews c = c{viewsAround = Map.map snd around}
+                    aroundOf addr = fold [members | (t, c, a, _) <- retyped, a == addr, Just (members, _) <- [Map.lookup (t, c) around]]
+                    foreignKeysFor addr = Map.findWithDefault [] addr foreignKeyBreaks
                     renameSteps =
                         [ Step DropPhase (-1) addr (Column table new) (renameSql (old, new)) Shared [] (ObjectKey Definition addr) (Changed def def)
                         | (old, new) <- opts.renames
@@ -511,8 +568,11 @@ main =
                     breaksSection = \case
                         [] -> []
                         fs -> "  breaks, by plpgsql_check" : concat [["    " <> short f, "      " <> Map.findWithDefault "" f breaking] | f <- fs]
+                    foreignKeySection = \case
+                        [] -> []
+                        ks -> "  cannot be rebuilt with the new type" : concat [["    " <> short k, "      " <> err] | (k, err) <- ks]
                     isView d = d.objectType `elem` ["view", "materialized view"]
-                    recreated addr d = addr `Set.member` retypedAddresses && (isView d || (d.objectType == "trigger" && any (\v -> isView v && v.objectNames == take 2 d.objectNames) (Map.findWithDefault Set.empty addr dependents)))
+                    recreated addr d = d `Set.member` aroundOf addr || (d.objectType == "trigger" && any (\v -> isView v && v.objectNames == take 2 d.objectNames) (aroundOf addr))
                     -- ALTER COLUMN TYPE rebuilds the column's indexes and constraints itself.
                     rebuiltWith d = d.objectType `elem` ["index", "table constraint", "sequence"]
                     usage =
@@ -522,6 +582,7 @@ main =
                                     <> section "dropped with it" with
                                     <> section "dropped and created again around it" again
                                     <> breaksSection (breaksFor addr)
+                                    <> foreignKeySection (foreignKeysFor addr)
                                     <> section "named in" (Set.toList (Map.findWithDefault Set.empty addr mentions))
                             | addr <- Set.toList (Map.keysSet dependents <> Map.keysSet deps.named)
                             , not (null (Map.findWithDefault Set.empty addr dependents)) || not (null (breaksFor addr)) || not (null (Map.findWithDefault Set.empty addr mentions))
@@ -533,6 +594,7 @@ main =
                         [d | (addr, ds) <- Map.toList dependents, dropped addr, d <- Set.toList ds, not (goesWith d)]
                             <> [d | (addr, ds) <- Map.toList dependents, addr `Set.member` retypedAddresses, d <- Set.toList ds, not (recreated addr d), not (rebuiltWith d)]
                             <> Map.keys breaking
+                            <> [k | ks <- Map.elems foreignKeyBreaks, (k, _) <- ks]
                 for_ edit.ignored \(k, reason) -> do
                     let name = render k.address <> if k.aspect == Privileges then " (privileges)" else ""
                     TIO.putStrLn [i|-- left alone: #{name}: #{reason}|]
@@ -565,9 +627,16 @@ main =
                             tagName = fromMaybe (T.pack (formatTime defaultTimeLocale "%Y-%m-%d" now) <> "_schema_diff") opts.tableTag
                             entries p = length (filter (== changeName) p.changes)
                             alreadyReworked = entries sqitchPlan > entries basePlan
+                        -- sqitch reverts the reworked change before the migrations, so its
+                        -- revert, the previous file, meets the edited table.
+                        previous <- parse (" at " <> opts.base) original
+                        oldFileFails <- snd <$> compareTableWith conn baseline table statements (pure ()) (const (firstFailure conn previous))
+                        let baseRev = opts.base
+                        for_ oldFileFails \err ->
+                            TIO.putStrLn [i|the file at #{baseRev} fails on the edited table (#{err}); the rework's revert does nothing and the migrations revert the table|]
                         writeUnits root opts.top sqitchPlan tagName written
                         unless alreadyReworked
-                            $ reworkEdited root opts.top sqitchPlan tagName changeName [i|schema-diff: #{changeName} as edited|] original
+                            $ reworkEdited root opts.top sqitchPlan tagName changeName [i|schema-diff: #{changeName} as edited|] original (isJust oldFileFails)
                         for_ written \u -> TIO.putStrLn ("added " <> u.changeName)
                         TIO.putStrLn (if alreadyReworked then "already reworked on this branch: " <> changeName else "reworked " <> changeName)
 

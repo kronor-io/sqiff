@@ -11,6 +11,8 @@ module Kronor.SchemaDiff.TableEdit (
     Baseline (..),
     compareTable,
     compareTableWith,
+    foreignKeyError,
+    firstFailure,
     aside,
 ) where
 
@@ -27,6 +29,41 @@ import Kronor.SchemaDiff.Diff (Change (..), diff)
 import Kronor.SchemaDiff.Object
 import RIO
 import RIO.Map qualified as Map
+
+
+-- | The error PostgreSQL gives for a foreign key from columns of the first types to columns
+-- of the second, tried on temporary tables in a transaction that is rolled back.
+foreignKeyError :: Connection.Connection -> [(Text, Text)] -> IO (Maybe Text)
+foreignKeyError conn types = do
+    result <- Connection.use conn (Session.script [i|begin; create temp table schema_diff_pk (#{columns snd}, primary key (#{names})); create temp table schema_diff_fk (#{columns fst}, foreign key (#{names}) references schema_diff_pk (#{names}))|])
+    _ <- Connection.use conn (Session.script "rollback")
+    pure (either (Just . tidy . errorText) (const Nothing) result)
+  where
+    tidy e = case T.breakOn "are of incompatible types" e of
+        (_, "") -> e
+        (_, rest) -> "the key columns " <> rest
+    names = T.intercalate ", " [[i|c#{n}|] | n <- [1 .. length types]]
+    columns side = T.intercalate ", " [[i|c#{n} #{side ty}|] | (n, ty) <- zip [1 :: Int ..] types]
+
+
+-- | The first of @statements@ that fails, with its error. Runs inside the caller's
+-- transaction under a savepoint that is rolled back.
+firstFailure :: Connection.Connection -> [Text] -> IO (Maybe Text)
+firstFailure conn statements = do
+    _ <- Connection.use conn (Session.script "savepoint schema_diff_first_failure")
+    result <- go (zip [1 :: Int ..] statements)
+    _ <- Connection.use conn (Session.script "rollback to savepoint schema_diff_first_failure")
+    pure result
+  where
+    go [] = pure Nothing
+    go ((n, s) : rest) = Connection.use conn (Session.script s) >>= either (\e -> pure (Just [i|statement #{n}: #{errorText e}|])) (const (go rest))
+
+
+errorText :: Errors.SessionError -> Text
+errorText = \case
+    Errors.ScriptSessionError _ (Errors.ServerError _ message detail _ _) -> message <> maybe "" ("; " <>) detail
+    Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message detail _ _)) -> message <> maybe "" ("; " <>) detail
+    e -> tshow e
 
 
 data TableEdit = TableEdit
@@ -134,11 +171,6 @@ compareTableWith conn baseline table statements beforeEdit afterEdit = do
             |]
             E.noParams
             (D.rowList (D.column (D.nonNullable D.text)))
-
-    errorText = \case
-        Errors.ScriptSessionError _ (Errors.ServerError _ message detail _ _) -> message <> maybe "" ("; " <>) detail
-        Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message detail _ _)) -> message <> maybe "" ("; " <>) detail
-        e -> tshow e
 
     script' :: Text -> IO Bool
     script' sql = do

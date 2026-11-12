@@ -234,10 +234,13 @@ writeUnits root topDir sqitchPlan tag us = do
 
 
 -- | Reworks a change whose deploy script was already edited in place: puts back @original@
--- for sqitch to snapshot, reworks, then restores the edit whatever happens.
-reworkEdited :: FilePath -> FilePath -> SqitchPlan -> Text -> Text -> Text -> Text -> IO ()
-reworkEdited root topDir sqitchPlan tag changeName note original = do
+-- for sqitch to snapshot, reworks, then restores the edit whatever happens. With
+-- @emptyRevert@ the reworked change's revert does nothing, for when the previous file
+-- cannot run on the edited table.
+reworkEdited :: FilePath -> FilePath -> SqitchPlan -> Text -> Text -> Text -> Text -> Bool -> IO ()
+reworkEdited root topDir sqitchPlan tag changeName note original emptyRevert = do
     let path = root </> topDir </> "deploy" </> T.unpack changeName <.> "sql"
+        revertPath = root </> topDir </> "revert" </> T.unpack changeName <.> "sql"
     edited <- readFileUtf8 path
     ( do
             writeFileUtf8 path original
@@ -246,6 +249,14 @@ reworkEdited root topDir sqitchPlan tag changeName note original = do
             runSqitch root ["rework", changeName, "-n", note]
         )
         `finally` writeFileUtf8 path edited
+    let project = sqitchPlan.project
+    when emptyRevert
+        $ writeFileUtf8
+            revertPath
+            [S.i|-- Revert #{project}:#{changeName} from pg
+
+-- The migrations before this change revert the table; the previous file fails on the edited table.
+|]
 
 
 runSqitch :: FilePath -> [Text] -> IO ()

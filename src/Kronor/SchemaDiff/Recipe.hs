@@ -16,6 +16,7 @@ module Kronor.SchemaDiff.Recipe (
 ) where
 
 import Data.ByteString qualified as B
+import Data.Char (isAlphaNum)
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import Kronor.SchemaDiff.Body (BodyCheck (..))
@@ -67,6 +68,7 @@ data Context = Context
     , droppedTables :: Set QName
     , partitionedTables :: Set QName
     , droppedColumns :: Set (QName, Text)
+    , retypedColumns :: Set (QName, Text)
     , newTableColumns :: Map QName [(Text, ColumnDef)]
     , bodyChecks :: Map ObjectKey (Text, BodyCheck)
     -- ^ Body checks, with the definition each was made for.
@@ -170,6 +172,11 @@ definition ctx key object change = case object of
     createAt rank (txn, hazards) sql = Step CreatePhase rank addr object sql txn hazards key change
     remove (txn, hazards) sql = Step DropPhase (dropRank object) addr object sql txn hazards key change
     manual why = [create (Shared, [Manual why]) ("-- " <> why)]
+    -- A definition that names a column the edit drops or retypes has to go before it.
+    namesAlteredColumn t = namesAlteredColumnOf (== t)
+    namesAlteredColumnOf onTable def =
+        let names = Set.fromList (T.split (\ch -> not (isAlphaNum ch || ch == '_')) def)
+         in any (\(t', c) -> onTable t' && c `Set.member` names) (ctx.droppedColumns <> ctx.retypedColumns)
 
     extension e = case change of
         Added def ->
@@ -294,24 +301,33 @@ definition ctx key object change = case object of
         serialName = let tableName = t.name in qualified (QName t.schema [i|#{tableName}_#{c}_seq|])
         toIdentity k =
             [i|do $$
-declare seq text := pg_get_serial_sequence(#{tableLit}, #{columnLit}); last bigint; called boolean;
+declare seq text := pg_get_serial_sequence(#{tableLit}, #{columnLit}); last bigint; called boolean; acl aclitem[];
 begin
     execute format('select last_value, is_called from %s', seq) into last, called;
+    select relacl into acl from pg_class where oid = seq::regclass;
     #{col}drop default;
     execute format('drop sequence %s', seq);
     #{col}add generated #{k} as identity;
     perform setval(pg_get_serial_sequence(#{tableLit}, #{columnLit}), last, called);
+    #{grantAcl serialOf}
 end $$|]
         toSerial colType =
             [i|do $$
-declare last bigint; called boolean;
+declare last bigint; called boolean; acl aclitem[];
 begin
     execute format('select last_value, is_called from %s', pg_get_serial_sequence(#{tableLit}, #{columnLit})) into last, called;
+    select relacl into acl from pg_class where oid = pg_get_serial_sequence(#{tableLit}, #{columnLit})::regclass;
     #{col}drop identity;
     create sequence #{serialName} as #{colType} owned by #{qualified t}.#{quoteIdent c};
     perform setval(#{literal serialName}, last, called);
     #{col}set default nextval(#{literal serialName}::regclass);
+    #{grantAcl (literal serialName)}
 end $$|]
+        serialOf = [i|pg_get_serial_sequence(#{tableLit}, #{columnLit})|] :: Text
+        -- Gives the new sequence the grants the old one had, apart from its owner's.
+        grantAcl :: Text -> Text
+        grantAcl target =
+            [i|execute coalesce((select string_agg(format('grant %s on sequence %s to %s', x.privilege_type, #{target}, case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end), '; ') from aclexplode(acl) x where x.grantee <> x.grantor), 'select');|]
         notNullSteps old new = case (old.notNull, new.notNull) of
             (False, True) ->
                 create (Shared, []) [i|#{alter}add #{named new}not null #{quoteIdent c} not valid|]
@@ -388,6 +404,8 @@ end $$|]
             | otherwise -> [remove (None, []) ("drop index concurrently " <> qualified ix)]
         Changed old new
             | onOnly new || onOnly old -> remove (Shared, [LongLock]) ("drop index " <> qualified ix) : addIndex new
+            | namesAlteredColumnOf (\t -> indexTable old == Just (qualified t)) old ->
+                remove (None, []) ("drop index concurrently if exists " <> qualified ix) : addIndex new
             | otherwise ->
                 let tmp = takeBytes 59 ix.name <> "_new"
                     oldName = quoteIdent ix.name
@@ -496,7 +514,8 @@ end $$|]
 
     trigger t n = case change of
         Added def -> [create (Shared, []) def]
-        Changed _ new
+        Changed old new
+            | namesAlteredColumn t old -> [dropTrigger DropPhase, create (Shared, []) new]
             | Just rest <- T.stripPrefix "CREATE TRIGGER " new -> [create (Shared, []) ("CREATE OR REPLACE TRIGGER " <> rest)]
             | otherwise -> [dropTrigger CreatePhase, create (Shared, []) new]
         Dropped _ -> [dropTrigger DropPhase]
@@ -506,7 +525,9 @@ end $$|]
 
     policy t n = case change of
         Added def -> [createPolicy def]
-        Changed _ new -> [create (Shared, []) dropPolicy, createPolicy new]
+        Changed old new
+            | namesAlteredColumn t old -> [remove (Shared, []) dropPolicy, createPolicy new]
+            | otherwise -> [create (Shared, []) dropPolicy, createPolicy new]
         Dropped _ -> [remove (Shared, []) dropPolicy]
       where
         dropPolicy = "drop policy " <> quoteIdent n <> " on " <> qualified t

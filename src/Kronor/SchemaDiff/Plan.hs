@@ -73,6 +73,14 @@ context checks fromSchema toSchema fromEdges changes =
                 , Table t <- [fromAddress k.address]
                 ]
         , droppedColumns = Set.fromList [(t, c) | (Column t c, Dropped _) <- definitions]
+        , retypedColumns =
+            Set.fromList
+                [ (t, c)
+                | (Column t c, Changed old new) <- definitions
+                , let o = parseColumn old
+                      n = parseColumn new
+                , o.colType /= n.colType || o.collation /= n.collation
+                ]
         , viewsAround = Map.empty
         , droppedObjects = Set.fromList [k.address | (k, Dropped _) <- Map.toList changes, k.aspect == Definition]
         , newTableColumns =
