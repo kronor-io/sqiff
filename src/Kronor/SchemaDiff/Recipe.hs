@@ -741,12 +741,22 @@ viewParts def = case T.breakOn "\n" def of
 -- from an earlier failed build.
 concurrentBuild :: QName -> Text -> Text
 concurrentBuild index build =
-    "do $$ begin if exists (select from pg_index where indexrelid = to_regclass("
-        <> literal (qualified index)
-        <> ") and not indisvalid) then raise exception 'index "
-        <> T.replace "'" "''" (qualified index)
-        <> " is invalid from an earlier failed build; drop it first'; end if; end $$;\n"
-        <> build
+    let regclass = literal (qualified index)
+        message = T.replace "'" "''" (qualified index)
+     in T.unlines
+            [ "do $$"
+            , "begin"
+            , "    if exists ("
+            , "        select from pg_index"
+            , [i|        where indexrelid = to_regclass(#{regclass}) and not indisvalid|]
+            , "    ) then"
+            , [i|        raise exception 'index #{message} is invalid from an earlier failed build; drop it first';|]
+            , "    end if;"
+            , "end"
+            , "$$;"
+            ]
+            <> "\n"
+            <> build
 
 
 -- | The longest prefix of at most @n@ bytes in UTF-8.

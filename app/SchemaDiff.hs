@@ -19,19 +19,20 @@ import Kronor.SchemaDiff.Object (Object (..), QName (..), fromAddress, qualified
 import Kronor.SchemaDiff.Plan (context, invert, plan, planWith, renderStep, topoOrder)
 import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), parseColumn, recipe, referencedTable, revokeGranted)
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
-import Kronor.SchemaDiff.Sqitch (SqitchPlan (..), Unit (..), UnitKind (..), parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
+import Kronor.SchemaDiff.Sqitch (SqitchPlan (..), Unit (..), UnitKind (..), moveToEnd, parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
 import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), aside, compareTable, firstFailure, foreignKeyError, typeChangeFacts, withEditedTable)
 import Kronor.SchemaDiff.Timing (measure, timed)
 import Options.Applicative qualified as O
 import RIO
 import RIO.Directory (makeAbsolute)
-import RIO.FilePath (makeRelative, (</>))
+import RIO.FilePath (makeRelative, (<.>), (</>))
 import RIO.HashSet qualified as HS
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.NonEmpty (nonEmpty)
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
+import RIO.Text.Partial qualified as TP
 import System.Environment (lookupEnv)
 import System.Process.Typed (proc, readProcess, setWorkingDir)
 
@@ -488,7 +489,7 @@ main =
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     steps = plan checks fromSchema toSchema fromEdges toEdges changes
                     inverseCtx = context Map.empty toSchema fromSchema toEdges (Map.map invert changes)
-                    written = units True inverseCtx sqitchPlan now steps
+                    written = units (const True) inverseCtx sqitchPlan now steps
                     tagName = fromMaybe (T.pack (formatTime defaultTimeLocale "%Y-%m-%d" now) <> "_schema_diff") opts.tag
                 measure "sqitch.planUnits" (sum [length u.deploy + length u.revert | u <- written])
                 if opts.dryRun
@@ -524,10 +525,25 @@ main =
                         | otherwise -> wait <$> async describeWithWords
                 when (opts.againstDatabase && not (null opts.renames)) $ failWith "--rename works with the file comparison, not --against-database"
                 let renameSql (old, new) = [i|alter table #{qualified table} rename column #{quoteIdent old} to #{quoteIdent new}|]
+                -- This branch's changes for the table, run after the file at --base, so that
+                -- a second run writes only what they don't cover yet.
+                branchChanges <-
+                    if opts.againstDatabase
+                        then pure []
+                        else do
+                            current <- readPlan (root </> opts.planPath)
+                            basePlan <- parsePlan <$> jjShow root opts.base opts.planPath
+                            let before = Set.fromList basePlan.changes
+                            for (filter (\n -> n `Set.notMember` before && forTable table n) (nubOrd current.changes)) \n -> do
+                                script <- readFileUtf8 (root </> opts.top </> "deploy" </> T.unpack n <.> "sql")
+                                (n,) . replayable <$> either (\e -> failWith [i|#{n}: #{e}|]) pure ((withoutTransactionControl <=< splitStatements) script)
+                let branchStatements = concatMap snd branchChanges
+                    pendingRenames = [r | r <- opts.renames, renameSql r `notElem` branchStatements]
+                for_ branchChanges \(n, _) -> TIO.putStrLn [i|-- already on this branch: #{n}|]
                 baseline <-
                     if opts.againstDatabase
                         then pure (LiveTable opts.allowDrops)
-                        else BaseFile . (<> map renameSql opts.renames) <$> parse (" at " <> opts.base) original
+                        else BaseFile . (<> (branchStatements <> map renameSql pendingRenames)) <$> parse (" at " <> opts.base) original
                 conn <- timed "table.connect" $ connect =<< resolveDb db
                 edit <- timed "table.compare1" $ compareTable conn baseline table statements
                 let columnAddress c = Address "table column" [table.schema, table.name, c] []
@@ -615,12 +631,15 @@ main =
                     foreignKeysFor addr = Map.findWithDefault [] addr foreignKeyBreaks
                     renameSteps =
                         [ Step DropPhase (-1) addr (Column table new) (renameSql (old, new)) Shared [] (ObjectKey Definition addr) (Changed def def)
-                        | (old, new) <- opts.renames
+                        | (old, new) <- pendingRenames
                         , let addr = columnAddress new
                               def = Map.findWithDefault "" (ObjectKey Definition addr) edit.desired
                         ]
                     steps = renameSteps <> map withTypeFacts (planWith withViews Map.empty edit.current edit.desired [] [] edit.changes)
-                    same = if opts.againstDatabase then "the file matches the table" else "the file has no schema changes since " <> opts.base
+                    same
+                        | opts.againstDatabase = "the file matches the table"
+                        | not (null branchChanges) = "this branch's changes already cover the file"
+                        | otherwise = "the file has no schema changes since " <> opts.base
                     columnsWhere p = [(c, (parseColumn (changeText ch)).colType) | (k, ch) <- Map.toList edit.changes, k.aspect == Definition, p ch, Column _ c <- [fromAddress k.address]]
                     changeText = \case Added d -> d; Dropped d -> d; Changed _ d -> d
                     renameLike =
@@ -692,7 +711,9 @@ main =
                             then TIO.putStrLn ("-- " <> same)
                             else for_ steps (TIO.putStrLn . renderStep)
                     else do
-                        when (null steps) $ failWith ("nothing to write: " <> same)
+                        when (null steps) do
+                            TIO.putStrLn ("nothing to write: " <> same)
+                            exitSuccess
                         for_ usage (TIO.hPutStrLn stderr)
                         unless (null blocking) do
                             let n = length blocking
@@ -704,12 +725,14 @@ main =
                         let inverseCtx = withViews (context Map.empty edit.desired edit.current [] (Map.map invert edit.changes))
                             renameBack =
                                 [ Step DropPhase (-1) (columnAddress old) (Column table old) (renameSql (new, old)) Shared [] s.key s.change
-                                | (s, (old, new)) <- zip renameSteps opts.renames
+                                | (s, (old, new)) <- zip renameSteps pendingRenames
                                 ]
                             withRenameBack u
                                 | any (`elem` renameSteps) u.deploy = u{revert = u.revert <> renameBack}
                                 | otherwise = u
-                            written = map withRenameBack (units False inverseCtx sqitchPlan now steps)
+                            -- A new index gets kronor's <schema>/table/<table>/index/<name> change.
+                            isIndex s = case s.object of Index _ -> True; _ -> False
+                            written = map withRenameBack (units isIndex inverseCtx sqitchPlan now steps)
                             tagName = fromMaybe (T.pack (formatTime defaultTimeLocale "%Y-%m-%d" now) <> "_schema_diff") opts.tableTag
                             entries p = length (filter (== changeName) p.changes)
                             alreadyReworked = entries sqitchPlan > entries basePlan
@@ -724,8 +747,33 @@ main =
                         unless alreadyReworked
                             $ timed "write.reworkEdited"
                             $ reworkEdited root opts.top sqitchPlan tagName changeName [i|schema-diff: #{changeName} as edited|] original (isJust oldFileFails)
+                        -- The table's rework comes after its migrations in the plan.
+                        when alreadyReworked $ moveToEnd (root </> opts.planPath) changeName
                         for_ written \u -> TIO.putStrLn ("added " <> u.changeName)
-                        TIO.putStrLn (if alreadyReworked then "already reworked on this branch: " <> changeName else "reworked " <> changeName)
+                        TIO.putStrLn
+                            ( if alreadyReworked
+                                then [i|moved the branch's rework of #{changeName} after the new migrations; if this branch is deployed locally, revert it to before the rework first|]
+                                else "reworked " <> changeName
+                            )
+
+
+-- | Whether a sqitch change is about the table, by the names create-migration and
+-- schema-diff give: <schema>/table/<table>/index/…, or <schema>.<table> in a migration's name.
+forTable :: QName -> Text -> Bool
+forTable t n =
+    let (schema, name) = (t.schema, t.name)
+        key = [i|#{schema}.#{name}|]
+        indexes = [i|#{schema}/table/#{name}/index/|]
+     in indexes `T.isPrefixOf` n || any (`T.isInfixOf` (n <> "-")) [key <> ".", key <> "-"]
+
+
+-- | A migration's statements as they can run inside the comparison's transaction:
+-- without session settings, and with concurrent index builds made plain.
+replayable :: [Text] -> [Text]
+replayable = map (TP.replace "concurrently " "" . TP.replace "CONCURRENTLY " "") . filter (not . setting)
+  where
+    setting s = any (`T.isPrefixOf` T.toLower (code s)) ["set ", "reset ", "select set_config("]
+    code = T.stripStart . T.unlines . dropWhile (\l -> T.null (T.strip l) || "--" `T.isPrefixOf` T.stripStart l) . T.lines
 
 
 -- | A file as it is at a jj revision.
