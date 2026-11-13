@@ -16,6 +16,7 @@ import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
 import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), Partitions (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, relationColumns, render, tempTableStatements)
 import Kronor.SchemaDiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
 import Kronor.SchemaDiff.Folder (Existing (..), writeFolder)
+import Kronor.SchemaDiff.Git (Repo, findRepo, showFile)
 import Kronor.SchemaDiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
 import Kronor.SchemaDiff.Plan (context, invert, plan, planWith, renderStep, topoOrder)
 import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), parseColumn, recipe, referencedTable, revokeGranted)
@@ -35,7 +36,6 @@ import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import RIO.Text.Partial qualified as TP
 import System.Environment (lookupEnv)
-import System.Process.Typed (proc, readProcess, setWorkingDir)
 
 
 data Scope = Scope
@@ -510,6 +510,7 @@ data TableEnv = TableEnv
     , db :: Text
     , file :: FilePath
     , root :: FilePath
+    , repo :: Repo
     , sqitchChange :: Text
     , table :: QName
     , statements :: [Text]
@@ -564,13 +565,14 @@ tableCommand file db opts = do
     statements <- parseFile file "" =<< readFileUtf8 absFile
     let describeWithWords = describeDatabase dependentsScope db >>= \c@(Connected _ _ schema _ _) -> (c,) <$> routineWords schema
     early <- if opts.compareWith == LiveDatabase || not (null opts.renames) then Just <$> async describeWithWords else pure Nothing
-    original <- timed "table.jjShow" $ jjShow root opts.base (makeRelative root absFile)
+    repo <- findRepo root
+    original <- timed "table.baseFile" $ showFile repo opts.base absFile
     described <- case early of
         Just a -> pure (wait a)
         Nothing
             | Right statements == (withoutTransactionControl <=< splitStatements) original -> pure describeWithWords
             | otherwise -> wait <$> async describeWithWords
-    runRIO TableEnv{opts, db, file, root, sqitchChange = changeName, table, statements, original} (compareAndReport described)
+    runRIO TableEnv{opts, db, file, root, repo, sqitchChange = changeName, table, statements, original} (compareAndReport described)
 
 
 -- | The project root, the file's absolute path, its sqitch change and its table.
@@ -651,7 +653,7 @@ branchChangesFor = do
         then pure []
         else do
             current <- liftIO (readPlan (root </> opts.planPath))
-            basePlan <- liftIO (parsePlan <$> jjShow root opts.base opts.planPath)
+            basePlan <- liftIO (parsePlan <$> showFile env.repo opts.base (root </> opts.planPath))
             let before = Set.fromList basePlan.changes
             for (filter (\n -> n `Set.notMember` before && forTable env.table n) (nubOrd current.changes)) \n -> do
                 script <- readFileUtf8 (root </> opts.top </> "deploy" </> T.unpack n <.> "sql")
@@ -881,7 +883,7 @@ writeMigration conn baseline edit f = do
         failWith [i|#{n} dependencies on what the edit drops or retypes; change or drop the dependents first|]
     unless (null f.renameLike) $ failWith "a column is dropped and another added with the same type; say whether it is a rename with --rename or --drop-and-add"
     sqitchPlan <- timed "write.readPlan" $ liftIO (readPlan (root </> opts.planPath))
-    basePlan <- timed "write.basePlan" $ liftIO (parsePlan <$> jjShow root opts.base opts.planPath)
+    basePlan <- timed "write.basePlan" $ liftIO (parsePlan <$> showFile env.repo opts.base (root </> opts.planPath))
     now <- liftIO getCurrentTime
     let inverseCtx = f.withViews (context Map.empty edit.desired edit.current [] (Map.map invert edit.changes))
         renameBack =
@@ -940,15 +942,6 @@ withoutLeadingComments :: Text -> Text
 withoutLeadingComments = T.stripStart . T.unlines . dropWhile (\l -> T.null (T.strip l) || "--" `T.isPrefixOf` T.stripStart l) . T.lines
 
 
--- | A file as it is at a jj revision.
-jjShow :: FilePath -> Text -> FilePath -> IO Text
-jjShow root rev path = do
-    (code, out, err) <- readProcess (setWorkingDir root (proc "jj" ["--ignore-working-copy", "file", "show", "-r", T.unpack rev, path]))
-    case code of
-        ExitSuccess -> pure (decodeUtf8Lenient (toStrictBytes out))
-        ExitFailure _ -> failWith [i|jj file show -r #{rev} #{path}: #{decodeUtf8Lenient (toStrictBytes err)}|]
-
-
 commandParser :: O.Parser Command
 commandParser =
     O.hsubparser
@@ -971,7 +964,7 @@ commandParser =
                     <$> O.flag PrintMigration WriteMigration (O.long "write" <> O.help "Add the migration with sqitch and rework the table's change")
                     <*> O.flag FileAtBase LiveDatabase (O.long "against-database" <> O.help "Compare with the live table instead of the file at --base; shows drift too")
                     <*> O.flag ReportDrops AllowDrops (O.long "allow-drops" <> O.help "With --against-database, drop columns and constraints that are not in the file")
-                    <*> O.strOption (O.long "base" <> O.metavar "REV" <> O.value "master" <> O.help "Revision with the file before your edit (jj)")
+                    <*> O.strOption (O.long "base" <> O.metavar "REV" <> O.value "master" <> O.help "Git revision with the file before your edit")
                     <*> O.strOption (O.long "project" <> O.metavar "DIR" <> O.value ".")
                     <*> O.strOption (O.long "top-dir" <> O.metavar "DIR" <> O.value "database")
                     <*> O.strOption (O.long "plan-file" <> O.metavar "FILE" <> O.value "database/sqitch.plan")

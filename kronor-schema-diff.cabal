@@ -28,6 +28,7 @@ library
     Kronor.SchemaDiff.Catalog
     Kronor.SchemaDiff.Diff
     Kronor.SchemaDiff.Folder
+    Kronor.SchemaDiff.Git
     Kronor.SchemaDiff.Object
     Kronor.SchemaDiff.Plan
     Kronor.SchemaDiff.Recipe

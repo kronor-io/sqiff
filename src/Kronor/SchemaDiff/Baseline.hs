@@ -4,26 +4,23 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | A scratch PostgreSQL holding the schema a revision's sqitch plan produces, run from a
--- jj workspace at that revision.
+-- git worktree at that revision.
 module Kronor.SchemaDiff.Baseline (ensureBaseline) where
 
 import Data.String.Interpolate (i)
 import Data.Text.IO qualified as TIO
 import Kronor.SchemaDiff.Catalog (failWith)
+import Kronor.SchemaDiff.Git (Repo, findRepo, git, resolveCommit)
 import RIO
-import RIO.Directory (XdgDirectory (..), createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable, getXdgDirectory, removeFile)
+import RIO.Directory (XdgDirectory (..), createDirectoryIfMissing, doesDirectoryExist, doesFileExist, doesPathExist, findExecutable, getXdgDirectory, removeDirectoryRecursive, removeFile)
 import RIO.FilePath (takeDirectory, (</>))
 import RIO.Text qualified as T
 import System.Environment (getEnvironment)
-import System.Process.Typed (ProcessConfig, nullStream, proc, readProcess, runProcess, setEnv, setStdin, setStdout, setWorkingDir, useHandleOpen)
+import System.Process.Typed (ProcessConfig, nullStream, proc, readProcess, runProcess, setEnv, setStdin, setStdout, useHandleOpen)
 
 
 composeProject :: Text
 composeProject = "schema-diff-baseline"
-
-
-workspaceName :: String
-workspaceName = "schema-diff-baseline"
 
 
 port :: Int
@@ -44,21 +41,22 @@ data Paths = Paths
 -- returns its connection string.
 ensureBaseline :: Text -> IO Text
 ensureBaseline rev = do
-    for_ ["docker", "jj"] \tool -> do
+    for_ ["docker", "git"] \tool -> do
         found <- findExecutable tool
         when (isNothing found) $ failWith [i|#{tool} is not on PATH; the baseline database needs it|]
     cache <- getXdgDirectory XdgCache "schema-diff"
     let p = Paths{checkout = cache </> "checkout", stateFile = cache </> "baseline-commit"}
-    commit <- resolve rev
+    repo <- findRepo "."
+    commit <- resolveCommit repo rev
     recorded <- doesFileExist p.stateFile >>= bool (pure Nothing) (Just . T.strip <$> readFileUtf8 p.stateFile)
-    hasCheckout <- doesDirectoryExist (p.checkout </> ".jj")
+    hasCheckout <- doesPathExist (p.checkout </> ".git")
     running <- if hasCheckout then isRunning p else pure False
     if recorded == Just commit && running
         then pure connInfo
         else do
             note [i|bringing the baseline database to #{T.take 12 commit} (#{rev})|]
             whenM (doesFileExist p.stateFile) $ removeFile p.stateFile
-            checkoutAt p commit
+            checkoutAt repo p commit
             start p
             stale <- staleDeploy p
             when stale do
@@ -77,36 +75,24 @@ note :: Text -> IO ()
 note message = TIO.hPutStrLn stderr ("schema-diff: " <> message)
 
 
-resolve :: Text -> IO Text
-resolve rev = do
-    (code, out, err) <- readProcess (quiet (proc "jj" ["--ignore-working-copy", "log", "--no-graph", "--limit", "2", "-r", T.unpack rev, "-T", "commit_id ++ \"\\n\""]))
-    case (code, T.lines (decode out)) of
-        (ExitSuccess, [commit]) -> pure commit
-        (ExitSuccess, []) -> failWith [i|#{rev} names no commit|]
-        (ExitSuccess, _) -> failWith [i|#{rev} names more than one commit|]
-        (ExitFailure _, _) -> failWith [i|jj log -r #{rev}: #{decode err}|]
-
-
--- | Creates the jj workspace at @commit@, or moves it there.
-checkoutAt :: Paths -> Text -> IO ()
-checkoutAt p commit =
-    doesDirectoryExist (p.checkout </> ".jj") >>= \case
+-- | Creates the git worktree at @commit@, or moves it there. A checkout that is not a
+-- git worktree is stopped and replaced; the database volume stays.
+checkoutAt :: Repo -> Paths -> Text -> IO ()
+checkoutAt repo p commit =
+    doesPathExist (p.checkout </> ".git") >>= \case
         True -> do
-            void $ readProcess (quiet (setWorkingDir p.checkout (proc "jj" ["workspace", "update-stale"])))
-            (_, out, _) <- readProcess (quiet (setWorkingDir p.checkout (proc "jj" ["log", "--no-graph", "-r", "@-", "-T", "commit_id"])))
-            unless (decode out == commit) $ jj (Just p.checkout) ["new", T.unpack commit]
+            let args = ["-C", p.checkout, "checkout", "--quiet", "--force", "--detach", T.unpack commit]
+            code <- runProcess (toStderr (proc "git" args))
+            unless (code == ExitSuccess) $ failWith [i|git #{unwords args} failed|]
         False -> do
+            let checkout = p.checkout
+            whenM (doesDirectoryExist checkout) do
+                note [i|replacing #{checkout} with a git worktree|]
+                whenM (doesFileExist (p.checkout </> "docker-compose.yaml")) $ compose p ["down"]
+                removeDirectoryRecursive p.checkout
             createDirectoryIfMissing True (takeDirectory p.checkout)
-            void $ readProcess (quiet (proc "jj" ["workspace", "forget", workspaceName]))
-            jj Nothing ["workspace", "add", "--name", workspaceName, "-r", T.unpack commit, p.checkout]
-
-
-jj :: Maybe FilePath -> [String] -> IO ()
-jj dir args = do
-    code <- runProcess (toStderr (maybe id setWorkingDir dir (proc "jj" args)))
-    case code of
-        ExitSuccess -> pure ()
-        ExitFailure n -> failWith [i|jj #{unwords args} failed with exit code #{n}|]
+            git repo ["worktree", "prune"]
+            git repo ["worktree", "add", "--quiet", "--detach", p.checkout, T.unpack commit]
 
 
 -- | Starts the server and waits until it accepts connections over TCP, which it does
