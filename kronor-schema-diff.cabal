@@ -32,6 +32,7 @@ library
     Kronor.SchemaDiff.Object
     Kronor.SchemaDiff.Plan
     Kronor.SchemaDiff.Recipe
+    Kronor.SchemaDiff.Rewrite
     Kronor.SchemaDiff.Script
     Kronor.SchemaDiff.Sqitch
     Kronor.SchemaDiff.TableEdit

@@ -18,6 +18,8 @@ module Kronor.SchemaDiff.Sqitch (
     units,
     writeUnits,
     renderScript,
+    tidyConstraint,
+    tidyIndex,
 ) where
 
 import Data.Char (isAsciiLower, isDigit)

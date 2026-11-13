@@ -20,13 +20,14 @@ import Kronor.SchemaDiff.Git (Repo, findRepo, showFile)
 import Kronor.SchemaDiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
 import Kronor.SchemaDiff.Plan (context, invert, plan, planWith, renderStep, topoOrder)
 import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), parseColumn, recipe, referencedTable, revokeGranted)
+import Kronor.SchemaDiff.Rewrite (Rewrite (..), fileDrift, rewriteFile)
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
 import Kronor.SchemaDiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), moveToEnd, parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
-import Kronor.SchemaDiff.TableEdit (Baseline (..), Drops (..), TableEdit (..), aside, compareTable, firstFailure, foreignKeyError, typeChangeFacts, withEditedTable)
+import Kronor.SchemaDiff.TableEdit (Baseline (..), Drops (..), TableEdit (..), aside, columnOrder, compareTable, firstFailure, foreignKeyError, typeChangeFacts, withEditedTable)
 import Kronor.SchemaDiff.Timing (measure, timed)
 import Options.Applicative qualified as O
 import RIO
-import RIO.Directory (makeAbsolute)
+import RIO.Directory (doesFileExist, makeAbsolute)
 import RIO.FilePath (makeRelative, (<.>), (</>))
 import RIO.HashSet qualified as HS
 import RIO.List qualified as L
@@ -423,7 +424,13 @@ data TableOptions = TableOptions
     , tableTag :: Maybe Text
     , renames :: [(Text, Text)]
     , sameTypeSwap :: SameTypeSwap
+    , fileMode :: FileMode
     }
+
+
+-- | Whether @table@ migrates the table to the file, or rewrites the file from the table.
+data FileMode = MigrateToFile | RewriteFromDatabase
+    deriving stock (Eq)
 
 
 -- | Whether @table@ prints the migration or writes it with sqitch.
@@ -564,15 +571,73 @@ tableCommand file db opts = do
     (root, absFile, changeName, table) <- locateTable file opts
     statements <- parseFile file "" =<< readFileUtf8 absFile
     let describeWithWords = describeDatabase dependentsScope db >>= \c@(Connected _ _ schema _ _) -> (c,) <$> routineWords schema
-    early <- if opts.compareWith == LiveDatabase || not (null opts.renames) then Just <$> async describeWithWords else pure Nothing
+        migrating = opts.fileMode == MigrateToFile
+    early <- if migrating && (opts.compareWith == LiveDatabase || not (null opts.renames)) then Just <$> async describeWithWords else pure Nothing
     repo <- findRepo root
     original <- timed "table.baseFile" $ showFile repo opts.base absFile
-    described <- case early of
-        Just a -> pure (wait a)
-        Nothing
-            | Right statements == (withoutTransactionControl <=< splitStatements) original -> pure describeWithWords
-            | otherwise -> wait <$> async describeWithWords
-    runRIO TableEnv{opts, db, file, root, repo, sqitchChange = changeName, table, statements, original} (compareAndReport described)
+    let env = TableEnv{opts, db, file, root, repo, sqitchChange = changeName, table, statements, original}
+    if migrating
+        then do
+            described <- case early of
+                Just a -> pure (wait a)
+                Nothing
+                    | Right statements == (withoutTransactionControl <=< splitStatements) original -> pure describeWithWords
+                    | otherwise -> wait <$> async describeWithWords
+            runRIO env (compareAndReport described)
+        else runRIO env rewriteFromDatabase
+
+
+-- | Prints the file rewritten to create the table as the database has it, or writes it
+-- and reworks the change.
+rewriteFromDatabase :: RIO TableEnv ()
+rewriteFromDatabase = do
+    env <- ask
+    let opts = env.opts
+        table = env.table
+        deployDir = env.root </> opts.top </> "deploy"
+    unless (null opts.renames) $ failWith "--rename works with the file comparison, not --rewrite-file"
+    current <- readFileUtf8 env.file
+    conn <- liftIO (connect =<< resolveDb env.db)
+    order <- liftIO (columnOrder conn table)
+    when (null order) $ failWith [i|#{qualified table} is not in the database; there is nothing to rewrite the file from|]
+    edit <- timed "rewrite.compare" $ liftIO (compareTable conn (LiveTable ReportDrops) table env.statements)
+    ownFiles <-
+        fmap Set.fromList . filterM (\n -> doesFileExist (deployDir </> T.unpack table.schema </> "table" </> T.unpack table.name </> "index" </> T.unpack n <.> "sql"))
+            $ [n | k <- Map.keys edit.current, Index q <- [fromAddress k.address], let n = q.name]
+    let path = env.file
+    rewrite <- either (\e -> failWith [i|#{path}: #{e}|]) pure (rewriteFile table ownFiles order edit.current edit.desired current)
+    remaining <-
+        if rewrite.text == current
+            then pure (fileDrift ownFiles edit.desired edit.current)
+            else do
+                rewritten <- parseFile env.file " as rewritten" rewrite.text
+                check <- timed "rewrite.check" $ liftIO (compareTable conn (LiveTable ReportDrops) table rewritten)
+                pure (fileDrift ownFiles check.desired check.current)
+    let still = [render k.address <> (if k.aspect == Comment then " (comment)" else "") | k <- Map.keys remaining]
+    for_ still \s -> liftIO (TIO.hPutStrLn stderr [i|-- still differs: #{s}|])
+    case opts.output of
+        PrintMigration -> do
+            case (rewrite.text == current, null still) of
+                (True, True) -> say "-- the file matches the table"
+                (True, False) -> say "-- the file is unchanged; the differences above are left to you"
+                (False, _) -> liftIO (TIO.putStr rewrite.text)
+            unless (null still) $ exitWith (ExitFailure 1)
+        WriteMigration
+            | not (null still) -> let n = length still in failWith [i|the rewritten file still differs from the table in #{n} places; nothing written|]
+            | rewrite.text == current -> say "nothing to write: the file matches the table"
+            | otherwise -> do
+                sqitchPlan <- liftIO (readPlan (env.root </> opts.planPath))
+                basePlan <- liftIO (parsePlan <$> showFile env.repo opts.base (env.root </> opts.planPath))
+                now <- liftIO getCurrentTime
+                let changeName = env.sqitchChange
+                    entries p = length (filter (== changeName) p.changes)
+                    tagName = fromMaybe (defaultTag now) opts.tableTag
+                writeFileUtf8 env.file rewrite.text
+                if entries sqitchPlan > entries basePlan
+                    then say [i|rewrote #{changeName}; the branch already reworks it|]
+                    else do
+                        liftIO $ reworkEdited env.root opts.top sqitchPlan tagName changeName [i|schema-diff: #{changeName} as the database has it|] current PreviousFileRuns
+                        say [i|rewrote and reworked #{changeName}|]
 
 
 -- | The project root, the file's absolute path, its sqitch change and its table.
@@ -971,6 +1036,7 @@ commandParser =
                     <*> O.optional (O.strOption (O.long "tag" <> O.metavar "NAME" <> O.help "Tag to add when the rework needs one"))
                     <*> O.many (O.option (O.eitherReader renameArg) (O.long "rename" <> O.metavar "OLD:NEW" <> O.help "Column OLD is renamed to NEW; repeat for more columns"))
                     <*> O.flag AskIfRename DropAndAdd (O.long "drop-and-add" <> O.help "A column dropped and one added with the same type are not a rename")
+                    <*> O.flag MigrateToFile RewriteFromDatabase (O.long "rewrite-file" <> O.help "Print the file rewritten to create the table as --db has it; with --write, write it and rework the change")
                 )
     renameArg s = case T.split (== ':') (T.pack s) of
         [old, new] | not (T.null old), not (T.null new) -> Right (old, new)

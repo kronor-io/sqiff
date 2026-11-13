@@ -16,6 +16,7 @@ module Kronor.SchemaDiff.TableEdit (
     firstFailure,
     typeChangeFacts,
     aside,
+    columnOrder,
 ) where
 
 import Data.String.Interpolate (i)
@@ -72,6 +73,23 @@ typeChangeFacts conn old new = do
     isDomain =
         [singletonStatement|
             select coalesce((select typtype = 'd' from pg_type where oid = to_regtype($1::text)), false)::bool
+        |]
+
+
+-- | The table's column names in the table's order.
+columnOrder :: Connection.Connection -> QName -> IO [Text]
+columnOrder conn table =
+    Connection.use conn (Session.statement (qualified table) query)
+        >>= either (\e -> failWith [i|could not read the columns of #{qualified table}: #{errorText e}|]) (pure . toList)
+  where
+    query =
+        [vectorStatement|
+            select attname::text
+            from pg_attribute
+            where attrelid = to_regclass($1::text)
+              and attnum > 0
+              and not attisdropped
+            order by attnum
         |]
 
 
