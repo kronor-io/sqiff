@@ -48,6 +48,7 @@ import Hasql.Encoders qualified as E
 import Hasql.Errors qualified as Errors
 import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
+import Hasql.TH (maybeStatement, singletonStatement, vectorStatement)
 import Kronor.SchemaDiff.Timing (timed)
 import Pqi.Ffi qualified
 import RIO
@@ -58,6 +59,7 @@ import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import RIO.Text.Partial qualified as TP
+import RIO.Vector qualified as V
 
 
 data Aspect = Definition | Privileges | Comment
@@ -276,11 +278,11 @@ edgesBetween addresses pairs =
 -- functions print.
 qualifiedNames :: Connection.Connection -> IO a -> IO a
 qualifiedNames conn action = do
-    previous <- run conn () (Statement.unpreparable "select current_setting('search_path')" mempty (D.singleRow textColumn))
+    previous <- run conn () [singletonStatement| select current_setting('search_path') :: text |]
     void (run conn "" setPath)
     action `finally` void (Connection.use conn (Session.statement previous setPath))
   where
-    setPath = Statement.unpreparable "select set_config('search_path', $1, false)" (E.param (E.nonNullable E.text)) (D.singleRow textColumn)
+    setPath = [singletonStatement| select set_config('search_path', $1 :: text, false) :: text |]
 
 
 -- | Functions plpgsql_check could not analyse, with the reason.
@@ -306,7 +308,7 @@ bodyUses conns@(conn :| _) excluded only madeTempTables =
 tempTableStatements :: Connection.Connection -> IO Text
 tempTableStatements conn =
     timed "tempTableStatements"
-        $ run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
+        $ run conn () plpgsqlCheckSchema
         >>= \case
             Nothing -> pure ""
             Just extSchema -> do
@@ -314,7 +316,7 @@ tempTableStatements conn =
                     Connection.use conn do
                         Session.script "begin"
                         Session.script (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))
-                        Session.statement () (Statement.unpreparable "select coalesce(current_setting('schema_diff.temp_tables', true), '')" mempty (D.singleRow textColumn))
+                        Session.statement () [singletonStatement| select coalesce(current_setting('schema_diff.temp_tables', true), '') :: text |]
                 _ <- Connection.use conn (Session.script "rollback")
                 pure (either (const "") ("set client_min_messages = error;\n" <>) result)
 
@@ -346,15 +348,24 @@ plpgsqlFunctions :: Connection.Connection -> [Text] -> IO (Maybe PlFunctions)
 plpgsqlFunctions conn excluded =
     timed "plpgsqlFunctions"
         $ qualifiedNames conn
-        $ run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
+        $ run conn () plpgsqlCheckSchema
         >>= traverse \extSchema -> do
             functions <- run conn excluded (Statement.unpreparable (decodeUtf8Lenient plpgsqlFunctionsQuery) excludedParam (D.rowList functionRow))
-            implicit <- run conn () (Statement.unpreparable implicitQuery mempty (D.rowList int8Column))
+            implicit <- toList <$> run conn () implicitQuery
             let (unchecked, checkable) = partitionEithers (map triggerTable functions)
             let withSchema = TP.replace "@extschema@" extSchema . decodeUtf8Lenient
             pure (PlFunctions (withSchema plpgsqlDependQuery) (pure (withSchema plpgsqlTempTablesScript)) checkable unchecked implicit)
   where
-    implicitQuery = "select castfunc::int8 from pg_cast where castfunc >= 16384 union select oprcode::int8 from pg_operator where oprcode >= 16384"
+    implicitQuery =
+        [vectorStatement|
+            select castfunc::int8
+            from pg_cast
+            where castfunc >= 16384
+            union
+            select oprcode::int8
+            from pg_operator
+            where oprcode >= 16384
+        |]
     functionRow = (,,,,) <$> D.column (D.nonNullable D.int8) <*> textColumn <*> D.column (D.nonNullable D.bool) <*> D.column (D.nullable D.int8) <*> int8Column
     triggerTable (oid, name, isTrigger, relid, cost)
         | isTrigger && isNothing relid = Left (name, "no trigger uses it")
@@ -425,17 +436,17 @@ render addr = addr.objectType <> " " <> T.intercalate "." addr.objectNames <> ar
 -- transaction @conn@ is in; 'Nothing' when plpgsql_check is not installed.
 bodyErrors :: Connection.Connection -> Text -> Text -> IO (Maybe Text) -> [Text] -> [Text] -> IO (Maybe (Set (Text, Int32, Text)))
 bodyErrors conn aside table made signatures sqlSignatures =
-    run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
+    run conn () plpgsqlCheckSchema
         >>= traverse \extSchema -> do
             tempTables <- made >>= maybe (pure (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))) pure
             _ <- timed "bodyErrors.tempTables" $ guarded (Connection.use conn (Session.script tempTables))
             plErrors <- for (chunks signatures) (timed "bodyErrors.batch" . inBatches extSchema)
             sqlErrors <- for sqlSignatures \signature ->
                 either (\e -> [(signature, 0, errorText e)]) (const [])
-                    <$> timed ("bodyErrors.sql " <> signature) (guarded (Connection.use conn (Session.statement signature (Statement.unpreparable validate (E.param (E.nonNullable E.text)) (D.singleRow (D.column (D.nullable D.text)))))))
+                    <$> timed ("bodyErrors.sql " <> signature) (guarded (Connection.use conn (Session.statement signature validate)))
             pure (Set.fromList (concat (plErrors <> sqlErrors)))
   where
-    validate = "select pg_catalog.fmgr_sql_validator(to_regprocedure($1))::text"
+    validate = [singletonStatement| select pg_catalog.fmgr_sql_validator(to_regprocedure($1 :: text)) :: text? |]
     guarded action = do
         _ <- Connection.use conn (Session.script "savepoint schema_diff_check")
         result <- action
@@ -497,15 +508,37 @@ relationColumns :: Connection.Connection -> [(Text, Text)] -> IO (Map (Text, Tex
 relationColumns conn relations =
     Map.fromListWith (<>)
         . map (\(s, r, c) -> ((s, r), Set.singleton c))
-        <$> run conn relations (Statement.unpreparable query params (D.rowList ((,,) <$> textColumn <*> textColumn <*> textColumn)))
+        . toList
+        <$> run conn (V.fromList (map fst relations), V.fromList (map snd relations)) query
   where
+    query :: Statement.Statement (Vector Text, Vector Text) (Vector (Text, Text, Text))
     query =
-        "select n.nspname::text, c.relname::text, a.attname::text \
-        \from unnest($1::text[], $2::text[]) u(s, r) \
-        \join pg_namespace n on n.nspname = u.s \
-        \join pg_class c on c.relnamespace = n.oid and c.relname = u.r \
-        \join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped"
-    params = contramap (map fst) excludedParam <> contramap (map snd) excludedParam
+        [vectorStatement|
+            select
+                n.nspname::text
+              , c.relname::text
+              , a.attname::text
+            from unnest($1::text[], $2::text[]) u (s, r)
+            join pg_namespace n
+              on n.nspname = u.s
+            join pg_class c
+              on c.relnamespace = n.oid
+             and c.relname = u.r
+            join pg_attribute a
+              on a.attrelid = c.oid
+             and a.attnum > 0
+             and not a.attisdropped
+        |]
+
+
+-- | The schema plpgsql_check is installed in, if it is.
+plpgsqlCheckSchema :: Statement.Statement () (Maybe Text)
+plpgsqlCheckSchema =
+    [maybeStatement|
+        select extnamespace::regnamespace::text
+        from pg_extension
+        where extname = 'plpgsql_check'
+    |]
 
 
 run :: Connection.Connection -> params -> Statement.Statement params a -> IO a

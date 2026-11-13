@@ -44,12 +44,14 @@ library
     , file-embed
     , filepath
     , hasql
+    , hasql-th
     , pqi-ffi
     , rio
     , string-interpolate
     , text
     , time
     , typed-process
+    , vector
 
 executable schema-diff
   import:         shared

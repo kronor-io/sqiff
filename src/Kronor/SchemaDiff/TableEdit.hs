@@ -21,10 +21,8 @@ module Kronor.SchemaDiff.TableEdit (
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import Hasql.Connection qualified as Connection
-import Hasql.Decoders qualified as D
-import Hasql.Encoders qualified as E
 import Hasql.Session qualified as Session
-import Hasql.Statement qualified as Statement
+import Hasql.TH (singletonStatement, vectorStatement)
 import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Partitions (..), Schema, describeOn, errorText, failWith)
 import Kronor.SchemaDiff.Diff (Change (..), diff)
 import Kronor.SchemaDiff.Object
@@ -56,14 +54,25 @@ typeChangeFacts conn old new = do
     before <- fileNode
     altered <- Connection.use conn (Session.script [i|alter table pg_temp.schema_diff_retype alter column c type #{new} using c::#{new}|])
     after <- fileNode
-    domain <- Connection.use conn (Session.statement () (Statement.unpreparable [i|select coalesce((select typtype = 'd' from pg_type where oid = to_regtype(#{literalText new})), false)|] E.noParams (D.singleRow (D.column (D.nonNullable D.bool)))))
+    domain <- Connection.use conn (Session.statement new isDomain)
     _ <- Connection.use conn (Session.script "rollback")
     pure case (before, altered, after, domain) of
         (Right b, Right (), Right a, Right d) -> Just (a /= b, d)
         _ -> Nothing
   where
-    fileNode = Connection.use conn (Session.statement () (Statement.unpreparable "select relfilenode::int8 from pg_class where oid = 'pg_temp.schema_diff_retype'::regclass" E.noParams (D.singleRow (D.column (D.nonNullable D.int8)))))
-    literalText t = [i|'#{T.replace "'" "''" t}'|] :: Text
+    fileNode =
+        Connection.use conn
+            $ Session.statement
+                ()
+                [singletonStatement|
+                    select relfilenode::int8
+                    from pg_class
+                    where oid = to_regclass('pg_temp.schema_diff_retype')
+                |]
+    isDomain =
+        [singletonStatement|
+            select coalesce((select typtype = 'd' from pg_type where oid = to_regtype($1::text)), false)::bool
+        |]
 
 
 -- | The first of @statements@ that fails, with its error. Runs inside the caller's
@@ -138,8 +147,8 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             unless exists $ failWith [i|#{qualified table} does not exist yet; a new table only needs its own change|]
             beforeResult <- timed "tableEdit.before" beforeEdit
             owned <-
-                Connection.use conn (Session.statement () ownedSequences)
-                    >>= either setupFailed pure
+                Connection.use conn (Session.statement (qualified table) ownedSequences)
+                    >>= either setupFailed (pure . toList)
             for_ (filter (\s -> any ((s `T.isInfixOf`) . withoutLineComments) (statements <> baseStatements)) owned) \s ->
                 script [i|alter sequence #{tableSchemaRef}#{quoteIdent s} owned by none|]
             script [i|create schema #{aside}|]
@@ -194,21 +203,24 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             else pure Map.empty
 
     currentXact =
-        Connection.use conn (Session.statement () (Statement.unpreparable "select pg_current_xact_id()::text" E.noParams (D.singleRow (D.column (D.nonNullable D.text)))))
+        Connection.use conn (Session.statement () [singletonStatement| select pg_current_xact_id() :: text |])
             >>= either setupFailed pure
 
     describeTable q = timed "tableEdit.describeTable" $ fst <$> describeOn [conn] [] SkipPartitions (Just (qualified q))
 
     ownedSequences =
-        Statement.unpreparable
-            [i|
-                select s.relname::text from pg_class s
-                join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = s.oid and d.deptype = 'a'
-                join pg_class t on t.oid = d.refobjid
-                where s.relkind = 'S' and t.oid = to_regclass(#{literal (qualified table)})
-            |]
-            E.noParams
-            (D.rowList (D.column (D.nonNullable D.text)))
+        [vectorStatement|
+            select s.relname::text
+            from pg_class s
+            join pg_depend d
+              on d.classid = 'pg_class'::regclass
+             and d.objid = s.oid
+             and d.deptype = 'a'
+            join pg_class t
+              on t.oid = d.refobjid
+            where s.relkind = 'S'
+              and t.oid = to_regclass($1::text)
+        |]
 
     withoutLineComments = T.unlines . map (fst . T.breakOn "--") . T.lines
 
