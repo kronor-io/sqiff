@@ -115,8 +115,23 @@ units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (
     claimReverts _ [] = []
     claimReverts claimed (u : rest) =
         let keys = nubOrd [s.key | s <- u.deploy, s.key `Set.notMember` claimed]
-            inverse = concat [recipe inverseCtx k (invert c) | k <- reverse keys, Just c <- [lookup k [(s.key, s.change) | s <- u.deploy]]]
+            inverse = map refill (concat [recipe inverseCtx k (invert c) | k <- reverse keys, Just c <- [lookup k [(s.key, s.change) | s <- u.deploy]]])
          in u{revert = if u.kind == ReworkChange then [] else inverse} : claimReverts (claimed <> Set.fromList keys) rest
+
+    -- A dropped not null column without a default can only come back nullable: its values are gone.
+    refill s
+        | Column t c <- s.object
+        , Added def <- s.change
+        , let p = parseColumn def
+        , p.notNull && isNothing p.defaultExpr && isNothing p.identity && isNothing p.generated =
+            let table = qualified t
+                column = quoteIdent c
+                definition = columnSql p{notNull = False}
+             in s
+                    { sql = [S.i|alter table #{table} add column #{column} #{definition}|]
+                    , hazards = [MayFail "the column comes back nullable and empty, since its values were dropped"]
+                    }
+        | otherwise = s
 
     nameMigrations _ [] = []
     nameMigrations i (u : rest)
@@ -141,6 +156,7 @@ units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (
     verb s
         | s.key.aspect == Privileges = "grant"
         | s.key.aspect == Comment = "comment"
+        | " rename column " `T.isInfixOf` s.sql = "rename"
         | s.phase == DropPhase = "drop"
         | isAdded s.change = "add"
         | otherwise = "alter"
@@ -261,23 +277,27 @@ renderScript header migration steps =
                 <> map (\s -> if safeToIndent s.sql then indent (statement s.sql s) else statement s.sql s) group'
                 <> ["COMMIT;"]
     statement sql s =
-        T.intercalate "\n" (map ("-- " <>) (hazardNotes s) <> [tidy sql <> if "--" `T.isPrefixOf` sql then "" else ";"])
+        T.intercalate "\n" (map ("-- " <>) (hazardNotes s) <> [tidy s sql <> if "--" `T.isPrefixOf` sql then "" else ";"])
     indent = T.intercalate "\n" . map (\l -> if T.null l then l else "  " <> l) . T.lines
     -- Indenting inside a string or a dollar-quoted body would change its text.
     safeToIndent sql = not ("$" `T.isInfixOf` sql) && all (even . T.count "'") (T.lines sql)
-    tidy sql = case T.lines sql of
+    tidy s sql = case T.lines sql of
         [l]
             | Just rest <- T.stripPrefix "alter table " l
             , (name, more) <- T.breakOn " " rest
             , not ("\"" `T.isInfixOf` name)
             , not (T.null more) ->
                 "alter table " <> name <> "\n    " <> tidyConstraint (T.stripStart more)
-        ls -> T.intercalate "\n" (map tidyIndex ls)
+        ls
+            | indexLike s.object -> T.intercalate "\n" (map tidyIndex ls)
+            | otherwise -> sql
+    indexLike = \case Index _ -> True; TableConstraint _ _ -> True; _ -> False
     idempotent sql =
         T.replace "CREATE UNIQUE INDEX CONCURRENTLY " "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "
             . T.replace "CREATE INDEX CONCURRENTLY " "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
             . T.replace "create unique index concurrently " "create unique index concurrently if not exists "
             . T.replace "drop index concurrently " "drop index concurrently if exists "
+            . T.replace "drop index concurrently if exists " "drop index concurrently "
             $ sql
     hazardNotes s = map hazardText s.hazards
 
@@ -372,6 +392,8 @@ verifyScript header steps =
             , (parseColumn old).colType /= ty ->
                 [ [S.i|assert (select atttypid from pg_attribute where attrelid = #{reg t} and attname = #{sqlLiteral c}) = #{sqlLiteral ty}::regtype, #{sqlLiteral (c <> " is not " <> ty)};|]
                 ]
+        -- A new key's index is built in a change before the one that attaches it.
+        TableConstraint t c | "create unique index " `T.isInfixOf` T.toLower s.sql -> [relation s (QName t.schema c)]
         TableConstraint t c -> [presence s [S.i|select from pg_constraint where conrelid = #{reg t} and conname = #{sqlLiteral c}|] [S.i|constraint #{c} on #{qualified t}|]]
         Policy t n -> [presence s [S.i|select from pg_policy where polrelid = #{reg t} and polname = #{sqlLiteral n}|] [S.i|policy #{n} on #{qualified t}|]]
         Trigger t n -> [presence s [S.i|select from pg_trigger where tgrelid = #{reg t} and tgname = #{sqlLiteral n} and not tgisinternal|] [S.i|trigger #{n} on #{qualified t}|]]
@@ -449,12 +471,18 @@ writeUnits root topDir sqitchPlan tag us = do
                     . T.replace "__your_type_here__ null" options
                     . T.replace "\nalter table " [S.i|\n#{hazards}alter table |]
                     $ rendered
-            (Just (_, vars), AddIndexShape t ix) -> do
-                deploy
-                let templated = indexPrefix t <> fromMaybe ix (lookup "index_name" vars)
-                for_ ["revert", "verify"] \dir -> do
-                    rendered <- readFileUtf8 (scriptPath dir u)
-                    writeFileUtf8 (scriptPath dir u) (T.replace templated ix rendered)
+            (Just (_, vars), AddIndexShape t ix)
+                -- A partitioned index has no row in pg_stat_user_indexes and can't be
+                -- dropped concurrently, so the template's revert and verify don't fit it.
+                | any (\s -> EveryPartition `elem` s.hazards) u.deploy -> do
+                    deploy >> revert
+                    writeFileUtf8 (scriptPath "verify" u) (verifyScript [S.i|-- Verify #{project}:#{name} on pg|] u.deploy)
+                | otherwise -> do
+                    deploy
+                    let templated = indexPrefix t <> fromMaybe ix (lookup "index_name" vars)
+                    for_ ["revert", "verify"] \dir -> do
+                        rendered <- readFileUtf8 (scriptPath dir u)
+                        writeFileUtf8 (scriptPath dir u) (T.replace templated ix rendered)
             (Just _, OtherShape) -> deploy >> revert >> verify
             (Nothing, _) -> do
                 deploy

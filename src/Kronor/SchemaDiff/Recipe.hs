@@ -14,6 +14,7 @@ module Kronor.SchemaDiff.Recipe (
     Step (..),
     Context (..),
     ColumnDef (..),
+    columnSql,
     parseColumn,
     recipe,
 ) where

@@ -373,8 +373,10 @@ readBoth scope from toDb forPlan = do
     -- @--to@ is described while @--from@'s connection string is found, which can mean
     -- checking or building the baseline database; that comes first if both fail.
     toDescribed <- async (timed "describe --to" $ describeDatabase scope toDb)
+    -- The body check rolls back failed definitions, so it gets a connection of its own.
+    checkConn <- async (connect =<< resolveDb toDb)
     fromDb <- timed "connInfoOf" $ connInfoOf from
-    (fromDatabase@(Connected _ _ fromSchema _ _), toDatabase@(Connected toConn _ toSchema _ _)) <-
+    (fromDatabase@(Connected _ _ fromSchema _ _), toDatabase@(Connected _ _ toSchema _ _)) <-
         timed "readBoth.describe" $ concurrently (timed "describe --from" $ describeDatabase scope fromDb) (wait toDescribed)
     let plainChanges = diff (\_ a b -> a == b) fromSchema toSchema
         needed = neededFor forPlan plainChanges
@@ -386,7 +388,7 @@ readBoth scope from toDb forPlan = do
                     (edgesOf "--from" scope needed fromDatabase)
                     (if forPlan then edgesOf "--to" scope needed toDatabase else pure ([], []))
                 )
-                (bodyChecks scope toConn toSchema plainChanges)
+                (wait checkConn >>= \conn -> bodyChecks scope conn toSchema plainChanges)
     for_ (fromNotes <> toNotes) (TIO.hPutStrLn stderr)
     pure ((fromSchema, fromEdges), (toSchema, toEdges), checks)
 
@@ -538,7 +540,8 @@ main =
                                 script <- readFileUtf8 (root </> opts.top </> "deploy" </> T.unpack n <.> "sql")
                                 (n,) . replayable <$> either (\e -> failWith [i|#{n}: #{e}|]) pure ((withoutTransactionControl <=< splitStatements) script)
                 let branchStatements = concatMap snd branchChanges
-                    pendingRenames = [r | r <- opts.renames, renameSql r `notElem` branchStatements]
+                    normalised = T.toLower . T.unwords . T.words . T.dropWhileEnd (== ';') . T.strip . withoutLeadingComments
+                    pendingRenames = [r | r <- opts.renames, normalised (renameSql r) `notElem` map normalised branchStatements]
                 for_ branchChanges \(n, _) -> TIO.putStrLn [i|-- already on this branch: #{n}|]
                 baseline <-
                     if opts.againstDatabase
@@ -629,8 +632,9 @@ main =
                     withViews c = c{viewsAround = Map.map snd around}
                     aroundOf addr = fold [members | (t, c, a, _) <- retyped, a == addr, Just (members, _) <- [Map.lookup (t, c) around]]
                     foreignKeysFor addr = Map.findWithDefault [] addr foreignKeyBreaks
+                    renameHazard = MayFail "breaks running code and Hasura metadata that still use the old name; kronor renames over two deploys with create-migration rename-column-step-1 and rename-column-step-2"
                     renameSteps =
-                        [ Step DropPhase (-1) addr (Column table new) (renameSql (old, new)) Shared [] (ObjectKey Definition addr) (Changed def def)
+                        [ Step DropPhase (-1) addr (Column table new) (renameSql (old, new)) Shared [renameHazard] (ObjectKey Definition addr) (Changed def def)
                         | (old, new) <- pendingRenames
                         , let addr = columnAddress new
                               def = Map.findWithDefault "" (ObjectKey Definition addr) edit.desired
@@ -744,9 +748,11 @@ main =
                         for_ oldFileFails \err ->
                             TIO.putStrLn [i|the file at #{baseRev} fails on the edited table (#{err}); the rework's revert does nothing and the migrations revert the table|]
                         timed "write.writeUnits" $ writeUnits root opts.top sqitchPlan tagName written
-                        unless alreadyReworked
-                            $ timed "write.reworkEdited"
-                            $ reworkEdited root opts.top sqitchPlan tagName changeName [i|schema-diff: #{changeName} as edited|] original (isJust oldFileFails)
+                        unless alreadyReworked do
+                            -- writeUnits may have added the tag already.
+                            afterUnits <- readPlan (root </> opts.planPath)
+                            timed "write.reworkEdited"
+                                $ reworkEdited root opts.top afterUnits tagName changeName [i|schema-diff: #{changeName} as edited|] original (isJust oldFileFails)
                         -- The table's rework comes after its migrations in the plan.
                         when alreadyReworked $ moveToEnd (root </> opts.planPath) changeName
                         for_ written \u -> TIO.putStrLn ("added " <> u.changeName)
@@ -764,7 +770,7 @@ forTable t n =
     let (schema, name) = (t.schema, t.name)
         key = [i|#{schema}.#{name}|]
         indexes = [i|#{schema}/table/#{name}/index/|]
-     in indexes `T.isPrefixOf` n || any (`T.isInfixOf` (n <> "-")) [key <> ".", key <> "-"]
+     in indexes `T.isPrefixOf` n || any (`T.isInfixOf` (n <> "-")) [before <> key <> after | before <- ["-", "/"], after <- [".", "-"]]
 
 
 -- | A migration's statements as they can run inside the comparison's transaction:
@@ -772,8 +778,12 @@ forTable t n =
 replayable :: [Text] -> [Text]
 replayable = map (TP.replace "concurrently " "" . TP.replace "CONCURRENTLY " "") . filter (not . setting)
   where
-    setting s = any (`T.isPrefixOf` T.toLower (code s)) ["set ", "reset ", "select set_config("]
-    code = T.stripStart . T.unlines . dropWhile (\l -> T.null (T.strip l) || "--" `T.isPrefixOf` T.stripStart l) . T.lines
+    setting s = any (`T.isPrefixOf` T.toLower (withoutLeadingComments s)) ["set ", "reset ", "select set_config("]
+
+
+-- | A statement from its first line of code.
+withoutLeadingComments :: Text -> Text
+withoutLeadingComments = T.stripStart . T.unlines . dropWhile (\l -> T.null (T.strip l) || "--" `T.isPrefixOf` T.stripStart l) . T.lines
 
 
 -- | A file as it is at a jj revision.
