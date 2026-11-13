@@ -5,7 +5,7 @@
 
 -- | Writes a schema as one file per object, for example
 -- @table-column/public/payment/amount.sql@.
-module Kronor.SchemaDiff.Folder (writeFolder) where
+module Kronor.SchemaDiff.Folder (Existing (..), writeFolder) where
 
 import Crypto.Hash qualified as Hash
 import Data.String.Interpolate (i)
@@ -17,14 +17,19 @@ import RIO.FilePath (joinPath, takeDirectory, (<.>), (</>))
 import RIO.Map qualified as Map
 
 
--- | Writes into an empty or new folder. With @replace@, first clears a folder this
+-- | What to do with a folder that is not empty.
+data Existing = KeepExisting | ReplaceOwn
+    deriving stock (Eq, Show)
+
+
+-- | Writes into an empty or new folder. With 'ReplaceOwn', first clears a folder this
 -- function wrote before, which it recognises by its marker file.
-writeFolder :: Bool -> FilePath -> Schema -> IO ()
-writeFolder replace root schema = do
+writeFolder :: Existing -> FilePath -> Schema -> IO ()
+writeFolder existing root schema = do
     exists <- doesDirectoryExist root
     entries <- if exists then listDirectory root else pure []
     unless (null entries) do
-        unless replace $ failWith (T.pack root <> " is not empty; pass --replace to rewrite it, or choose another folder")
+        when (existing == KeepExisting) $ failWith (T.pack root <> " is not empty; pass --replace to rewrite it, or choose another folder")
         written <- doesFileExist (root </> marker)
         unless written $ failWith (T.pack root <> " was not written by schema-diff, so --replace leaves it alone")
         removeDirectoryRecursive root

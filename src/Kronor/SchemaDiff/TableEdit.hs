@@ -9,6 +9,7 @@
 module Kronor.SchemaDiff.TableEdit (
     TableEdit (..),
     Baseline (..),
+    Drops (..),
     compareTable,
     compareTableWith,
     withEditedTable,
@@ -25,7 +26,7 @@ import Hasql.Decoders qualified as D
 import Hasql.Encoders qualified as E
 import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, describeOn, errorText, failWith)
+import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Partitions (..), Schema, describeOn, errorText, failWith)
 import Kronor.SchemaDiff.Diff (Change (..), diff)
 import Kronor.SchemaDiff.Object
 import Kronor.SchemaDiff.Timing (timed)
@@ -97,9 +98,18 @@ data Baseline
     = -- | The statements of the file before the edit. Drift between the files and the
       -- database cancels out, and everything the edit removes is meant.
       BaseFile [Text]
-    | -- | The table as it is. With @allowDrops@, columns and constraints missing from the
-      -- file are dropped; otherwise they are only reported.
-      LiveTable Bool
+    | -- | The table as it is.
+      LiveTable Drops
+
+
+-- | What happens to columns and constraints the live table has and the file does not.
+data Drops = ReportDrops | AllowDrops
+    deriving stock (Eq, Show)
+
+
+-- | Whether a pass over the edit describes the table.
+data Describing = DescribeTable | SkipDescribe
+    deriving stock (Eq)
 
 
 compareTable :: Connection.Connection -> Baseline -> QName -> [Text] -> IO TableEdit
@@ -109,16 +119,16 @@ compareTable conn baseline table statements = fst <$> compareTableWith conn base
 -- | 'compareTable' that also runs @before@ in the transaction before anything changes,
 -- and @after@ once the table is what the edited file creates.
 compareTableWith :: Connection.Connection -> Baseline -> QName -> [Text] -> IO b -> (b -> IO a) -> IO (TableEdit, a)
-compareTableWith = editTable True
+compareTableWith = editTable DescribeTable
 
 
 -- | 'compareTableWith' for the result of @after@ alone: the table is neither built from
 -- the file before the edit nor described.
 withEditedTable :: Connection.Connection -> Baseline -> QName -> [Text] -> IO b -> (b -> IO a) -> IO a
-withEditedTable conn baseline table statements beforeEdit afterEdit = snd <$> editTable False conn baseline table statements beforeEdit afterEdit
+withEditedTable conn baseline table statements beforeEdit afterEdit = snd <$> editTable SkipDescribe conn baseline table statements beforeEdit afterEdit
 
 
-editTable :: Bool -> Connection.Connection -> Baseline -> QName -> [Text] -> IO b -> (b -> IO a) -> IO (TableEdit, a)
+editTable :: Describing -> Connection.Connection -> Baseline -> QName -> [Text] -> IO b -> (b -> IO a) -> IO (TableEdit, a)
 editTable describing conn baseline table statements beforeEdit afterEdit = do
     (current, desired, afterResult) <-
         ( do
@@ -137,7 +147,7 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             script ("create schema " <> aside)
             script ("alter table " <> qualified table <> " set schema " <> aside)
             current <- timed "tableEdit.current" case baseline of
-                _ | not describing -> pure Map.empty
+                _ | describing == SkipDescribe -> pure Map.empty
                 BaseFile base -> do
                     script "savepoint schema_diff_base"
                     built <- build xact "before the edit" base
@@ -176,7 +186,7 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             after <- currentXact
             when (after /= xact)
                 $ failWith [i|statement #{n} of the file #{label} ended the transaction the comparison runs in|]
-        if describing
+        if describing == DescribeTable
             then do
                 schema <- describeTable table
                 pure (Map.fromList [(k, def) | (k, def) <- Map.toList schema, belongsTo table k def])
@@ -186,7 +196,7 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
         Connection.use conn (Session.statement () (Statement.unpreparable "select pg_current_xact_id()::text" E.noParams (D.singleRow (D.column (D.nonNullable D.text)))))
             >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
 
-    describeTable q = timed "tableEdit.describeTable" $ fst <$> describeOn [conn] [] False (Just (qualified q))
+    describeTable q = timed "tableEdit.describeTable" $ fst <$> describeOn [conn] [] SkipPartitions (Just (qualified q))
 
     ownedSequences =
         Statement.unpreparable
@@ -242,5 +252,5 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             (Index _, Dropped _) -> Just "not in the file; indexes are often kept in their own files"
             (Trigger _ _, Dropped _) -> Just "not in the file; triggers are kept in their own files"
             (Policy _ _, Dropped _) -> Just "not in the file; policies may be kept in other files"
-            (_, Dropped _) | LiveTable False <- baseline -> Just "in the database but not in the file; --allow-drops drops it"
+            (_, Dropped _) | LiveTable ReportDrops <- baseline -> Just "in the database but not in the file; --allow-drops drops it"
             _ -> Nothing

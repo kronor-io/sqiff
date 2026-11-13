@@ -16,6 +16,7 @@ module Kronor.SchemaDiff.Catalog (
     failWith,
     connect,
     describe,
+    Partitions (..),
     Addresses,
     describeOn,
     dependencies,
@@ -143,16 +144,20 @@ type CatalogId = (Int64, Int64, Int32)
 type Addresses = Map CatalogId Address
 
 
+-- | Whether partitions and their objects are described.
+data Partitions = SkipPartitions | IncludePartitions
+    deriving stock (Eq, Show)
+
+
 -- | Every object outside system schemas, extension members and the excluded schemas.
--- Partitions and their columns only when asked for.
-describe :: Connection.Connection -> [Text] -> Bool -> IO Schema
-describe conn excluded includePartitions = fst <$> describeOn [conn] excluded includePartitions Nothing
+describe :: Connection.Connection -> [Text] -> Partitions -> IO Schema
+describe conn excluded partitions = fst <$> describeOn [conn] excluded partitions Nothing
 
 
 -- | 'describe' with the queries spread over the connections, limited to one table's
 -- objects when @onlyTable@ names it, and with each object's catalog ids.
-describeOn :: [Connection.Connection] -> [Text] -> Bool -> Maybe Text -> IO (Schema, Addresses)
-describeOn conns excluded includePartitions onlyTable = do
+describeOn :: [Connection.Connection] -> [Text] -> Partitions -> Maybe Text -> IO (Schema, Addresses)
+describeOn conns excluded partitions onlyTable = do
     queue <- newIORef (maybe ordered (const (map (,Nothing) describeQueries)) onlyTable)
     let next = atomicModifyIORef' queue \case
             [] -> ([], Nothing)
@@ -174,7 +179,7 @@ describeOn conns excluded includePartitions onlyTable = do
     -- results from several threads at once.
     describeOne conn ((file, body), half) = timed [i|describeQuery #{takeBaseName file} #{maybe "" show half}|] do
         rows <-
-            run conn (excluded, includePartitions, onlyTable, half)
+            run conn (excluded, partitions == IncludePartitions, onlyTable, half)
                 $ Statement.unpreparable (wrap (decodeUtf8Lenient body)) describeParams (D.rowList ((,,) <$> catalogIdRow <*> addressRow <*> textColumn))
         _ <- evaluate (foldl' (\n (_, addr, def) -> n + T.length def + sum (map T.length (addr.objectType : addr.objectNames <> addr.objectArgs))) (0 :: Int) rows)
         let objectAspect = case takeBaseName file of

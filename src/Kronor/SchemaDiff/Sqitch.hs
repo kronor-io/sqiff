@@ -6,6 +6,8 @@
 -- | Splits a plan into sqitch changes and writes them with sqitch's own commands.
 module Kronor.SchemaDiff.Sqitch (
     UnitKind (..),
+    Placement (..),
+    PreviousFile (..),
     Unit (..),
     SqitchPlan (..),
     parsePlan,
@@ -41,12 +43,22 @@ data UnitKind = AddChange | ReworkChange
     deriving stock (Eq, Show)
 
 
+-- | Where a change lives: a time-stamped migration, or kronor's path for its object.
+data Placement = Migration | Conventional
+    deriving stock (Eq, Show)
+
+
+-- | Whether the file a rework replaces can still run on the edited table, as its revert.
+data PreviousFile = PreviousFileRuns | PreviousFileFails
+    deriving stock (Eq, Show)
+
+
 -- | One sqitch change. A rework keeps the revert sqitch gives it: the previous version.
 data Unit = Unit
     { kind :: UnitKind
     , changeName :: Text
     , note :: Text
-    , migration :: Bool
+    , placement :: Placement
     , deploy :: [Step]
     , revert :: [Step]
     }
@@ -96,16 +108,16 @@ units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (
 
     single s = case if conventional s then conventionalName s else Nothing of
         Just n
-            | n `Set.member` existing -> Unit ReworkChange n (note "update" s) False [s] []
-            | isAdded s.change -> Unit AddChange n (createNote s) False [s] []
-        _ -> Unit AddChange (groupKey s) (note (verb s) s) True [s] []
+            | n `Set.member` existing -> Unit ReworkChange n (note "update" s) Conventional [s] []
+            | isAdded s.change -> Unit AddChange n (createNote s) Conventional [s] []
+        _ -> Unit AddChange (groupKey s) (note (verb s) s) Migration [s] []
 
     createNote s = case (s.object, s.change) of
         (Index ix, Added def) | Just t <- indexTableName def -> "add_index: add index " <> dotted (QName ix.schema t) <> "." <> ix.name
         _ -> note "create" s
 
     merge u (next : rest)
-        | u.migration && next.migration && u.changeName == next.changeName && all sharable (u.deploy <> next.deploy) && samePhase (u.deploy <> next.deploy) =
+        | u.placement == Migration && next.placement == Migration && u.changeName == next.changeName && all sharable (u.deploy <> next.deploy) && samePhase (u.deploy <> next.deploy) =
             u{deploy = u.deploy <> next.deploy, note = u.note} : rest
     merge u rest = u : rest
 
@@ -135,7 +147,7 @@ units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (
 
     nameMigrations _ [] = []
     nameMigrations i (u : rest)
-        | u.migration =
+        | u.placement == Migration =
             let stamp = formatTime defaultTimeLocale "%Y/%m/%Y-%m-%d-%H%M%S" (addUTCTime (fromIntegral i) now)
                 description = describe u
                 template = maybe "migration" fst (templateOf u)
@@ -213,12 +225,12 @@ data Shape
 shapeOf :: Unit -> Shape
 shapeOf u = case u.deploy of
     [s]
-        | not u.migration
+        | u.placement == Conventional
         , Index ix <- s.object
         , Added def <- s.change
         , Just t <- indexTableName def ->
             AddIndexShape (QName ix.schema t) ix.name
-        | u.migration
+        | u.placement == Migration
         , Column t c <- s.object
         , Added _ <- s.change
         , plain t
@@ -226,7 +238,7 @@ shapeOf u = case u.deploy of
         , Just options <- T.stripPrefix [S.i|alter table #{qualified t} add column #{c} |] s.sql
         , not (any (`elem` [MayRewriteTable, RewritesTable, LongLock]) s.hazards) ->
             AddColumnShape t c options
-        | u.migration
+        | u.placement == Migration
         , Just t <- owningTable s.object
         , plain t
         , Just c <- T.stripPrefix [S.i|alter table #{qualified t} validate constraint |] s.sql
@@ -252,7 +264,7 @@ templateOf u = case shapeOf u of
     AddColumnShape t c _ -> Just ("add_column", [("schema", t.schema), ("table_name", t.name), ("column_name", c)])
     ValidateShape t c -> Just ("validate_constraint", [("schema", t.schema), ("table_name", t.name), ("constraint_name", c)])
     AddIndexShape t ix -> Just ("add_index", [("schema", t.schema), ("table_name", t.name), ("index_name", fromMaybe ix (T.stripPrefix (indexPrefix t) ix))])
-    OtherShape | u.migration -> Just ("migration", [])
+    OtherShape | u.placement == Migration -> Just ("migration", [])
     OtherShape -> Nothing
 
 
@@ -263,8 +275,8 @@ slug = T.take 80 . T.intercalate "-" . filter (not . T.null) . T.split (not . al
 
 
 -- | A script: shared steps in one transaction, others in their own or none.
-renderScript :: Text -> Bool -> [Step] -> Text
-renderScript header migration steps =
+renderScript :: Text -> Placement -> [Step] -> Text
+renderScript header placement steps =
     T.intercalate "\n\n" (header : map block (L.groupBy together steps)) <> "\n"
   where
     together a b = a.txn == Shared && b.txn == Shared
@@ -273,7 +285,7 @@ renderScript header migration steps =
         _ ->
             T.intercalate "\n\n"
                 $ ["BEGIN;"]
-                <> ["  -- Do not remove this line\n  select set_config('lock_timeout', '50ms', false);" | migration]
+                <> ["  -- Do not remove this line\n  select set_config('lock_timeout', '50ms', false);" | placement == Migration]
                 <> map (\s -> if safeToIndent s.sql then indent (statement s.sql s) else statement s.sql s) group'
                 <> ["COMMIT;"]
     statement sql s =
@@ -458,7 +470,7 @@ writeUnits root topDir sqitchPlan tag us = do
             name = u.changeName
             deploy = script "deploy" [S.i|-- Deploy #{project}:#{name} to pg|] u.deploy u
             revert = script "revert" [S.i|-- Revert #{project}:#{name} from pg|] u.revert u
-            verify = writeFileUtf8 (scriptPath "verify" u) (verifyScript [S.i|-- Verify #{project}:#{name} on pg|] (if u.migration then u.deploy else []))
+            verify = writeFileUtf8 (scriptPath "verify" u) (verifyScript [S.i|-- Verify #{project}:#{name} on pg|] (if u.placement == Migration then u.deploy else []))
         case u.kind of
             AddChange -> sqitch (["add", u.changeName, "-n", u.note] <> foldMap templateArgs template)
             ReworkChange -> sqitch ["rework", u.changeName, "-n", u.note]
@@ -495,15 +507,14 @@ writeUnits root topDir sqitchPlan tag us = do
     scriptPath dir u = root </> topDir </> dir </> T.unpack u.changeName <.> "sql"
     script dir header steps u
         | null steps = writeFileUtf8 (scriptPath dir u) (header <> "\n\n-- Nothing to revert.\n")
-        | otherwise = writeFileUtf8 (scriptPath dir u) (renderScript header u.migration steps)
+        | otherwise = writeFileUtf8 (scriptPath dir u) (renderScript header u.placement steps)
 
 
 -- | Reworks a change whose deploy script was already edited in place: puts back @original@
 -- for sqitch to snapshot, reworks, then restores the edit whatever happens. With
--- @emptyRevert@ the reworked change's revert does nothing, for when the previous file
--- cannot run on the edited table.
-reworkEdited :: FilePath -> FilePath -> SqitchPlan -> Text -> Text -> Text -> Text -> Bool -> IO ()
-reworkEdited root topDir sqitchPlan tag changeName note original emptyRevert = do
+-- 'PreviousFileFails' the reworked change's revert does nothing.
+reworkEdited :: FilePath -> FilePath -> SqitchPlan -> Text -> Text -> Text -> Text -> PreviousFile -> IO ()
+reworkEdited root topDir sqitchPlan tag changeName note original previousFile = do
     let path = root </> topDir </> "deploy" </> T.unpack changeName <.> "sql"
         revertPath = root </> topDir </> "revert" </> T.unpack changeName <.> "sql"
     edited <- readFileUtf8 path
@@ -515,7 +526,7 @@ reworkEdited root topDir sqitchPlan tag changeName note original emptyRevert = d
         )
         `finally` writeFileUtf8 path edited
     let project = sqitchPlan.project
-    when emptyRevert
+    when (previousFile == PreviousFileFails)
         $ writeFileUtf8
             revertPath
             [S.i|-- Revert #{project}:#{changeName} from pg

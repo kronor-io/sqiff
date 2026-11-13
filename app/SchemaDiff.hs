@@ -12,15 +12,15 @@ import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
 import Kronor.SchemaDiff.Baseline (ensureBaseline)
 import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
-import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, relationColumns, render, tempTableStatements)
+import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), Partitions (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, relationColumns, render, tempTableStatements)
 import Kronor.SchemaDiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
-import Kronor.SchemaDiff.Folder (writeFolder)
+import Kronor.SchemaDiff.Folder (Existing (..), writeFolder)
 import Kronor.SchemaDiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
 import Kronor.SchemaDiff.Plan (context, invert, plan, planWith, renderStep, topoOrder)
 import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), parseColumn, recipe, referencedTable, revokeGranted)
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
-import Kronor.SchemaDiff.Sqitch (SqitchPlan (..), Unit (..), UnitKind (..), moveToEnd, parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
-import Kronor.SchemaDiff.TableEdit (Baseline (..), TableEdit (..), aside, compareTable, firstFailure, foreignKeyError, typeChangeFacts, withEditedTable)
+import Kronor.SchemaDiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), moveToEnd, parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
+import Kronor.SchemaDiff.TableEdit (Baseline (..), Drops (..), TableEdit (..), aside, compareTable, firstFailure, foreignKeyError, typeChangeFacts, withEditedTable)
 import Kronor.SchemaDiff.Timing (measure, timed)
 import Options.Applicative qualified as O
 import RIO
@@ -39,9 +39,14 @@ import System.Process.Typed (proc, readProcess, setWorkingDir)
 
 data Scope = Scope
     { excluded :: [Text]
-    , includePartitions :: Bool
-    , checkFunctionBodies :: Bool
+    , partitions :: Partitions
+    , bodyCheck :: BodyChecks
     }
+
+
+-- | Whether SQL-standard function bodies are recreated on @--to@ to compare them.
+data BodyChecks = CheckBodies | SkipBodyChecks
+    deriving stock (Eq)
 
 
 -- | Which edges a command uses.
@@ -183,7 +188,7 @@ routineWords schema = do
 
 -- | How 'dependentsIn' describes the database.
 dependentsScope :: Scope
-dependentsScope = Scope{excluded = ["hdb_catalog"], includePartitions = False, checkFunctionBodies = False}
+dependentsScope = Scope{excluded = ["hdb_catalog"], partitions = SkipPartitions, bodyCheck = SkipBodyChecks}
 
 
 -- | For each dropped or changed definition in @changes@, the objects in the database
@@ -362,7 +367,7 @@ describeDatabase scope name = do
     db <- resolveDb name
     tempTables <- async (either (const Nothing) Just <$> tryAny (bracket (connect db) Connection.release tempTableStatements))
     (conn, extra) <- concurrently (connect db) (replicateConcurrently (describeConnections - 1) (connect db))
-    (schema, addresses) <- describeOn (conn : extra) scope.excluded scope.includePartitions Nothing
+    (schema, addresses) <- describeOn (conn : extra) scope.excluded scope.partitions Nothing
     pure (Connected conn extra schema addresses (wait tempTables))
 
 
@@ -396,7 +401,7 @@ readBoth scope from toDb forPlan = do
 -- | Body checks for the definitions that are added or changed: no other check is consulted.
 bodyChecks :: Scope -> Connection.Connection -> Schema -> Map ObjectKey Change -> IO (Map ObjectKey BodyCheck)
 bodyChecks scope conn toSchema plainChanges
-    | scope.checkFunctionBodies = timed "bodyChecks" $ checkBodies conn (Map.restrictKeys toSchema addedOrChanged)
+    | scope.bodyCheck == CheckBodies = timed "bodyChecks" $ checkBodies conn (Map.restrictKeys toSchema addedOrChanged)
     | otherwise = pure Map.empty
   where
     addedOrChanged = Map.keysSet (Map.filter (\case Dropped _ -> False; _ -> True) plainChanges)
@@ -422,7 +427,7 @@ connInfoOf = \case
 
 
 data Command
-    = Describe Text (Maybe FilePath) Bool Scope
+    = Describe Text (Maybe FilePath) Existing Scope
     | Diff Source Text Scope
     | Plan Source Text Scope
     | Sqitch Source Text Scope SqitchOptions
@@ -430,17 +435,32 @@ data Command
 
 
 data TableOptions = TableOptions
-    { write :: Bool
-    , againstDatabase :: Bool
-    , allowDrops :: Bool
+    { output :: Output
+    , compareWith :: CompareWith
+    , drops :: Drops
     , base :: Text
     , project :: FilePath
     , top :: FilePath
     , planPath :: FilePath
     , tableTag :: Maybe Text
     , renames :: [(Text, Text)]
-    , dropAndAdd :: Bool
+    , sameTypeSwap :: SameTypeSwap
     }
+
+
+-- | Whether @table@ prints the migration or writes it with sqitch.
+data Output = PrintMigration | WriteMigration
+    deriving stock (Eq)
+
+
+-- | What the edited file is compared with.
+data CompareWith = FileAtBase | LiveDatabase
+    deriving stock (Eq)
+
+
+-- | A dropped column and an added one of the same type: maybe a rename, or not one.
+data SameTypeSwap = AskIfRename | DropAndAdd
+    deriving stock (Eq)
 
 
 data SqitchOptions = SqitchOptions
@@ -460,7 +480,7 @@ main =
             Describe name out replace scope -> do
                 db <- resolveDb name
                 conns <- timed "describe.connect" $ replicateConcurrently describeConnections (connect db)
-                (schema, _) <- timed "describe.describeOn" $ describeOn conns scope.excluded scope.includePartitions Nothing
+                (schema, _) <- timed "describe.describeOn" $ describeOn conns scope.excluded scope.partitions Nothing
                 case out of
                     Just dir -> writeFolder replace dir schema
                     Nothing ->
@@ -503,7 +523,7 @@ main =
                         TIO.putStrLn [i|#{kind}\t#{changeName}\t#{count} statements\t#{note}|]
                     else writeUnits opts.projectDir opts.topDir sqitchPlan tagName written
             TableFile file db opts -> do
-                when opts.write requireSqitch
+                when (opts.output == WriteMigration) requireSqitch
                 root <- makeAbsolute opts.project
                 absFile <- makeAbsolute file
                 let deployDir = root </> opts.top </> "deploy"
@@ -517,7 +537,7 @@ main =
                 -- Other connections describe the database while the table is compared, which
                 -- happens in a transaction that is rolled back; waited for only when needed.
                 let describeWithWords = describeDatabase dependentsScope db >>= \c@(Connected _ _ schema _ _) -> (c,) <$> routineWords schema
-                early <- if opts.againstDatabase || not (null opts.renames) then Just <$> async describeWithWords else pure Nothing
+                early <- if opts.compareWith == LiveDatabase || not (null opts.renames) then Just <$> async describeWithWords else pure Nothing
                 original <- timed "table.jjShow" $ jjShow root opts.base (makeRelative root absFile)
                 -- A file unchanged since --base has nothing to describe the database for.
                 described <- case early of
@@ -525,12 +545,12 @@ main =
                     Nothing
                         | Right statements == (withoutTransactionControl <=< splitStatements) original -> pure describeWithWords
                         | otherwise -> wait <$> async describeWithWords
-                when (opts.againstDatabase && not (null opts.renames)) $ failWith "--rename works with the file comparison, not --against-database"
+                when (opts.compareWith == LiveDatabase && not (null opts.renames)) $ failWith "--rename works with the file comparison, not --against-database"
                 let renameSql (old, new) = [i|alter table #{qualified table} rename column #{quoteIdent old} to #{quoteIdent new}|]
                 -- This branch's changes for the table, run after the file at --base, so that
                 -- a second run writes only what they don't cover yet.
                 branchChanges <-
-                    if opts.againstDatabase
+                    if opts.compareWith == LiveDatabase
                         then pure []
                         else do
                             current <- readPlan (root </> opts.planPath)
@@ -544,8 +564,8 @@ main =
                     pendingRenames = [r | r <- opts.renames, normalised (renameSql r) `notElem` map normalised branchStatements]
                 for_ branchChanges \(n, _) -> TIO.putStrLn [i|-- already on this branch: #{n}|]
                 baseline <-
-                    if opts.againstDatabase
-                        then pure (LiveTable opts.allowDrops)
+                    if opts.compareWith == LiveDatabase
+                        then pure (LiveTable opts.drops)
                         else BaseFile . (<> (branchStatements <> map renameSql pendingRenames)) <$> parse (" at " <> opts.base) original
                 conn <- timed "table.connect" $ connect =<< resolveDb db
                 edit <- timed "table.compare1" $ compareTable conn baseline table statements
@@ -641,7 +661,7 @@ main =
                         ]
                     steps = renameSteps <> map withTypeFacts (planWith withViews Map.empty edit.current edit.desired [] [] edit.changes)
                     same
-                        | opts.againstDatabase = "the file matches the table"
+                        | opts.compareWith == LiveDatabase = "the file matches the table"
                         | not (null branchChanges) = "this branch's changes already cover the file"
                         | otherwise = "the file has no schema changes since " <> opts.base
                     columnsWhere p = [(c, (parseColumn (changeText ch)).colType) | (k, ch) <- Map.toList edit.changes, k.aspect == Definition, p ch, Column _ c <- [fromAddress k.address]]
@@ -649,7 +669,7 @@ main =
                     renameLike =
                         [ (old, new)
                         | null opts.renames
-                        , not opts.dropAndAdd
+                        , opts.sameTypeSwap == AskIfRename
                         , (old, oldType) <- columnsWhere (\case Dropped _ -> True; _ -> False)
                         , (new, newType) <- columnsWhere (\case Added _ -> True; _ -> False)
                         , oldType == newType
@@ -707,7 +727,7 @@ main =
                 for_ [(k, reason) | (k, reason) <- edit.ignored, not (k.aspect == Comment && k.address `Set.member` leftAlone)] \(k, reason) -> do
                     let name = render k.address <> if k.aspect == Privileges then " (privileges)" else ""
                     TIO.putStrLn [i|-- left alone: #{name}: #{reason}|]
-                if not opts.write
+                if opts.output == PrintMigration
                     then do
                         for_ usage \line -> TIO.putStrLn ("-- " <> line)
                         unless (null usage) $ TIO.putStrLn ""
@@ -752,7 +772,7 @@ main =
                             -- writeUnits may have added the tag already.
                             afterUnits <- readPlan (root </> opts.planPath)
                             timed "write.reworkEdited"
-                                $ reworkEdited root opts.top afterUnits tagName changeName [i|schema-diff: #{changeName} as edited|] original (isJust oldFileFails)
+                                $ reworkEdited root opts.top afterUnits tagName changeName [i|schema-diff: #{changeName} as edited|] original (maybe PreviousFileRuns (const PreviousFileFails) oldFileFails)
                         -- The table's rework comes after its migrations in the plan.
                         when alreadyReworked $ moveToEnd (root </> opts.planPath) changeName
                         for_ written \u -> TIO.putStrLn ("added " <> u.changeName)
@@ -814,16 +834,16 @@ commandParser =
             <$> O.strArgument (O.metavar "FILE" <> O.help "The table's deploy file, for example database/deploy/runtime/table/payment.sql")
             <*> O.strOption (O.long "db" <> O.metavar "CONNINFO|local" <> O.help "A database with the table as it is now; changes are rolled back. local is the dev stack's database")
             <*> ( TableOptions
-                    <$> O.switch (O.long "write" <> O.help "Add the migration with sqitch and rework the table's change")
-                    <*> O.switch (O.long "against-database" <> O.help "Compare with the live table instead of the file at --base; shows drift too")
-                    <*> O.switch (O.long "allow-drops" <> O.help "With --against-database, drop columns and constraints that are not in the file")
+                    <$> O.flag PrintMigration WriteMigration (O.long "write" <> O.help "Add the migration with sqitch and rework the table's change")
+                    <*> O.flag FileAtBase LiveDatabase (O.long "against-database" <> O.help "Compare with the live table instead of the file at --base; shows drift too")
+                    <*> O.flag ReportDrops AllowDrops (O.long "allow-drops" <> O.help "With --against-database, drop columns and constraints that are not in the file")
                     <*> O.strOption (O.long "base" <> O.metavar "REV" <> O.value "master" <> O.help "Revision with the file before your edit (jj)")
                     <*> O.strOption (O.long "project" <> O.metavar "DIR" <> O.value ".")
                     <*> O.strOption (O.long "top-dir" <> O.metavar "DIR" <> O.value "database")
                     <*> O.strOption (O.long "plan-file" <> O.metavar "FILE" <> O.value "database/sqitch.plan")
                     <*> O.optional (O.strOption (O.long "tag" <> O.metavar "NAME" <> O.help "Tag to add when the rework needs one"))
                     <*> O.many (O.option (O.eitherReader renameArg) (O.long "rename" <> O.metavar "OLD:NEW" <> O.help "Column OLD is renamed to NEW; repeat for more columns"))
-                    <*> O.switch (O.long "drop-and-add" <> O.help "A column dropped and one added with the same type are not a rename")
+                    <*> O.flag AskIfRename DropAndAdd (O.long "drop-and-add" <> O.help "A column dropped and one added with the same type are not a rename")
                 )
     renameArg s = case T.split (== ':') (T.pack s) of
         [old, new] | not (T.null old), not (T.null new) -> Right (old, new)
@@ -851,7 +871,7 @@ commandParser =
         Describe
             <$> O.strOption (O.long "db" <> O.metavar "CONNINFO|local" <> O.help "local is the dev stack's database")
             <*> O.optional (O.strOption (O.long "out" <> O.metavar "DIR"))
-            <*> O.switch (O.long "replace" <> O.help "Clear --out first, if schema-diff wrote it")
+            <*> O.flag KeepExisting ReplaceOwn (O.long "replace" <> O.help "Clear --out first, if schema-diff wrote it")
             <*> scopeParser
     diffParser = twoDatabases Diff
     scopeParser =
@@ -859,13 +879,12 @@ commandParser =
             <$> fmap
                 ("hdb_catalog" :)
                 (O.many (O.strOption (O.long "exclude-schema" <> O.metavar "SCHEMA" <> O.help "Leave this schema out; Hasura's hdb_catalog always is")))
-            <*> O.switch (O.long "include-partitions" <> O.help "Also compare partitions and their columns")
-            <*> fmap
-                not
-                ( O.switch
-                    ( O.long "no-body-check"
-                        <> O.help "Skip recreating SQL-standard function bodies in rolled-back transactions on --to"
-                    )
+            <*> O.flag SkipPartitions IncludePartitions (O.long "include-partitions" <> O.help "Also compare partitions and their columns")
+            <*> O.flag
+                CheckBodies
+                SkipBodyChecks
+                ( O.long "no-body-check"
+                    <> O.help "Skip recreating SQL-standard function bodies in rolled-back transactions on --to"
                 )
 
 
