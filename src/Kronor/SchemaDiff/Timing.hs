@@ -15,23 +15,23 @@ import Text.Printf (printf)
 
 -- | Runs @action@; with @SCHEMA_DIFF_TIMING@ set, prints its label, start and duration in
 -- milliseconds to stderr.
-timed :: Text -> IO a -> IO a
+timed :: MonadIO m => Text -> m a -> m a
 timed label action =
-    lookupEnv "SCHEMA_DIFF_TIMING" >>= \case
+    liftIO (lookupEnv "SCHEMA_DIFF_TIMING") >>= \case
         Nothing -> action
         Just _ -> do
-            start <- Clock.getMonotonicTimeNSec
+            start <- liftIO Clock.getMonotonicTimeNSec
             result <- action
-            end <- Clock.getMonotonicTimeNSec
+            end <- liftIO Clock.getMonotonicTimeNSec
             let ms :: Word64 -> String
                 ms n = printf "%.1f" (fromIntegral n / 1e6 :: Double)
-            hPut stderr (encodeUtf8 [i|timing\t#{label}\t#{ms start}\t#{ms (end - start)}\n|])
+            liftIO (hPut stderr (encodeUtf8 [i|timing\t#{label}\t#{ms start}\t#{ms (end - start)}\n|]))
             pure result
 
 
 -- | With @SCHEMA_DIFF_TIMING@ set, evaluates @x@ and prints how long that took.
-measure :: Text -> Int -> IO ()
+measure :: MonadIO m => Text -> Int -> m ()
 measure label x =
-    lookupEnv "SCHEMA_DIFF_TIMING" >>= \case
+    liftIO (lookupEnv "SCHEMA_DIFF_TIMING") >>= \case
         Nothing -> pure ()
         Just _ -> timed label (void (evaluate x))

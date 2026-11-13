@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE NoFieldSelectors #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 module SchemaDiff (main) where
@@ -499,253 +500,420 @@ main =
                             note = u.note
                         TIO.putStrLn [i|#{kind}\t#{changeName}\t#{count} statements\t#{note}|]
                     else writeUnits opts.projectDir opts.topDir sqitchPlan tagName written
-            TableFile file db opts -> do
-                when (opts.output == WriteMigration) requireSqitch
-                root <- makeAbsolute opts.project
-                absFile <- makeAbsolute file
-                let deployDir = root </> opts.top </> "deploy"
-                    relative = T.pack (makeRelative deployDir absFile)
-                changeName <- maybe (failWith [i|#{file} is not under #{deployDir}|]) pure (T.stripSuffix ".sql" relative)
-                table <- case T.split (== '/') changeName of
-                    [s, "table", t] | not ("@" `T.isInfixOf` t) -> pure (QName s t)
-                    _ -> failWith [i|#{file} is not a table's own deploy file (<schema>/table/<name>.sql)|]
-                let parse :: Text -> Text -> IO [Text]
-                    parse label = either (\e -> failWith [i|#{file}#{label}: #{e}|]) pure . (withoutTransactionControl <=< splitStatements)
-                    atBase = let base = opts.base in [i| at #{base}|] :: Text
-                statements <- parse "" =<< readFileUtf8 absFile
-                let describeWithWords = describeDatabase dependentsScope db >>= \c@(Connected _ _ schema _ _) -> (c,) <$> routineWords schema
-                early <- if opts.compareWith == LiveDatabase || not (null opts.renames) then Just <$> async describeWithWords else pure Nothing
-                original <- timed "table.jjShow" $ jjShow root opts.base (makeRelative root absFile)
-                described <- case early of
-                    Just a -> pure (wait a)
-                    Nothing
-                        | Right statements == (withoutTransactionControl <=< splitStatements) original -> pure describeWithWords
-                        | otherwise -> wait <$> async describeWithWords
-                when (opts.compareWith == LiveDatabase && not (null opts.renames)) $ failWith "--rename works with the file comparison, not --against-database"
-                let renameSql (old, new) = [i|alter table #{qualified table} rename column #{quoteIdent old} to #{quoteIdent new}|]
-                branchChanges <-
-                    if opts.compareWith == LiveDatabase
-                        then pure []
-                        else do
-                            current <- readPlan (root </> opts.planPath)
-                            basePlan <- parsePlan <$> jjShow root opts.base opts.planPath
-                            let before = Set.fromList basePlan.changes
-                            for (filter (\n -> n `Set.notMember` before && forTable table n) (nubOrd current.changes)) \n -> do
-                                script <- readFileUtf8 (root </> opts.top </> "deploy" </> T.unpack n <.> "sql")
-                                (n,) . replayable <$> either (\e -> failWith [i|#{n}: #{e}|]) pure ((withoutTransactionControl <=< splitStatements) script)
-                let branchStatements = concatMap snd branchChanges
-                    normalised = T.toLower . T.unwords . T.words . T.dropWhileEnd (== ';') . T.strip . withoutLeadingComments
-                    pendingRenames = [r | r <- opts.renames, normalised (renameSql r) `notElem` map normalised branchStatements]
-                for_ branchChanges \(n, _) -> TIO.putStrLn [i|-- already on this branch: #{n}|]
-                baseline <-
-                    if opts.compareWith == LiveDatabase
-                        then pure (LiveTable opts.drops)
-                        else BaseFile . (<> (branchStatements <> map renameSql pendingRenames)) <$> parse atBase original
-                conn <- timed "table.connect" $ connect =<< resolveDb db
-                edit <- timed "table.compare1" $ compareTable conn baseline table statements
-                let columnAddress c = Address "table column" [table.schema, table.name, c] []
-                    renamedFrom = Set.fromList [columnAddress old | (old, _) <- opts.renames]
-                deps <- timed "table.dependentsIn" $ dependentsIn described (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom))
-                let definitionOf a = Map.lookup (ObjectKey Definition a) deps.dbSchema
-                    routines = Set.toList (Set.filter (\a -> a.objectType `elem` ["function", "procedure"]) (fold deps.named <> fold deps.exact))
-                    plpgsql = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE plpgsql" `T.isInfixOf` def]
-                    sqlBodies = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE sql" `T.isInfixOf` def, not (standardBody def)]
-                    signature a = case a.objectNames of
-                        [s, n] -> let args = T.intercalate ", " a.objectArgs in [i|#{quoteIdent s}.#{quoteIdent n}(#{args})|]
-                        _ -> render a
-                    bySignature = Map.fromList [(signature a, a) | a <- plpgsql <> sqlBodies]
-                    check made = timed [i|table.bodyErrors n=#{Map.size bySignature}|] $ bodyErrors conn aside (qualified table) made (map signature plpgsql) (map signature sqlBodies)
-                    rowTypeCall message = "function " `T.isPrefixOf` message && any (\end -> (qualified table <> end) `T.isInfixOf` message) [")", ","]
-                checked <-
-                    if null plpgsql && null sqlBodies
-                        then pure Nothing
-                        else
-                            timed "table.compare2"
-                                $ fmap (Set.filter (\(_, _, message) -> not (rowTypeCall message)))
-                                <$> withEditedTable conn baseline table statements (check deps.dbTempTables) (\before -> (\after -> Set.difference <$> after <*> before) <$> check (pure Nothing))
-                let retyped =
-                        [ (t, c, k.address, n.colType)
-                        | (k, Changed old new) <- Map.toList edit.changes
-                        , k.aspect == Definition
-                        , let o = parseColumn old
-                              n = parseColumn new
-                        , o.colType /= n.colType || o.collation /= n.collation
-                        , Column t c <- [fromAddress k.address]
-                        ]
-                    typeIn s t c = case [ty | (QName s' t', c', _, ty) <- retyped, (s', t', c') == (s, t, c)] of
-                        ty : _ -> Just ty
-                        [] -> (.colType) . parseColumn <$> Map.lookup (ObjectKey Definition (Address "table column" [s, t, c] [])) deps.dbSchema
-                foreignKeyBreaks <-
-                    timed "table.foreignKeys" $ Map.fromListWith (<>) . catMaybes <$> for
-                        [ (addr, k, types)
-                        | (_, _, addr, _) <- retyped
-                        , k <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
-                        , k.objectType == "table constraint"
-                        , Just def <- [Map.lookup (ObjectKey Definition k) deps.dbSchema]
-                        , Just types <- [foreignKeyTypes typeIn k def]
-                        ]
-                        \(addr, k, types) -> fmap (\err -> (addr, [(k, err)])) <$> foreignKeyError conn types
-                typeFacts <-
-                    timed "table.typeChangeFacts" $ Map.fromList . catMaybes <$> for retyped \(_, _, addr, newType) ->
-                        case parseColumn <$> Map.lookup (ObjectKey Definition addr) edit.current of
-                            Just o -> fmap (addr,) <$> typeChangeFacts conn o.colType newType
-                            Nothing -> pure Nothing
-                let otherTables addr =
-                        Set.toList
-                            . Set.fromList
-                            $ [ other
-                              | k <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
-                              , k.objectType == "table constraint"
-                              , [s, t, _] <- [k.objectNames]
-                              , Just def <- [Map.lookup (ObjectKey Definition k) deps.dbSchema]
-                              , Just referenced <- [referencedTable def]
-                              , let other = if QName s t == table then referenced else qualified (QName s t)
-                              , other /= qualified table
-                              ]
-                    convertNote = MayFail "fails when an existing value does not convert to the new type"
-                    withTypeFacts s = case Map.lookup s.address typeFacts of
-                        Just (rewrites, domain)
-                            | MayRewriteTable `elem` s.hazards ->
-                                let kept = concatMap (\h -> if h == MayRewriteTable then [RewritesTable | rewrites] else [h | h /= convertNote || rewrites || domain]) s.hazards
-                                 in s{hazards = kept <> concat [LocksOther o : [RechecksForeignKey o | rewrites] | o <- otherTables s.address]}
-                        _ -> s
-                let breaking = Map.fromListWith (\_ earlier -> earlier) [(a, message) | (s, _, message) <- maybe [] Set.toList checked, Just a <- [Map.lookup s bySignature]]
-                    passed = Set.fromList [a | isJust checked, a <- plpgsql <> sqlBodies, a `Map.notMember` breaking, Just def <- [definitionOf a], not ("execute" `T.isInfixOf` T.toLower def)]
-                    breaksFor addr = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.named <> Map.findWithDefault Set.empty addr deps.exact), a `Map.member` breaking]
-                    dependents = deps.exact
-                    mentions = Map.map (Set.filter (\a -> a `Map.notMember` breaking && a `Set.notMember` passed)) deps.named
-                    retypedAddresses = Set.fromList [a | (_, _, a, _) <- retyped]
-                    around = viewsAroundTypeChanges deps [(t, c, a) | (t, c, a, _) <- retyped]
-                    withViews c = c{viewsAround = Map.map snd around}
-                    aroundOf addr = fold [members | (t, c, a, _) <- retyped, a == addr, Just (members, _) <- [Map.lookup (t, c) around]]
-                    foreignKeysFor addr = Map.findWithDefault [] addr foreignKeyBreaks
-                    renameHazard = MayFail "breaks running code and Hasura metadata that still use the old name; kronor renames over two deploys with create-migration rename-column-step-1 and rename-column-step-2"
-                    renameSteps =
-                        [ Step DropPhase (-1) addr (Column table new) (renameSql (old, new)) Shared [renameHazard] (ObjectKey Definition addr) (Changed def def)
-                        | (old, new) <- pendingRenames
-                        , let addr = columnAddress new
-                              def = Map.findWithDefault "" (ObjectKey Definition addr) edit.desired
-                        ]
-                    steps = renameSteps <> map withTypeFacts (planWith withViews Map.empty edit.current edit.desired [] [] edit.changes)
-                    same :: Text
-                    same
-                        | opts.compareWith == LiveDatabase = "the file matches the table"
-                        | not (null branchChanges) = "this branch's changes already cover the file"
-                        | otherwise = let base = opts.base in [i|the file has no schema changes since #{base}|]
-                    columnsWhere p = [(c, (parseColumn (changeText ch)).colType) | (k, ch) <- Map.toList edit.changes, k.aspect == Definition, p ch, Column _ c <- [fromAddress k.address]]
-                    changeText = \case Added d -> d; Dropped d -> d; Changed _ d -> d
-                    renameLike =
-                        [ (old, new)
-                        | null opts.renames
-                        , opts.sameTypeSwap == AskIfRename
-                        , (old, oldType) <- columnsWhere (\case Dropped _ -> True; _ -> False)
-                        , (new, newType) <- columnsWhere (\case Added _ -> True; _ -> False)
-                        , oldType == newType
-                        ]
-                    renameNotes = [[i|#{old} is dropped and #{new} added with the same type; pass --rename #{old}:#{new} if it is a rename, or --drop-and-add if it is not|] | (old, new) <- renameLike]
-                    dropped addr = case Map.lookup (ObjectKey Definition addr) edit.changes of
-                        Just (Dropped _) -> True
-                        _ -> False
-                    goesWith d = d.objectType == "index" || (d.objectType == "table constraint" && take 2 d.objectNames == [table.schema, table.name])
-                    listed = fold dependents <> fold mentions
-                    overloaded = Map.keysSet (Map.filter (> (1 :: Int)) (Map.fromListWith (+) [((a.objectType, a.objectNames), 1) | a <- Set.toList listed]))
-                    short a =
-                        let objectType = a.objectType
-                            kind = if objectType `elem` ["function", "procedure"] then "" else [i|#{objectType} |] :: Text
-                            name = T.intercalate "." a.objectNames
-                            args = if (a.objectType, a.objectNames) `Set.member` overloaded then let list = T.intercalate ", " a.objectArgs in [i|(#{list})|] else "" :: Text
-                         in [i|#{kind}#{name}#{args}|] :: Text
-                    item d = [i|    #{short d}|] :: Text
-                    detail t = [i|      #{t}|] :: Text
-                    section :: Text -> [Address] -> [Text]
-                    section heading = \case
-                        [] -> []
-                        ds -> [i|  #{heading}|] : map item ds
-                    breaksSection = \case
-                        [] -> []
-                        fs -> "  breaks" : concat [[item f, detail (Map.findWithDefault "" f breaking)] | f <- fs]
-                    foreignKeySection = \case
-                        [] -> []
-                        ks -> "  cannot be rebuilt with the new type" : concat [[item k, detail err] | (k, err) <- ks]
-                    isView d = d.objectType `elem` ["view", "materialized view"]
-                    recreated addr d = d `Set.member` aroundOf addr || (d.objectType == "trigger" && any (\v -> isView v && v.objectNames == take 2 d.objectNames) (aroundOf addr))
-                    rebuiltWith d = d.objectType `elem` ["index", "table constraint", "sequence"]
-                    usage =
-                        concat
-                            [ T.intercalate "." addr.objectNames
-                                : section (if addr `Set.member` renamedFrom then "used by, and follows the rename" else "used by") users
-                                    <> section "dropped with it" with
-                                    <> section "dropped and created again around it" again
-                                    <> breaksSection (breaksFor addr)
-                                    <> foreignKeySection (foreignKeysFor addr)
-                                    <> section "named in" (Set.toList (Map.findWithDefault Set.empty addr mentions))
-                            | addr <- Set.toList (Map.keysSet dependents <> Map.keysSet deps.named)
-                            , not (null (Map.findWithDefault Set.empty addr dependents)) || not (null (breaksFor addr)) || not (null (Map.findWithDefault Set.empty addr mentions))
-                            , let (with, rest) = L.partition (\d -> dropped addr && goesWith d) (Set.toList (Map.findWithDefault Set.empty addr dependents))
-                                  (again, users) = L.partition (recreated addr) (filter (`Map.notMember` breaking) rest)
-                            ]
-                            <> renameNotes
-                    blocking =
-                        Set.toList
-                            . Set.fromList
-                            $ [d | (addr, ds) <- Map.toList dependents, dropped addr, d <- Set.toList ds, not (goesWith d)]
-                            <> [d | (addr, ds) <- Map.toList dependents, addr `Set.member` retypedAddresses, d <- Set.toList ds, not (recreated addr d), not (rebuiltWith d), d `Set.notMember` passed]
-                            <> Map.keys breaking
-                            <> [k | ks <- Map.elems foreignKeyBreaks, (k, _) <- ks]
-                measure "table.planRender" (T.length (T.unlines (map renderStep steps <> usage)) + length blocking)
-                let leftAlone = Set.fromList [k.address | (k, _) <- edit.ignored, k.aspect == Definition]
-                for_ [(k, reason) | (k, reason) <- edit.ignored, not (k.aspect == Comment && k.address `Set.member` leftAlone)] \(k, reason) -> do
-                    let name = render k.address <> if k.aspect == Privileges then " (privileges)" else ""
-                    TIO.putStrLn [i|-- left alone: #{name}: #{reason}|]
-                if opts.output == PrintMigration
-                    then do
-                        for_ usage \line -> TIO.putStrLn [i|-- #{line}|]
-                        unless (null usage) $ TIO.putStrLn ""
-                        if null steps
-                            then TIO.putStrLn [i|-- #{same}|]
-                            else for_ steps (TIO.putStrLn . renderStep)
-                    else do
-                        when (null steps) do
-                            TIO.putStrLn [i|nothing to write: #{same}|]
-                            exitSuccess
-                        for_ usage (TIO.hPutStrLn stderr)
-                        unless (null blocking) do
-                            let n = length blocking
-                            failWith [i|#{n} dependencies on what the edit drops or retypes; change or drop the dependents first|]
-                        unless (null renameLike) $ failWith "a column is dropped and another added with the same type; say whether it is a rename with --rename or --drop-and-add"
-                        sqitchPlan <- timed "write.readPlan" $ readPlan (root </> opts.planPath)
-                        basePlan <- timed "write.basePlan" $ parsePlan <$> jjShow root opts.base opts.planPath
-                        now <- getCurrentTime
-                        let inverseCtx = withViews (context Map.empty edit.desired edit.current [] (Map.map invert edit.changes))
-                            renameBack =
-                                [ Step DropPhase (-1) (columnAddress old) (Column table old) (renameSql (new, old)) Shared [] s.key s.change
-                                | (s, (old, new)) <- zip renameSteps pendingRenames
-                                ]
-                            withRenameBack u
-                                | any (`elem` renameSteps) u.deploy = u{revert = u.revert <> renameBack}
-                                | otherwise = u
-                            isIndex s = case s.object of Index _ -> True; _ -> False
-                            written = map withRenameBack (units isIndex inverseCtx sqitchPlan now steps)
-                            tagName = fromMaybe (defaultTag now) opts.tableTag
-                            entries p = length (filter (== changeName) p.changes)
-                            alreadyReworked = entries sqitchPlan > entries basePlan
-                        previous <- parse atBase original
-                        oldFileFails <- timed "table.compare3" $ withEditedTable conn baseline table statements (pure ()) (const (firstFailure conn previous))
-                        let baseRev = opts.base
-                        for_ oldFileFails \err ->
-                            TIO.putStrLn [i|the file at #{baseRev} fails on the edited table (#{err}); the rework's revert does nothing and the migrations revert the table|]
-                        timed "write.writeUnits" $ writeUnits root opts.top sqitchPlan tagName written
-                        unless alreadyReworked do
-                            afterUnits <- readPlan (root </> opts.planPath)
-                            timed "write.reworkEdited"
-                                $ reworkEdited root opts.top afterUnits tagName changeName [i|schema-diff: #{changeName} as edited|] original (maybe PreviousFileRuns (const PreviousFileFails) oldFileFails)
-                        when alreadyReworked $ moveToEnd (root </> opts.planPath) changeName
-                        for_ written \u -> let name = u.changeName in TIO.putStrLn [i|added #{name}|]
-                        TIO.putStrLn
-                            ( if alreadyReworked
-                                then [i|moved the branch's rework of #{changeName} after the new migrations; if this branch is deployed locally, revert it to before the rework first|]
-                                else [i|reworked #{changeName}|]
-                            )
+            TableFile file db opts -> tableCommand file db opts
+
+
+-- | What the table command works on: its options, the deploy file before and after the
+-- edit, and where they live.
+data TableEnv = TableEnv
+    { opts :: TableOptions
+    , db :: Text
+    , file :: FilePath
+    , root :: FilePath
+    , sqitchChange :: Text
+    , table :: QName
+    , statements :: [Text]
+    , original :: Text
+    }
+
+
+-- | A retyped column: its table, name, address and new type.
+type Retyped = (QName, Text, Address, Text)
+
+
+-- | The functions the body check finds broken by the edit, and the ones it passes.
+data BodyResults = BodyResults
+    { breaking :: Map Address Text
+    , passed :: Set Address
+    }
+
+
+-- | What the comparison and the checks found.
+data Evidence = Evidence
+    { edit :: TableEdit
+    , deps :: Dependents
+    , bodies :: BodyResults
+    , retyped :: [Retyped]
+    , foreignKeyBreaks :: Map Address [(Address, Text)]
+    , typeFacts :: Map Address (Bool, Bool)
+    , branchChanges :: [(Text, [Text])]
+    , pendingRenames :: [(Text, Text)]
+    , renamedFrom :: Set Address
+    }
+
+
+-- | The migration's steps and what the command reports about them.
+data Findings = Findings
+    { steps :: [Step]
+    , renameSteps :: [Step]
+    , newRenames :: [(Text, Text)]
+    , usage :: [Text]
+    , blocking :: [Address]
+    , renameLike :: [(Text, Text)]
+    , same :: Text
+    , withViews :: Context -> Context
+    }
+
+
+-- | Prints the migration that turns the table into what its edited file creates, or
+-- writes it with sqitch.
+tableCommand :: FilePath -> Text -> TableOptions -> IO ()
+tableCommand file db opts = do
+    when (opts.output == WriteMigration) requireSqitch
+    (root, absFile, changeName, table) <- locateTable file opts
+    statements <- parseFile file "" =<< readFileUtf8 absFile
+    let describeWithWords = describeDatabase dependentsScope db >>= \c@(Connected _ _ schema _ _) -> (c,) <$> routineWords schema
+    early <- if opts.compareWith == LiveDatabase || not (null opts.renames) then Just <$> async describeWithWords else pure Nothing
+    original <- timed "table.jjShow" $ jjShow root opts.base (makeRelative root absFile)
+    described <- case early of
+        Just a -> pure (wait a)
+        Nothing
+            | Right statements == (withoutTransactionControl <=< splitStatements) original -> pure describeWithWords
+            | otherwise -> wait <$> async describeWithWords
+    runRIO TableEnv{opts, db, file, root, sqitchChange = changeName, table, statements, original} (compareAndReport described)
+
+
+-- | The project root, the file's absolute path, its sqitch change and its table.
+locateTable :: FilePath -> TableOptions -> IO (FilePath, FilePath, Text, QName)
+locateTable file opts = do
+    root <- makeAbsolute opts.project
+    absFile <- makeAbsolute file
+    let deployDir = root </> opts.top </> "deploy"
+        relative = T.pack (makeRelative deployDir absFile)
+    changeName <- maybe (failWith [i|#{file} is not under #{deployDir}|]) pure (T.stripSuffix ".sql" relative)
+    table <- case T.split (== '/') changeName of
+        [s, "table", t] | not ("@" `T.isInfixOf` t) -> pure (QName s t)
+        _ -> failWith [i|#{file} is not a table's own deploy file (<schema>/table/<name>.sql)|]
+    pure (root, absFile, changeName, table)
+
+
+-- | A deploy file's statements; @label@ names the version in a parse error.
+parseFile :: MonadIO m => FilePath -> Text -> Text -> m [Text]
+parseFile file label = either (\e -> failWith [i|#{file}#{label}: #{e}|]) pure . (withoutTransactionControl <=< splitStatements)
+
+
+atBase :: TableOptions -> Text
+atBase opts = let base = opts.base in [i| at #{base}|]
+
+
+renameSql :: QName -> (Text, Text) -> Text
+renameSql table (old, new) = [i|alter table #{qualified table} rename column #{quoteIdent old} to #{quoteIdent new}|]
+
+
+columnAddress :: QName -> Text -> Address
+columnAddress table c = Address "table column" [table.schema, table.name, c] []
+
+
+say :: MonadIO m => Text -> m ()
+say = liftIO . TIO.putStrLn
+
+
+-- | Compares the table, checks what depends on the edit, and prints or writes the migration.
+compareAndReport :: IO (Connected, Map Address BodyText) -> RIO TableEnv ()
+compareAndReport described = do
+    env <- ask
+    let opts = env.opts
+        table = env.table
+    when (opts.compareWith == LiveDatabase && not (null opts.renames)) $ failWith "--rename works with the file comparison, not --against-database"
+    branchChanges <- branchChangesFor
+    let branchStatements = concatMap snd branchChanges
+        normalised = T.toLower . T.unwords . T.words . T.dropWhileEnd (== ';') . T.strip . withoutLeadingComments
+        pendingRenames = [r | r <- opts.renames, normalised (renameSql table r) `notElem` map normalised branchStatements]
+    for_ branchChanges \(n, _) -> say [i|-- already on this branch: #{n}|]
+    baseline <-
+        if opts.compareWith == LiveDatabase
+            then pure (LiveTable opts.drops)
+            else BaseFile . (<> (branchStatements <> map (renameSql table) pendingRenames)) <$> parseFile env.file (atBase opts) env.original
+    conn <- timed "table.connect" $ liftIO (connect =<< resolveDb env.db)
+    edit <- timed "table.compare1" $ liftIO (compareTable conn baseline table env.statements)
+    let renamedFrom = Set.fromList [columnAddress table old | (old, _) <- opts.renames]
+    deps <- timed "table.dependentsIn" $ liftIO (dependentsIn described (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom)))
+    bodies <- bodyResultsFor conn baseline deps
+    let retyped = retypedColumns edit
+    foreignKeyBreaks <- liftIO (foreignKeyBreaksFor conn deps retyped)
+    typeFacts <- liftIO (typeFactsFor conn edit retyped)
+    let findings = findingsFor env Evidence{edit, deps, bodies, retyped, foreignKeyBreaks, typeFacts, branchChanges, pendingRenames, renamedFrom}
+    measure "table.planRender" (T.length (T.unlines (map renderStep findings.steps <> findings.usage)) + length findings.blocking)
+    printLeftAlone edit
+    case opts.output of
+        PrintMigration -> printMigration findings
+        WriteMigration -> writeMigration conn baseline edit findings
+
+
+-- | This branch's changes for the table, with the statements the comparison can replay;
+-- none against the database.
+branchChangesFor :: RIO TableEnv [(Text, [Text])]
+branchChangesFor = do
+    env <- ask
+    let opts = env.opts
+        root = env.root
+    if opts.compareWith == LiveDatabase
+        then pure []
+        else do
+            current <- liftIO (readPlan (root </> opts.planPath))
+            basePlan <- liftIO (parsePlan <$> jjShow root opts.base opts.planPath)
+            let before = Set.fromList basePlan.changes
+            for (filter (\n -> n `Set.notMember` before && forTable env.table n) (nubOrd current.changes)) \n -> do
+                script <- readFileUtf8 (root </> opts.top </> "deploy" </> T.unpack n <.> "sql")
+                (n,) . replayable <$> either (\e -> failWith [i|#{n}: #{e}|]) pure ((withoutTransactionControl <=< splitStatements) script)
+
+
+-- | Checks the PL/pgSQL and string-bodied SQL functions that depend on the edit or name it,
+-- before and after the edit.
+bodyResultsFor :: Connection.Connection -> Baseline -> Dependents -> RIO TableEnv BodyResults
+bodyResultsFor conn baseline deps = do
+    env <- ask
+    let table = env.table
+        definitionOf a = Map.lookup (ObjectKey Definition a) deps.dbSchema
+        routines = Set.toList (Set.filter (\a -> a.objectType `elem` ["function", "procedure"]) (fold deps.named <> fold deps.exact))
+        plpgsql = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE plpgsql" `T.isInfixOf` def]
+        sqlBodies = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE sql" `T.isInfixOf` def, not (standardBody def)]
+        signature a = case a.objectNames of
+            [s, n] -> let args = T.intercalate ", " a.objectArgs in [i|#{quoteIdent s}.#{quoteIdent n}(#{args})|]
+            _ -> render a
+        bySignature = Map.fromList [(signature a, a) | a <- plpgsql <> sqlBodies]
+        check made = timed [i|table.bodyErrors n=#{Map.size bySignature}|] $ bodyErrors conn aside (qualified table) made (map signature plpgsql) (map signature sqlBodies)
+        rowTypeCall message = "function " `T.isPrefixOf` message && any (\end -> (qualified table <> end) `T.isInfixOf` message) [")", ","]
+    checked <-
+        if null plpgsql && null sqlBodies
+            then pure Nothing
+            else
+                timed "table.compare2"
+                    . liftIO
+                    $ fmap (Set.filter (\(_, _, message) -> not (rowTypeCall message)))
+                    <$> withEditedTable conn baseline table env.statements (check deps.dbTempTables) (\before -> (\after -> Set.difference <$> after <*> before) <$> check (pure Nothing))
+    let breaking = Map.fromListWith (\_ earlier -> earlier) [(a, message) | (s, _, message) <- maybe [] Set.toList checked, Just a <- [Map.lookup s bySignature]]
+        passed = Set.fromList [a | isJust checked, a <- plpgsql <> sqlBodies, a `Map.notMember` breaking, Just def <- [definitionOf a], not ("execute" `T.isInfixOf` T.toLower def)]
+    pure BodyResults{breaking, passed}
+
+
+retypedColumns :: TableEdit -> [Retyped]
+retypedColumns edit =
+    [ (t, c, k.address, n.colType)
+    | (k, Changed old new) <- Map.toList edit.changes
+    , k.aspect == Definition
+    , let o = parseColumn old
+          n = parseColumn new
+    , o.colType /= n.colType || o.collation /= n.collation
+    , Column t c <- [fromAddress k.address]
+    ]
+
+
+-- | The foreign keys on retyped columns that cannot be rebuilt with the new types, with
+-- PostgreSQL's error.
+foreignKeyBreaksFor :: Connection.Connection -> Dependents -> [Retyped] -> IO (Map Address [(Address, Text)])
+foreignKeyBreaksFor conn deps retyped =
+    timed "table.foreignKeys"
+        $ Map.fromListWith (<>)
+        . catMaybes
+        <$> for
+            [ (addr, k, types)
+            | (_, _, addr, _) <- retyped
+            , k <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
+            , k.objectType == "table constraint"
+            , Just def <- [Map.lookup (ObjectKey Definition k) deps.dbSchema]
+            , Just types <- [foreignKeyTypes typeIn k def]
+            ]
+            \(addr, k, types) -> fmap (\err -> (addr, [(k, err)])) <$> foreignKeyError conn types
+  where
+    typeIn s t c = case [ty | (QName s' t', c', _, ty) <- retyped, (s', t', c') == (s, t, c)] of
+        ty : _ -> Just ty
+        [] -> (.colType) . parseColumn <$> Map.lookup (ObjectKey Definition (Address "table column" [s, t, c] [])) deps.dbSchema
+
+
+-- | For each retyped column, whether the change rewrites the table and whether the new
+-- type is a domain.
+typeFactsFor :: Connection.Connection -> TableEdit -> [Retyped] -> IO (Map Address (Bool, Bool))
+typeFactsFor conn edit retyped =
+    timed "table.typeChangeFacts" $ Map.fromList . catMaybes <$> for retyped \(_, _, addr, newType) ->
+        case parseColumn <$> Map.lookup (ObjectKey Definition addr) edit.current of
+            Just o -> fmap (addr,) <$> typeChangeFacts conn o.colType newType
+            Nothing -> pure Nothing
+
+
+findingsFor :: TableEnv -> Evidence -> Findings
+findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames, usage, blocking, renameLike, same, withViews}
+  where
+    opts = env.opts
+    table = env.table
+    edit = ev.edit
+    deps = ev.deps
+    breaking = ev.bodies.breaking
+    passed = ev.bodies.passed
+    retyped = ev.retyped
+    otherTables addr =
+        Set.toList
+            . Set.fromList
+            $ [ other
+              | k <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
+              , k.objectType == "table constraint"
+              , [s, t, _] <- [k.objectNames]
+              , Just def <- [Map.lookup (ObjectKey Definition k) deps.dbSchema]
+              , Just referenced <- [referencedTable def]
+              , let other = if QName s t == table then referenced else qualified (QName s t)
+              , other /= qualified table
+              ]
+    convertNote = MayFail "fails when an existing value does not convert to the new type"
+    withTypeFacts s = case Map.lookup s.address ev.typeFacts of
+        Just (rewrites, domain)
+            | MayRewriteTable `elem` s.hazards ->
+                let kept = concatMap (\h -> if h == MayRewriteTable then [RewritesTable | rewrites] else [h | h /= convertNote || rewrites || domain]) s.hazards
+                 in s{hazards = kept <> concat [LocksOther o : [RechecksForeignKey o | rewrites] | o <- otherTables s.address]}
+        _ -> s
+    breaksFor addr = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.named <> Map.findWithDefault Set.empty addr deps.exact), a `Map.member` breaking]
+    dependents = deps.exact
+    mentions = Map.map (Set.filter (\a -> a `Map.notMember` breaking && a `Set.notMember` passed)) deps.named
+    retypedAddresses = Set.fromList [a | (_, _, a, _) <- retyped]
+    around = viewsAroundTypeChanges deps [(t, c, a) | (t, c, a, _) <- retyped]
+    withViews c = c{viewsAround = Map.map snd around}
+    aroundOf addr = fold [members | (t, c, a, _) <- retyped, a == addr, Just (members, _) <- [Map.lookup (t, c) around]]
+    foreignKeysFor addr = Map.findWithDefault [] addr ev.foreignKeyBreaks
+    renameHazard = MayFail "breaks running code and Hasura metadata that still use the old name; kronor renames over two deploys with create-migration rename-column-step-1 and rename-column-step-2"
+    renameSteps =
+        [ Step DropPhase (-1) addr (Column table new) (renameSql table (old, new)) Shared [renameHazard] (ObjectKey Definition addr) (Changed def def)
+        | (old, new) <- ev.pendingRenames
+        , let addr = columnAddress table new
+              def = Map.findWithDefault "" (ObjectKey Definition addr) edit.desired
+        ]
+    steps = renameSteps <> map withTypeFacts (planWith withViews Map.empty edit.current edit.desired [] [] edit.changes)
+    same :: Text
+    same
+        | opts.compareWith == LiveDatabase = "the file matches the table"
+        | not (null ev.branchChanges) = "this branch's changes already cover the file"
+        | otherwise = let base = opts.base in [i|the file has no schema changes since #{base}|]
+    columnsWhere p = [(c, (parseColumn (changeText ch)).colType) | (k, ch) <- Map.toList edit.changes, k.aspect == Definition, p ch, Column _ c <- [fromAddress k.address]]
+    changeText = \case Added d -> d; Dropped d -> d; Changed _ d -> d
+    renameLike =
+        [ (old, new)
+        | null opts.renames
+        , opts.sameTypeSwap == AskIfRename
+        , (old, oldType) <- columnsWhere (\case Dropped _ -> True; _ -> False)
+        , (new, newType) <- columnsWhere (\case Added _ -> True; _ -> False)
+        , oldType == newType
+        ]
+    renameNotes = [[i|#{old} is dropped and #{new} added with the same type; pass --rename #{old}:#{new} if it is a rename, or --drop-and-add if it is not|] | (old, new) <- renameLike]
+    dropped addr = case Map.lookup (ObjectKey Definition addr) edit.changes of
+        Just (Dropped _) -> True
+        _ -> False
+    goesWith d = d.objectType == "index" || (d.objectType == "table constraint" && take 2 d.objectNames == [table.schema, table.name])
+    listed = fold dependents <> fold mentions
+    overloaded = Map.keysSet (Map.filter (> (1 :: Int)) (Map.fromListWith (+) [((a.objectType, a.objectNames), 1) | a <- Set.toList listed]))
+    short a =
+        let objectType = a.objectType
+            kind = if objectType `elem` ["function", "procedure"] then "" else [i|#{objectType} |] :: Text
+            name = T.intercalate "." a.objectNames
+            args = if (a.objectType, a.objectNames) `Set.member` overloaded then let list = T.intercalate ", " a.objectArgs in [i|(#{list})|] else "" :: Text
+         in [i|#{kind}#{name}#{args}|] :: Text
+    item d = [i|    #{short d}|] :: Text
+    detail t = [i|      #{t}|] :: Text
+    section :: Text -> [Address] -> [Text]
+    section heading = \case
+        [] -> []
+        ds -> [i|  #{heading}|] : map item ds
+    breaksSection = \case
+        [] -> []
+        fs -> "  breaks" : concat [[item f, detail (Map.findWithDefault "" f breaking)] | f <- fs]
+    foreignKeySection = \case
+        [] -> []
+        ks -> "  cannot be rebuilt with the new type" : concat [[item k, detail err] | (k, err) <- ks]
+    isView d = d.objectType `elem` ["view", "materialized view"]
+    recreated addr d = d `Set.member` aroundOf addr || (d.objectType == "trigger" && any (\v -> isView v && v.objectNames == take 2 d.objectNames) (aroundOf addr))
+    rebuiltWith d = d.objectType `elem` ["index", "table constraint", "sequence"]
+    usage =
+        concat
+            [ T.intercalate "." addr.objectNames
+                : section (if addr `Set.member` ev.renamedFrom then "used by, and follows the rename" else "used by") users
+                    <> section "dropped with it" with
+                    <> section "dropped and created again around it" again
+                    <> breaksSection (breaksFor addr)
+                    <> foreignKeySection (foreignKeysFor addr)
+                    <> section "named in" (Set.toList (Map.findWithDefault Set.empty addr mentions))
+            | addr <- Set.toList (Map.keysSet dependents <> Map.keysSet deps.named)
+            , not (null (Map.findWithDefault Set.empty addr dependents)) || not (null (breaksFor addr)) || not (null (Map.findWithDefault Set.empty addr mentions))
+            , let (with, rest) = L.partition (\d -> dropped addr && goesWith d) (Set.toList (Map.findWithDefault Set.empty addr dependents))
+                  (again, users) = L.partition (recreated addr) (filter (`Map.notMember` breaking) rest)
+            ]
+            <> renameNotes
+    blocking =
+        Set.toList
+            . Set.fromList
+            $ [d | (addr, ds) <- Map.toList dependents, dropped addr, d <- Set.toList ds, not (goesWith d)]
+            <> [d | (addr, ds) <- Map.toList dependents, addr `Set.member` retypedAddresses, d <- Set.toList ds, not (recreated addr d), not (rebuiltWith d), d `Set.notMember` passed]
+            <> Map.keys breaking
+            <> [k | ks <- Map.elems ev.foreignKeyBreaks, (k, _) <- ks]
+
+
+-- | The differences the comparison leaves alone, with the reason; an object's comment
+-- goes with it.
+printLeftAlone :: MonadIO m => TableEdit -> m ()
+printLeftAlone edit = do
+    let leftAlone = Set.fromList [k.address | (k, _) <- edit.ignored, k.aspect == Definition]
+    for_ [(k, reason) | (k, reason) <- edit.ignored, not (k.aspect == Comment && k.address `Set.member` leftAlone)] \(k, reason) -> do
+        let name = render k.address <> if k.aspect == Privileges then " (privileges)" else ""
+        say [i|-- left alone: #{name}: #{reason}|]
+
+
+printMigration :: MonadIO m => Findings -> m ()
+printMigration f = do
+    let same = f.same
+    for_ f.usage \line -> say [i|-- #{line}|]
+    unless (null f.usage) $ say ""
+    if null f.steps
+        then say [i|-- #{same}|]
+        else for_ f.steps (say . renderStep)
+
+
+-- | Adds the migration with sqitch and reworks the table's change.
+writeMigration :: Connection.Connection -> Baseline -> TableEdit -> Findings -> RIO TableEnv ()
+writeMigration conn baseline edit f = do
+    env <- ask
+    let opts = env.opts
+        root = env.root
+        table = env.table
+        changeName = env.sqitchChange
+        same = f.same
+    when (null f.steps) do
+        say [i|nothing to write: #{same}|]
+        exitSuccess
+    for_ f.usage (liftIO . TIO.hPutStrLn stderr)
+    unless (null f.blocking) do
+        let n = length f.blocking
+        failWith [i|#{n} dependencies on what the edit drops or retypes; change or drop the dependents first|]
+    unless (null f.renameLike) $ failWith "a column is dropped and another added with the same type; say whether it is a rename with --rename or --drop-and-add"
+    sqitchPlan <- timed "write.readPlan" $ liftIO (readPlan (root </> opts.planPath))
+    basePlan <- timed "write.basePlan" $ liftIO (parsePlan <$> jjShow root opts.base opts.planPath)
+    now <- liftIO getCurrentTime
+    let inverseCtx = f.withViews (context Map.empty edit.desired edit.current [] (Map.map invert edit.changes))
+        renameBack =
+            [ Step DropPhase (-1) (columnAddress table old) (Column table old) (renameSql table (new, old)) Shared [] s.key s.change
+            | (s, (old, new)) <- zip f.renameSteps f.newRenames
+            ]
+        withRenameBack u
+            | any (`elem` f.renameSteps) u.deploy = u{revert = u.revert <> renameBack}
+            | otherwise = u
+        isIndex s = case s.object of Index _ -> True; _ -> False
+        written = map withRenameBack (units isIndex inverseCtx sqitchPlan now f.steps)
+        tagName = fromMaybe (defaultTag now) opts.tableTag
+        entries p = length (filter (== changeName) p.changes)
+        alreadyReworked = entries sqitchPlan > entries basePlan
+    previous <- parseFile env.file (atBase opts) env.original
+    oldFileFails <- timed "table.compare3" $ liftIO (withEditedTable conn baseline table env.statements (pure ()) (const (firstFailure conn previous)))
+    let baseRev = opts.base
+    for_ oldFileFails \err ->
+        say [i|the file at #{baseRev} fails on the edited table (#{err}); the rework's revert does nothing and the migrations revert the table|]
+    timed "write.writeUnits" $ liftIO (writeUnits root opts.top sqitchPlan tagName written)
+    unless alreadyReworked do
+        afterUnits <- liftIO (readPlan (root </> opts.planPath))
+        timed "write.reworkEdited"
+            . liftIO
+            $ reworkEdited root opts.top afterUnits tagName changeName [i|schema-diff: #{changeName} as edited|] env.original (maybe PreviousFileRuns (const PreviousFileFails) oldFileFails)
+    when alreadyReworked . liftIO $ moveToEnd (root </> opts.planPath) changeName
+    for_ written \u -> let name = u.changeName in say [i|added #{name}|]
+    say
+        ( if alreadyReworked
+            then [i|moved the branch's rework of #{changeName} after the new migrations; if this branch is deployed locally, revert it to before the rework first|]
+            else [i|reworked #{changeName}|]
+        )
 
 
 -- | Whether a sqitch change is about the table, by the names create-migration and

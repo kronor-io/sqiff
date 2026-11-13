@@ -119,7 +119,7 @@ newtype UserError = UserError Text
 instance Exception UserError
 
 
-failWith :: Text -> IO a
+failWith :: MonadIO m => Text -> m a
 failWith = throwIO . UserError . T.unwords . T.words
 
 
