@@ -20,6 +20,7 @@ import Hasql.TH (singletonStatement, vectorStatement)
 import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), failWith, qualifiedNames)
 import RIO
 import RIO.Map qualified as Map
+import RIO.Set qualified as Set
 import RIO.Vector qualified as V
 
 
@@ -39,44 +40,43 @@ data BodyCheck
 -- that accepts writes.
 checkBodies :: Connection.Connection -> Map ObjectKey Text -> IO (Map ObjectKey BodyCheck)
 checkBodies conn schema = qualifiedNames conn do
-    candidates <-
+    sqlBodyFunctions <-
         if any (\k -> k.address.objectType `elem` ["function", "procedure"]) (Map.keys schema)
             then toList <$> run sqlBodies ()
             else pure []
-    fmap Map.fromList . for [(k, def) | (names, args, kind) <- candidates, let { k = key (toList names) (toList args) kind }, Just def <- [Map.lookup k schema]] $ \(k, def) -> do
-        printed <- reprint k def
-        check <- case printed of
-            Right p
-                | p == def -> pure RoundTrips
-                | otherwise -> pure (Reprints p)
-            Left err -> case repair def of
-                Just candidate -> do
-                    again <- reprint k candidate
-                    pure case again of
-                        Right p | p == def -> Repaired candidate
-                        _ -> DoesNotParse err
-                Nothing -> pure (DoesNotParse err)
-        pure (k, check)
+    let keys = Set.fromList [definitionKey (toList names) (toList args) kind | (names, args, kind) <- sqlBodyFunctions]
+    Map.traverseWithKey roundTrip (Map.restrictKeys schema keys)
   where
-    key names args kind = ObjectKey Definition (Address kind names args)
+    definitionKey names args kind = ObjectKey Definition (Address kind names args)
+
+    -- | Runs the printed definition and compares it with what PostgreSQL prints back.
+    roundTrip k original =
+        rolledBack (recreate original *> printDefinition k) >>= \case
+            Right reprinted
+                | reprinted == original -> pure RoundTrips
+                | otherwise -> pure (Reprints reprinted)
+            Left parseError -> case repair original of
+                Nothing -> pure (DoesNotParse parseError)
+                Just repaired -> do
+                    fromRepaired <- rolledBack (recreate repaired *> printDefinition k)
+                    pure if fromRepaired == Right original then Repaired repaired else DoesNotParse parseError
 
     run :: Statement.Statement p a -> p -> IO a
     run statement params = Connection.use conn (Session.statement params statement) >>= either (\e -> failWith ("query failed: " <> tshow e)) pure
 
-    reprint k def = do
-        result <-
-            Connection.use conn do
-                Session.script "begin"
-                Session.script (def <> ";")
-                printed <-
-                    Session.statement (V.fromList k.address.objectNames, V.fromList k.address.objectArgs) printedSql
-                Session.script "rollback"
-                pure printed
-        case result of
-            Right printed -> pure (Right printed)
+    recreate :: Text -> Session.Session ()
+    recreate definition = Session.script (definition <> ";")
+
+    printDefinition :: ObjectKey -> Session.Session Text
+    printDefinition k = Session.statement (V.fromList k.address.objectNames, V.fromList k.address.objectArgs) printedSql
+
+    rolledBack :: Session.Session a -> IO (Either Text a)
+    rolledBack session =
+        Connection.use conn (Session.script "begin" *> session <* Session.script "rollback") >>= \case
+            Right a -> pure (Right a)
             Left err -> do
                 void (Connection.use conn (Session.script "rollback"))
-                pure (Left (T.take 300 (T.unwords (T.words (T.pack (show err))))))
+                pure . Left . T.take 300 . T.unwords . T.words . tshow $ err
 
     printedSql :: Statement.Statement (Vector Text, Vector Text) Text
     printedSql =

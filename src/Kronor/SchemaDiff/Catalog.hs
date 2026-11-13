@@ -1,3 +1,5 @@
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
@@ -63,7 +65,8 @@ import RIO.Vector qualified as V
 
 
 data Aspect = Definition | Privileges | Comment
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Generic)
+    deriving anyclass (NFData)
 
 
 data Address = Address
@@ -71,14 +74,16 @@ data Address = Address
     , objectNames :: [Text]
     , objectArgs :: [Text]
     }
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Generic)
+    deriving anyclass (NFData)
 
 
 data ObjectKey = ObjectKey
     { aspect :: Aspect
     , address :: Address
     }
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Generic)
+    deriving anyclass (NFData)
 
 
 type Schema = Map ObjectKey Text
@@ -175,18 +180,24 @@ describeOn conns excluded partitions onlyTable = do
     middling = ["constraint", "index", "relation"]
     byName names = [q | n <- names, q@(f, _) <- describeQueries, takeBaseName f == n]
 
-    describeOne conn ((file, body), half) = timed [i|describeQuery #{takeBaseName file} #{maybe "" show half}|] do
-        rows <-
-            run conn (excluded, partitions == IncludePartitions, onlyTable, half)
-                $ Statement.unpreparable (wrap (decodeUtf8Lenient body)) describeParams (D.rowList ((,,) <$> catalogIdRow <*> addressRow <*> textColumn))
-        _ <- evaluate (foldl' (\n (_, addr, def) -> n + T.length def + sum (map T.length (addr.objectType : addr.objectNames <> addr.objectArgs))) (0 :: Int) rows)
-        let objectAspect = case takeBaseName file of
-                "privileges" -> Privileges
-                "comment" -> Comment
-                _ -> Definition
-        (,)
-            <$> evaluate (Map.fromList [(ObjectKey objectAspect addr, def) | (_, addr, def) <- rows])
-            <*> evaluate (Map.fromList [(ids, addr) | (ids, addr, _) <- rows])
+    describeOne conn ((file, body), parity) =
+        timed [i|describeQuery #{name} #{maybe "" show parity}|] do
+            rows <- run conn (excluded, partitions == IncludePartitions, onlyTable, parity) (describeStatement body)
+            evaluate $ force
+                ( Map.fromList [(ObjectKey (aspectOf name) address, definition) | (_, address, definition) <- rows]
+                , Map.fromList [(ids, address) | (ids, address, _) <- rows]
+                )
+      where
+        name = takeBaseName file
+
+    describeStatement body =
+        Statement.unpreparable (wrap (decodeUtf8Lenient body)) describeParams
+            $ D.rowList ((,,) <$> catalogIdRow <*> addressRow <*> textColumn)
+
+    aspectOf = \case
+        "privileges" -> Privileges
+        "comment" -> Comment
+        _ -> Definition
 
     wrap body =
         [i|
