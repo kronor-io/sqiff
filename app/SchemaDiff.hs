@@ -8,7 +8,7 @@ module SchemaDiff (main) where
 import Data.Algorithm.Diff (PolyDiff (..), getDiff)
 import Data.String.Interpolate (i)
 import Data.Text.IO qualified as TIO
-import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
+import Data.Time (UTCTime, defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
 import Kronor.SchemaDiff.Baseline (ensureBaseline)
 import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
@@ -77,7 +77,7 @@ neededFor forPlan changes
 -- | Edges from @pg_depend@ and, when plpgsql_check is installed, from PL/pgSQL bodies,
 -- with notes for stderr. @label@ names the database in the notes.
 edgesOf :: Text -> Scope -> Needed -> Connected -> IO ([Edge], [Text])
-edgesOf label scope needed connected@(Connected conn extra _ addresses made) = timed ("edgesOf " <> label) case needed of
+edgesOf label scope needed connected@(Connected conn extra _ addresses made) = timed [i|edgesOf #{label}|] case needed of
     ReachableFrom starts -> let Connected _ _ schema _ _ = connected in reachableEdges label scope starts connected (routineWords schema)
     _ -> do
         let wantedIds wanted = [ids | (ids, addr) <- Map.toList addresses, addr `Set.member` wanted]
@@ -86,11 +86,11 @@ edgesOf label scope needed connected@(Connected conn extra _ addresses made) = t
                 _ -> Just Set.empty
         (edges, body) <-
             concurrently
-                ( timed ("edgesOf.dependOn " <> label) case needed of
+                ( timed [i|edgesOf.dependOn #{label}|] case needed of
                     BodiesOf wanted -> dependenciesOn conn addresses (wantedIds wanted)
                     _ -> pure []
                 )
-                (timed ("edgesOf.bodyUses " <> label) $ fmap (first (edgesBetween addresses)) <$> bodyUses (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded only made)
+                (timed [i|edgesOf.bodyUses #{label}|] $ fmap (first (edgesBetween addresses)) <$> bodyUses (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded only made)
         pure (edges <> maybe [] fst body, bodyNotes label (snd <$> body))
 
 
@@ -117,7 +117,7 @@ bodyNotes label = \case
 -- the closure, whose dependents are then read, and those can make other functions
 -- matter, so it repeats until nothing new is reached or picked.
 reachableEdges :: Text -> Scope -> Set Address -> Connected -> IO (Map Address BodyText) -> IO ([Edge], [Text])
-reachableEdges label scope starts (Connected conn extra schema addresses made) splitWords = timed ("reachableEdges " <> label) do
+reachableEdges label scope starts (Connected conn extra schema addresses made) splitWords = timed [i|reachableEdges #{label}|] do
     let idsOf = Map.fromListWith (<>) [(addr, [ids]) | (ids, addr) <- Map.toList addresses]
         idsFor = concatMap (\a -> Map.findWithDefault [] a idsOf) . Set.toList
         -- depend_from.sql reads the dependents of a relation's columns with the relation's.
@@ -287,8 +287,8 @@ viewsAroundTypeChanges deps retyped =
     ctx0 = context Map.empty Map.empty Map.empty [] Map.empty
     dropView a
         | isRoutine a = let kind = a.objectType; args = T.intercalate ", " a.objectArgs in [i|drop #{kind} #{qualifiedAddress a}(#{args})|]
-        | [s, t, n] <- a.objectNames, a.objectType `elem` ["policy", "trigger"] = "drop " <> a.objectType <> " " <> quoteIdent n <> " on " <> qualified (QName s t)
-        | otherwise = "drop " <> a.objectType <> " " <> qualifiedAddress a
+        | [s, t, n] <- a.objectNames, a.objectType `elem` ["policy", "trigger"] = let kind = a.objectType in [i|drop #{kind} #{quoteIdent n} on #{qualified (QName s t)}|]
+        | otherwise = let kind = a.objectType in [i|drop #{kind} #{qualifiedAddress a}|]
     qualifiedAddress a = case a.objectNames of
         [s, n] -> qualified (QName s n)
         ns -> T.intercalate "." ns
@@ -474,7 +474,7 @@ data SqitchOptions = SqitchOptions
 
 main :: IO ()
 main =
-    handle (\(UserError message) -> TIO.hPutStrLn stderr ("schema-diff: " <> message) >> exitWith (ExitFailure 2))
+    handle (\(UserError message) -> TIO.hPutStrLn stderr [i|schema-diff: #{message}|] >> exitWith (ExitFailure 2))
         $ O.execParser (O.info (commandParser O.<**> O.helper) O.fullDesc)
         >>= \case
             Describe name out replace scope -> do
@@ -512,7 +512,7 @@ main =
                     steps = plan checks fromSchema toSchema fromEdges toEdges changes
                     inverseCtx = context Map.empty toSchema fromSchema toEdges (Map.map invert changes)
                     written = units (const True) inverseCtx sqitchPlan now steps
-                    tagName = fromMaybe (T.pack (formatTime defaultTimeLocale "%Y-%m-%d" now) <> "_schema_diff") opts.tag
+                    tagName = fromMaybe (defaultTag now) opts.tag
                 measure "sqitch.planUnits" (sum [length u.deploy + length u.revert | u <- written])
                 if opts.dryRun
                     then for_ written \u -> do
@@ -528,11 +528,13 @@ main =
                 absFile <- makeAbsolute file
                 let deployDir = root </> opts.top </> "deploy"
                     relative = T.pack (makeRelative deployDir absFile)
-                changeName <- maybe (failWith (T.pack file <> " is not under " <> T.pack deployDir)) pure (T.stripSuffix ".sql" relative)
+                changeName <- maybe (failWith [i|#{file} is not under #{deployDir}|]) pure (T.stripSuffix ".sql" relative)
                 table <- case T.split (== '/') changeName of
                     [s, "table", t] | not ("@" `T.isInfixOf` t) -> pure (QName s t)
-                    _ -> failWith (T.pack file <> " is not a table's own deploy file (<schema>/table/<name>.sql)")
-                let parse label = either (\e -> failWith (T.pack file <> label <> ": " <> e)) pure . (withoutTransactionControl <=< splitStatements)
+                    _ -> failWith [i|#{file} is not a table's own deploy file (<schema>/table/<name>.sql)|]
+                let parse :: Text -> Text -> IO [Text]
+                    parse label = either (\e -> failWith [i|#{file}#{label}: #{e}|]) pure . (withoutTransactionControl <=< splitStatements)
+                    atBase = let base = opts.base in [i| at #{base}|] :: Text
                 statements <- parse "" =<< readFileUtf8 absFile
                 -- Other connections describe the database while the table is compared, which
                 -- happens in a transaction that is rolled back; waited for only when needed.
@@ -566,7 +568,7 @@ main =
                 baseline <-
                     if opts.compareWith == LiveDatabase
                         then pure (LiveTable opts.drops)
-                        else BaseFile . (<> (branchStatements <> map renameSql pendingRenames)) <$> parse (" at " <> opts.base) original
+                        else BaseFile . (<> (branchStatements <> map renameSql pendingRenames)) <$> parse atBase original
                 conn <- timed "table.connect" $ connect =<< resolveDb db
                 edit <- timed "table.compare1" $ compareTable conn baseline table statements
                 let columnAddress c = Address "table column" [table.schema, table.name, c] []
@@ -660,10 +662,11 @@ main =
                               def = Map.findWithDefault "" (ObjectKey Definition addr) edit.desired
                         ]
                     steps = renameSteps <> map withTypeFacts (planWith withViews Map.empty edit.current edit.desired [] [] edit.changes)
+                    same :: Text
                     same
                         | opts.compareWith == LiveDatabase = "the file matches the table"
                         | not (null branchChanges) = "this branch's changes already cover the file"
-                        | otherwise = "the file has no schema changes since " <> opts.base
+                        | otherwise = let base = opts.base in [i|the file has no schema changes since #{base}|]
                     columnsWhere p = [(c, (parseColumn (changeText ch)).colType) | (k, ch) <- Map.toList edit.changes, k.aspect == Definition, p ch, Column _ c <- [fromAddress k.address]]
                     changeText = \case Added d -> d; Dropped d -> d; Changed _ d -> d
                     renameLike =
@@ -683,18 +686,23 @@ main =
                     listed = fold dependents <> fold mentions
                     overloaded = Map.keysSet (Map.filter (> (1 :: Int)) (Map.fromListWith (+) [((a.objectType, a.objectNames), 1) | a <- Set.toList listed]))
                     short a =
-                        (if a.objectType `elem` ["function", "procedure"] then "" else a.objectType <> " ")
-                            <> T.intercalate "." a.objectNames
-                            <> if (a.objectType, a.objectNames) `Set.member` overloaded then let args = T.intercalate ", " a.objectArgs in [i|(#{args})|] else ""
+                        let objectType = a.objectType
+                            kind = if objectType `elem` ["function", "procedure"] then "" else [i|#{objectType} |] :: Text
+                            name = T.intercalate "." a.objectNames
+                            args = if (a.objectType, a.objectNames) `Set.member` overloaded then let list = T.intercalate ", " a.objectArgs in [i|(#{list})|] else "" :: Text
+                         in [i|#{kind}#{name}#{args}|] :: Text
+                    item d = [i|    #{short d}|] :: Text
+                    detail t = [i|      #{t}|] :: Text
+                    section :: Text -> [Address] -> [Text]
                     section heading = \case
                         [] -> []
-                        ds -> ("  " <> heading) : map (("    " <>) . short) ds
+                        ds -> [i|  #{heading}|] : map item ds
                     breaksSection = \case
                         [] -> []
-                        fs -> "  breaks" : concat [["    " <> short f, "      " <> Map.findWithDefault "" f breaking] | f <- fs]
+                        fs -> "  breaks" : concat [[item f, detail (Map.findWithDefault "" f breaking)] | f <- fs]
                     foreignKeySection = \case
                         [] -> []
-                        ks -> "  cannot be rebuilt with the new type" : concat [["    " <> short k, "      " <> err] | (k, err) <- ks]
+                        ks -> "  cannot be rebuilt with the new type" : concat [[item k, detail err] | (k, err) <- ks]
                     isView d = d.objectType `elem` ["view", "materialized view"]
                     recreated addr d = d `Set.member` aroundOf addr || (d.objectType == "trigger" && any (\v -> isView v && v.objectNames == take 2 d.objectNames) (aroundOf addr))
                     -- ALTER COLUMN TYPE rebuilds the column's indexes and constraints itself.
@@ -729,14 +737,14 @@ main =
                     TIO.putStrLn [i|-- left alone: #{name}: #{reason}|]
                 if opts.output == PrintMigration
                     then do
-                        for_ usage \line -> TIO.putStrLn ("-- " <> line)
+                        for_ usage \line -> TIO.putStrLn [i|-- #{line}|]
                         unless (null usage) $ TIO.putStrLn ""
                         if null steps
-                            then TIO.putStrLn ("-- " <> same)
+                            then TIO.putStrLn [i|-- #{same}|]
                             else for_ steps (TIO.putStrLn . renderStep)
                     else do
                         when (null steps) do
-                            TIO.putStrLn ("nothing to write: " <> same)
+                            TIO.putStrLn [i|nothing to write: #{same}|]
                             exitSuccess
                         for_ usage (TIO.hPutStrLn stderr)
                         unless (null blocking) do
@@ -757,12 +765,12 @@ main =
                             -- A new index gets kronor's <schema>/table/<table>/index/<name> change.
                             isIndex s = case s.object of Index _ -> True; _ -> False
                             written = map withRenameBack (units isIndex inverseCtx sqitchPlan now steps)
-                            tagName = fromMaybe (T.pack (formatTime defaultTimeLocale "%Y-%m-%d" now) <> "_schema_diff") opts.tableTag
+                            tagName = fromMaybe (defaultTag now) opts.tableTag
                             entries p = length (filter (== changeName) p.changes)
                             alreadyReworked = entries sqitchPlan > entries basePlan
                         -- sqitch reverts the reworked change before the migrations, so its
                         -- revert, the previous file, meets the edited table.
-                        previous <- parse (" at " <> opts.base) original
+                        previous <- parse atBase original
                         oldFileFails <- timed "table.compare3" $ withEditedTable conn baseline table statements (pure ()) (const (firstFailure conn previous))
                         let baseRev = opts.base
                         for_ oldFileFails \err ->
@@ -775,11 +783,11 @@ main =
                                 $ reworkEdited root opts.top afterUnits tagName changeName [i|schema-diff: #{changeName} as edited|] original (maybe PreviousFileRuns (const PreviousFileFails) oldFileFails)
                         -- The table's rework comes after its migrations in the plan.
                         when alreadyReworked $ moveToEnd (root </> opts.planPath) changeName
-                        for_ written \u -> TIO.putStrLn ("added " <> u.changeName)
+                        for_ written \u -> let name = u.changeName in TIO.putStrLn [i|added #{name}|]
                         TIO.putStrLn
                             ( if alreadyReworked
                                 then [i|moved the branch's rework of #{changeName} after the new migrations; if this branch is deployed locally, revert it to before the rework first|]
-                                else "reworked " <> changeName
+                                else [i|reworked #{changeName}|]
                             )
 
 
@@ -788,9 +796,10 @@ main =
 forTable :: QName -> Text -> Bool
 forTable t n =
     let (schema, name) = (t.schema, t.name)
-        key = [i|#{schema}.#{name}|]
-        indexes = [i|#{schema}/table/#{name}/index/|]
-     in indexes `T.isPrefixOf` n || any (`T.isInfixOf` (n <> "-")) [before <> key <> after | before <- ["-", "/"], after <- [".", "-"]]
+        key = [i|#{schema}.#{name}|] :: Text
+        indexes = [i|#{schema}/table/#{name}/index/|] :: Text
+        padded = [i|#{n}-|] :: Text
+     in indexes `T.isPrefixOf` n || any (`T.isInfixOf` padded) [[i|#{before}#{key}#{after}|] | before <- ["-", "/" :: Text], after <- [".", "-" :: Text]]
 
 
 -- | A migration's statements as they can run inside the comparison's transaction:
@@ -812,7 +821,7 @@ jjShow root rev path = do
     (code, out, err) <- readProcess (setWorkingDir root (proc "jj" ["--ignore-working-copy", "file", "show", "-r", T.unpack rev, path]))
     case code of
         ExitSuccess -> pure (decodeUtf8Lenient (toStrictBytes out))
-        ExitFailure _ -> failWith ("jj file show -r " <> rev <> " " <> T.pack path <> ": " <> decodeUtf8Lenient (toStrictBytes err))
+        ExitFailure _ -> failWith [i|jj file show -r #{rev} #{path}: #{decodeUtf8Lenient (toStrictBytes err)}|]
 
 
 commandParser :: O.Parser Command
@@ -895,13 +904,13 @@ report key change dependents = do
     case change of
         Changed old new ->
             for_ (getDiff (T.lines old) (T.lines new)) \case
-                First line -> TIO.putStrLn ("  - " <> line)
-                Second line -> TIO.putStrLn ("  + " <> line)
+                First line -> TIO.putStrLn [i|  - #{line}|]
+                Second line -> TIO.putStrLn [i|  + #{line}|]
                 Both _ _ -> pure ()
         _ -> pure ()
     unless (Set.null dependents) do
         TIO.putStrLn "  depended on by:"
-        for_ (Set.toList dependents) \addr -> TIO.putStrLn ("    " <> render addr)
+        for_ (Set.toList dependents) \addr -> TIO.putStrLn [i|    #{render addr}|]
   where
     verb :: Text
     verb = case change of
@@ -913,6 +922,11 @@ report key change dependents = do
         Definition -> ""
         Privileges -> " (privileges)"
         Comment -> " (comment)"
+
+
+-- | The tag a rework gets when none is named: today's date with @_schema_diff@.
+defaultTag :: UTCTime -> Text
+defaultTag now = let day = formatTime defaultTimeLocale "%Y-%m-%d" now in [i|#{day}_schema_diff|]
 
 
 summary :: Map ObjectKey Change -> Text

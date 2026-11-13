@@ -44,7 +44,7 @@ foreignKeyError conn types = do
   where
     tidy e = case T.breakOn "are of incompatible types" e of
         (_, "") -> e
-        (_, rest) -> "the key columns " <> rest
+        (_, rest) -> [i|the key columns #{rest}|]
     names = T.intercalate ", " [[i|c#{n}|] | n <- [1 .. length types]]
     columns side = T.intercalate ", " [[i|c#{n} #{side ty}|] | (n, ty) <- zip [1 :: Int ..] types]
 
@@ -136,16 +136,16 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             xact <- currentXact
             script "set local lock_timeout = '5s'"
             exists <- script' [i|select 1 from pg_class where oid = to_regclass(#{literal (qualified table)})|]
-            unless exists $ failWith (qualified table <> " does not exist yet; a new table only needs its own change")
+            unless exists $ failWith [i|#{qualified table} does not exist yet; a new table only needs its own change|]
             beforeResult <- timed "tableEdit.before" beforeEdit
             -- Owned sequences would move with the table; the ones the files name stay.
             owned <-
                 Connection.use conn (Session.statement () ownedSequences)
-                    >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
+                    >>= either setupFailed pure
             for_ (filter (\s -> any ((s `T.isInfixOf`) . withoutLineComments) (statements <> baseStatements)) owned) \s ->
                 script [i|alter sequence #{tableSchemaRef}#{quoteIdent s} owned by none|]
-            script ("create schema " <> aside)
-            script ("alter table " <> qualified table <> " set schema " <> aside)
+            script [i|create schema #{aside}|]
+            script [i|alter table #{qualified table} set schema #{aside}|]
             current <- timed "tableEdit.current" case baseline of
                 _ | describing == SkipDescribe -> pure Map.empty
                 BaseFile base -> do
@@ -173,16 +173,19 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
         , afterResult
         )
   where
-    script sql = Connection.use conn (Session.script sql) >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
+    script sql = Connection.use conn (Session.script sql) >>= either setupFailed pure
+
+    setupFailed e = failWith [i|could not set up the comparison: #{errorText e}|]
 
     baseStatements = case baseline of
         BaseFile base -> base
         LiveTable _ -> []
 
+    build :: Text -> Text -> [Text] -> IO Schema
     build xact label stmts = do
         for_ (zip [1 :: Int ..] stmts) \(n, statement) -> do
             Connection.use conn (Session.script statement)
-                >>= either (\e -> failWith ("statement " <> tshow n <> " of the file " <> label <> " failed: " <> errorText e)) pure
+                >>= either (\e -> failWith [i|statement #{n} of the file #{label} failed: #{errorText e}|]) pure
             after <- currentXact
             when (after /= xact)
                 $ failWith [i|statement #{n} of the file #{label} ended the transaction the comparison runs in|]
@@ -194,7 +197,7 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
 
     currentXact =
         Connection.use conn (Session.statement () (Statement.unpreparable "select pg_current_xact_id()::text" E.noParams (D.singleRow (D.column (D.nonNullable D.text)))))
-            >>= either (\e -> failWith ("could not set up the comparison: " <> errorText e)) pure
+            >>= either setupFailed pure
 
     describeTable q = timed "tableEdit.describeTable" $ fst <$> describeOn [conn] [] SkipPartitions (Just (qualified q))
 
@@ -219,8 +222,8 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
     literal :: Text -> Text
     literal t = [i|'#{T.replace "'" "''" t}'|]
 
-    asideRef = quoteIdent aside <> "."
-    tableSchemaRef = quoteIdent table.schema <> "."
+    asideRef = [i|#{quoteIdent aside}.|] :: Text
+    tableSchemaRef = let schema = quoteIdent table.schema in [i|#{schema}.|] :: Text
 
     moveBack k = case k.address.objectNames of
         s : rest | s == aside -> k{address = k.address{objectNames = table.schema : rest}}
