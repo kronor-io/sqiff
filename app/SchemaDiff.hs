@@ -60,9 +60,6 @@ data Needed
 
 
 -- | The edges a command needs, given the objects that differ between the databases.
--- @diff@ follows dependents of dropped and changed objects through every edge. @plan@
--- orders steps by edges between objects in the diff, and asks only about constraints and
--- indexes being depended on, which PL/pgSQL bodies never reference.
 neededFor :: Bool -> Map ObjectKey Change -> Needed
 neededFor forPlan changes
     | Map.null changes = NoEdges
@@ -112,18 +109,14 @@ bodyNotes label = \case
                 : [[i|  #{name}: #{reason}|] | (name, reason) <- skipped]
 
 
--- | The edges from @pg_depend@ reachable from @starts@, and the body edges of the
--- PL/pgSQL functions that 'bodiesToAnalyse' picks. A body edge can bring a function into
--- the closure, whose dependents are then read, and those can make other functions
--- matter, so it repeats until nothing new is reached or picked.
+-- | The @pg_depend@ edges reachable from @starts@, and the body edges of the PL/pgSQL
+-- functions 'bodiesToAnalyse' picks, repeated until nothing new is reached or picked.
 reachableEdges :: Text -> Scope -> Set Address -> Connected -> IO (Map Address BodyText) -> IO ([Edge], [Text])
 reachableEdges label scope starts (Connected conn extra schema addresses made) splitWords = timed [i|reachableEdges #{label}|] do
     let idsOf = Map.fromListWith (<>) [(addr, [ids]) | (ids, addr) <- Map.toList addresses]
         idsFor = concatMap (\a -> Map.findWithDefault [] a idsOf) . Set.toList
-        -- depend_from.sql reads the dependents of a relation's columns with the relation's.
         columnsOf = Map.fromListWith (<>) [(rel, [addr]) | ((classid, objid, sub), addr) <- Map.toList addresses, classid == pgClass, sub > 0, Just rel <- [Map.lookup (pgClass, objid, 0) addresses]]
         withColumns xs = xs <> Set.fromList (concatMap (\a -> Map.findWithDefault [] a columnsOf) (Set.toList xs))
-    -- The definitions are split into words while pg_depend is read, in parts on every core.
     (edges, functions) <-
         concurrently
             (timed "reach.dependFrom0" $ dependenciesFrom conn addresses (idsFor starts))
@@ -150,7 +143,6 @@ reachableEdges label scope starts (Connected conn extra schema addresses made) s
         Just (fs, described) -> do
             let position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
                 implicit = [a | o <- fs.implicit, Just a <- [Map.lookup (pgProc, o, 0) addresses]]
-                -- @explored@ holds the objects whose dependents are in @pgEdges@.
                 go explored pgEdges done bodyEdges failed = do
                     let dependents = dependentsBy (pgEdges <> bodyEdges)
                         frontier = (starts <> reachedFrom dependents starts) `Set.difference` explored
@@ -158,8 +150,6 @@ reachableEdges label scope starts (Connected conn extra schema addresses made) s
                     let pgEdges' = pgEdges <> more
                         explored' = explored <> withColumns (frontier <> Set.fromList (map (.dependent) more))
                         dependents' = dependentsBy (pgEdges' <> bodyEdges)
-                        -- No name leads to a cast's or operator's function, so reaching
-                        -- one means analysing every body.
                         picked
                             | any (`Set.member` (starts <> reachedFrom dependents' starts)) implicit = [f | (f, _, _, _) <- described]
                             | otherwise = bodiesToAnalyse dependents' starts described
@@ -191,11 +181,8 @@ dependentsScope :: Scope
 dependentsScope = Scope{excluded = ["hdb_catalog"], partitions = SkipPartitions, bodyCheck = SkipBodyChecks}
 
 
--- | For each dropped or changed definition in @changes@, the objects in the database
--- @described@ gives that depend on it, directly or through others, by @pg_depend@ and
--- PL/pgSQL bodies; and for each dropped or changed column and dropped relation, the other
--- functions whose definition names it, with its table for a column, or names a view that
--- reads it, with the view's schema. A view that keeps the column's name must be named with it.
+-- | For each dropped or changed definition, its dependents by @pg_depend@ and PL/pgSQL
+-- bodies, and the other functions whose text names it.
 dependentsIn :: IO (Connected, Map Address BodyText) -> Map ObjectKey Change -> IO Dependents
 dependentsIn described changes
     | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty [] (pure Nothing))
@@ -249,18 +236,14 @@ data Dependents = Dependents
     }
 
 
--- | For each column whose type changes, the statements that drop the views reading it, the
--- policies and triggers on it, and the routines PostgreSQL ties to the column or to those
--- views, dependents first, and the ones that create them again with their grants, indexes,
--- triggers and comments.
+-- | For each retyped column, the statements that drop the views, policies, triggers and
+-- routines that hold it, and the ones that create them again.
 viewsAroundTypeChanges :: Dependents -> [(QName, Text, Address)] -> Map (QName, Text) (Set Address, ([Text], [Text]))
 viewsAroundTypeChanges deps retyped =
     Map.fromList
         [ ((t, c), (members, (map dropView (reverse order), concatMap createView order)))
         | (t, c, addr) <- retyped
         , let closure = Map.findWithDefault Set.empty addr deps.exact
-              -- PostgreSQL refuses the type change while a policy or a trigger's when clause
-              -- or column list uses the column.
               onColumn = Set.filter (\a -> a.objectType `elem` ["policy", "trigger"] && any (\e -> e.dependent == a && e.referenced == addr) deps.dbEdges) closure
               members = held addr closure (Set.filter isView closure <> onColumn)
               order = topoOrder members [(d, r) | e <- deps.dbEdges, let d = relation e.dependent, let r = relation e.referenced, d `Set.member` members, r `Set.member` members]
@@ -269,8 +252,6 @@ viewsAroundTypeChanges deps retyped =
   where
     isView a = a.objectType `elem` ["view", "materialized view"]
     isRoutine a = a.objectType `elem` ["function", "procedure"]
-    -- A SQL-standard body records what it reads in pg_depend; any other routine is held
-    -- only by a view's row type in its signature.
     held column closure members =
         let views = Set.filter isView members
             holds r = case Map.lookup (ObjectKey Definition r) deps.dbSchema of
@@ -346,9 +327,8 @@ describeConnections :: Int
 describeConnections = 4
 
 
--- | A described database with its open connections, and the statements that make
--- plpgsql_check's temp tables there, worked out on a connection of their own while it is
--- described; 'Nothing' when that fails.
+-- | A described database, its open connections, and the statements that make
+-- plpgsql_check's temp tables there.
 data Connected = Connected Connection.Connection [Connection.Connection] Schema Addresses (IO (Maybe Text))
 
 
@@ -375,10 +355,7 @@ describeDatabase scope name = do
 -- differs, alongside the body checks; the edges of @--to@ only when @forPlan@.
 readBoth :: Scope -> Source -> Text -> Bool -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
 readBoth scope from toDb forPlan = do
-    -- @--to@ is described while @--from@'s connection string is found, which can mean
-    -- checking or building the baseline database; that comes first if both fail.
     toDescribed <- async (timed "describe --to" $ describeDatabase scope toDb)
-    -- The body check rolls back failed definitions, so it gets a connection of its own.
     checkConn <- async (connect =<< resolveDb toDb)
     fromDb <- timed "connInfoOf" $ connInfoOf from
     (fromDatabase@(Connected _ _ fromSchema _ _), toDatabase@(Connected _ _ toSchema _ _)) <-
@@ -536,12 +513,9 @@ main =
                     parse label = either (\e -> failWith [i|#{file}#{label}: #{e}|]) pure . (withoutTransactionControl <=< splitStatements)
                     atBase = let base = opts.base in [i| at #{base}|] :: Text
                 statements <- parse "" =<< readFileUtf8 absFile
-                -- Other connections describe the database while the table is compared, which
-                -- happens in a transaction that is rolled back; waited for only when needed.
                 let describeWithWords = describeDatabase dependentsScope db >>= \c@(Connected _ _ schema _ _) -> (c,) <$> routineWords schema
                 early <- if opts.compareWith == LiveDatabase || not (null opts.renames) then Just <$> async describeWithWords else pure Nothing
                 original <- timed "table.jjShow" $ jjShow root opts.base (makeRelative root absFile)
-                -- A file unchanged since --base has nothing to describe the database for.
                 described <- case early of
                     Just a -> pure (wait a)
                     Nothing
@@ -549,8 +523,6 @@ main =
                         | otherwise -> wait <$> async describeWithWords
                 when (opts.compareWith == LiveDatabase && not (null opts.renames)) $ failWith "--rename works with the file comparison, not --against-database"
                 let renameSql (old, new) = [i|alter table #{qualified table} rename column #{quoteIdent old} to #{quoteIdent new}|]
-                -- This branch's changes for the table, run after the file at --base, so that
-                -- a second run writes only what they don't cover yet.
                 branchChanges <-
                     if opts.compareWith == LiveDatabase
                         then pure []
@@ -573,11 +545,7 @@ main =
                 edit <- timed "table.compare1" $ compareTable conn baseline table statements
                 let columnAddress c = Address "table column" [table.schema, table.name, c] []
                     renamedFrom = Set.fromList [columnAddress old | (old, _) <- opts.renames]
-                -- A renamed column counts as dropped for finding what names it; nothing else sees that.
                 deps <- timed "table.dependentsIn" $ dependentsIn described (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom))
-                -- The PL/pgSQL functions and SQL functions with a string body that depend on the
-                -- edit or name it, checked before the edit and after it; an error that only the
-                -- edited table brings means the function breaks.
                 let definitionOf a = Map.lookup (ObjectKey Definition a) deps.dbSchema
                     routines = Set.toList (Set.filter (\a -> a.objectType `elem` ["function", "procedure"]) (fold deps.named <> fold deps.exact))
                     plpgsql = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE plpgsql" `T.isInfixOf` def]
@@ -587,7 +555,6 @@ main =
                         _ -> render a
                     bySignature = Map.fromList [(signature a, a) | a <- plpgsql <> sqlBodies]
                     check made = timed [i|table.bodyErrors n=#{Map.size bySignature}|] $ bodyErrors conn aside (qualified table) made (map signature plpgsql) (map signature sqlBodies)
-                    -- The rebuilt table has a new row type, so a call that passes its rows finds no function.
                     rowTypeCall message = "function " `T.isPrefixOf` message && any (\end -> (qualified table <> end) `T.isInfixOf` message) [")", ","]
                 checked <-
                     if null plpgsql && null sqlBodies
@@ -608,7 +575,6 @@ main =
                     typeIn s t c = case [ty | (QName s' t', c', _, ty) <- retyped, (s', t', c') == (s, t, c)] of
                         ty : _ -> Just ty
                         [] -> (.colType) . parseColumn <$> Map.lookup (ObjectKey Definition (Address "table column" [s, t, c] [])) deps.dbSchema
-                -- A foreign key on a retyped column has to be rebuilt with the new type.
                 foreignKeyBreaks <-
                     timed "table.foreignKeys" $ Map.fromListWith (<>) . catMaybes <$> for
                         [ (addr, k, types)
@@ -619,7 +585,6 @@ main =
                         , Just types <- [foreignKeyTypes typeIn k def]
                         ]
                         \(addr, k, types) -> fmap (\err -> (addr, [(k, err)])) <$> foreignKeyError conn types
-                -- Whether each type change rewrites the table, as PostgreSQL decides it.
                 typeFacts <-
                     timed "table.typeChangeFacts" $ Map.fromList . catMaybes <$> for retyped \(_, _, addr, newType) ->
                         case parseColumn <$> Map.lookup (ObjectKey Definition addr) edit.current of
@@ -681,7 +646,6 @@ main =
                     dropped addr = case Map.lookup (ObjectKey Definition addr) edit.changes of
                         Just (Dropped _) -> True
                         _ -> False
-                    -- DROP COLUMN also drops the table's indexes and constraints on the column.
                     goesWith d = d.objectType == "index" || (d.objectType == "table constraint" && take 2 d.objectNames == [table.schema, table.name])
                     listed = fold dependents <> fold mentions
                     overloaded = Map.keysSet (Map.filter (> (1 :: Int)) (Map.fromListWith (+) [((a.objectType, a.objectNames), 1) | a <- Set.toList listed]))
@@ -705,7 +669,6 @@ main =
                         ks -> "  cannot be rebuilt with the new type" : concat [[item k, detail err] | (k, err) <- ks]
                     isView d = d.objectType `elem` ["view", "materialized view"]
                     recreated addr d = d `Set.member` aroundOf addr || (d.objectType == "trigger" && any (\v -> isView v && v.objectNames == take 2 d.objectNames) (aroundOf addr))
-                    -- ALTER COLUMN TYPE rebuilds the column's indexes and constraints itself.
                     rebuiltWith d = d.objectType `elem` ["index", "table constraint", "sequence"]
                     usage =
                         concat
@@ -730,7 +693,6 @@ main =
                             <> Map.keys breaking
                             <> [k | ks <- Map.elems foreignKeyBreaks, (k, _) <- ks]
                 measure "table.planRender" (T.length (T.unlines (map renderStep steps <> usage)) + length blocking)
-                -- An object left alone takes its comment with it.
                 let leftAlone = Set.fromList [k.address | (k, _) <- edit.ignored, k.aspect == Definition]
                 for_ [(k, reason) | (k, reason) <- edit.ignored, not (k.aspect == Comment && k.address `Set.member` leftAlone)] \(k, reason) -> do
                     let name = render k.address <> if k.aspect == Privileges then " (privileges)" else ""
@@ -762,14 +724,11 @@ main =
                             withRenameBack u
                                 | any (`elem` renameSteps) u.deploy = u{revert = u.revert <> renameBack}
                                 | otherwise = u
-                            -- A new index gets kronor's <schema>/table/<table>/index/<name> change.
                             isIndex s = case s.object of Index _ -> True; _ -> False
                             written = map withRenameBack (units isIndex inverseCtx sqitchPlan now steps)
                             tagName = fromMaybe (defaultTag now) opts.tableTag
                             entries p = length (filter (== changeName) p.changes)
                             alreadyReworked = entries sqitchPlan > entries basePlan
-                        -- sqitch reverts the reworked change before the migrations, so its
-                        -- revert, the previous file, meets the edited table.
                         previous <- parse atBase original
                         oldFileFails <- timed "table.compare3" $ withEditedTable conn baseline table statements (pure ()) (const (firstFailure conn previous))
                         let baseRev = opts.base
@@ -777,11 +736,9 @@ main =
                             TIO.putStrLn [i|the file at #{baseRev} fails on the edited table (#{err}); the rework's revert does nothing and the migrations revert the table|]
                         timed "write.writeUnits" $ writeUnits root opts.top sqitchPlan tagName written
                         unless alreadyReworked do
-                            -- writeUnits may have added the tag already.
                             afterUnits <- readPlan (root </> opts.planPath)
                             timed "write.reworkEdited"
                                 $ reworkEdited root opts.top afterUnits tagName changeName [i|schema-diff: #{changeName} as edited|] original (maybe PreviousFileRuns (const PreviousFileFails) oldFileFails)
-                        -- The table's rework comes after its migrations in the plan.
                         when alreadyReworked $ moveToEnd (root </> opts.planPath) changeName
                         for_ written \u -> let name = u.changeName in TIO.putStrLn [i|added #{name}|]
                         TIO.putStrLn

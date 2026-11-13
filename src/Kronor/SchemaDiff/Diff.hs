@@ -41,8 +41,7 @@ diff same =
 
 
 -- | For each dropped or changed definition, the objects in @known@ that depend on it,
--- directly or through others, and are not part of the diff themselves. Edges and
--- @known@ come from the database being changed.
+-- directly or through others, and are not in the diff themselves.
 affected :: Set Address -> [Edge] -> Map ObjectKey Change -> Map Address (Set Address)
 affected known edges changes =
     Map.filter (not . Set.null)
@@ -99,9 +98,8 @@ wordsOf = HS.fromList . filter (not . T.null) . T.split (not . identifierChar)
     identifierChar c = isAlphaNum c || c == '_' || c == '$'
 
 
--- | Who depends on an object, by the edges given, where a relation also counts what
--- depends on its columns: a view depends on the columns it reads, and its body reads
--- the relation.
+-- | Who depends on an object by the edges given; a relation also counts what depends on
+-- its columns.
 dependentsBy :: [Edge] -> Address -> [Address]
 dependentsBy edges = \addr -> direct addr <> concatMap direct (columnsOf addr)
   where
@@ -124,16 +122,8 @@ reachedFrom dependents starts = go Set.empty (Set.fromList (concatMap dependents
              in go seen' (Set.fromList (concatMap dependents (Set.toList frontier)) `Set.difference` seen')
 
 
--- | Of @functions@ (each with its address, definition and trigger table), those whose
--- body edges 'affected' can follow from @starts@, given who depends on what so far. A
--- body edge matters only when it points into the closure of @starts@. plpgsql_check
--- reports the objects a body names, and those the rewriter adds for them: a view's
--- tables and functions, a column default's function. Each of those is named in the body
--- or depended on by an object that is, which is then reached too, so a function matters
--- only when its definition names a reached object, or it is a trigger function of a
--- table in the closure. A changed column, constraint, index, trigger or policy is never
--- a body's target, so its table's name counts only once something it depends on is in
--- the closure. Operators are matched by their symbol anywhere in the definition.
+-- | Of @functions@, those whose body edges 'affected' can follow from @starts@: their
+-- definition names a reached object, or they are a trigger function on the closure.
 bodiesToAnalyse :: (Address -> [Address]) -> Set Address -> [(a, Address, BodyText, Maybe Address)] -> [a]
 bodiesToAnalyse dependents starts functions =
     [f | (f, _, def, trigger) <- functions, named def || maybe False (`Set.member` closure) trigger]

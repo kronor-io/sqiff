@@ -25,7 +25,6 @@ timed label action =
             end <- Clock.getMonotonicTimeNSec
             let ms :: Word64 -> String
                 ms n = printf "%.1f" (fromIntegral n / 1e6 :: Double)
-            -- One write per line, so lines from several threads do not interleave.
             hPut stderr (encodeUtf8 [i|timing\t#{label}\t#{ms start}\t#{ms (end - start)}\n|])
             pure result
 

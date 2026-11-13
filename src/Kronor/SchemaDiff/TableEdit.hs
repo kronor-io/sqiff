@@ -3,9 +3,8 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
--- | Compares the table a deploy file creates before and after an edit, or the live table
--- with what the edited file creates. Runs in a transaction that is always rolled back,
--- with the live table moved aside so the file can create the table under its own name.
+-- | Compares the table a deploy file creates with the one before the edit, or with the
+-- live table, in a transaction that is always rolled back.
 module Kronor.SchemaDiff.TableEdit (
     TableEdit (..),
     Baseline (..),
@@ -138,7 +137,6 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             exists <- script' [i|select 1 from pg_class where oid = to_regclass(#{literal (qualified table)})|]
             unless exists $ failWith [i|#{qualified table} does not exist yet; a new table only needs its own change|]
             beforeResult <- timed "tableEdit.before" beforeEdit
-            -- Owned sequences would move with the table; the ones the files name stay.
             owned <-
                 Connection.use conn (Session.statement () ownedSequences)
                     >>= either setupFailed pure
@@ -237,7 +235,6 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
         Sequence _ -> False
         o -> owningTable o == Just q
 
-    -- Row-level security and storage options may be set outside the table's file.
     keepSettings current k def = case (fromAddress k.address, k.aspect, Map.lookup k current) of
         (Table _, Definition, Just old) ->
             let settings = filter (\l -> l `elem` ["row level security", "force row level security"] || "with (" `T.isPrefixOf` l) (T.lines old)
@@ -246,8 +243,6 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
              in T.intercalate "\n" (T.lines def <> filter (\l -> not ("with (" `T.isPrefixOf` l && hasOptions)) missing)
         _ -> def
 
-    -- Against the live table: kronor keeps grants, triggers, policies and many indexes in
-    -- other files, and migrations sometimes add columns and constraints a table file never got.
     leftOut k c
         | BaseFile _ <- baseline = Nothing
         | k.aspect == Privileges = Just "grants are kept outside table files"

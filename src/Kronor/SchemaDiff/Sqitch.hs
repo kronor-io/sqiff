@@ -97,10 +97,8 @@ parsePlan text =
             }
 
 
--- | Groups ordered steps into changes: new objects at their conventional paths,
--- reworks of changes the plan already has, and time-stamped migrations for the rest.
--- Consecutive steps on the same table that can share a transaction share a change.
--- Only steps that pass @conventional@ get a conventional path; the rest go into migrations.
+-- | Groups ordered steps into changes: conventional paths for steps that pass
+-- @conventional@, reworks of changes the plan has, and migrations for the rest.
 units :: (Step -> Bool) -> Context -> SqitchPlan -> UTCTime -> [Step] -> [Unit]
 units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (claimReverts Set.empty (foldr (merge . single) [] steps))
   where
@@ -130,7 +128,6 @@ units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (
             inverse = map refill (concat [recipe inverseCtx k (invert c) | k <- reverse keys, Just c <- [lookup k [(s.key, s.change) | s <- u.deploy]]])
          in u{revert = if u.kind == ReworkChange then [] else inverse} : claimReverts (claimed <> Set.fromList keys) rest
 
-    -- A dropped not null column without a default can only come back nullable: its values are gone.
     refill s
         | Column t c <- s.object
         , Added def <- s.change
@@ -155,7 +152,6 @@ units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (
              in u{changeName = [S.i|migrations/#{stamp}-#{slugged}|], note = [S.i|#{template}: #{description}|]} : nameMigrations (i + 1) rest
         | otherwise = u : nameMigrations i rest
 
-    -- The words create-migration uses for the same change.
     describe u = case shapeOf u of
         AddColumnShape t c _ -> let table = dotted t in [S.i|add column #{table}.#{c}|]
         ValidateShape t c -> let table = dotted t in [S.i|validate constraint #{table}.#{c}|]
@@ -301,7 +297,6 @@ renderScript header placement steps =
     statement sql s =
         T.intercalate "\n" (map ("-- " <>) (hazardNotes s) <> [tidy s sql <> if "--" `T.isPrefixOf` sql then "" else ";"])
     indent = T.intercalate "\n" . map (\l -> if T.null l then l else "  " <> l) . T.lines
-    -- Indenting inside a string or a dollar-quoted body would change its text.
     safeToIndent sql = not ("$" `T.isInfixOf` sql) && all (even . T.count "'") (T.lines sql)
     tidy s sql = case T.lines sql of
         [l]
@@ -381,15 +376,13 @@ tidyIndex line
     tail' = [(" INCLUDE (", " include ("), (" NULLS NOT DISTINCT", " nulls not distinct"), (" WITH (", " with ("), (" WHERE ", " where ")]
 
 
--- | A verify script that checks what a migration's statements leave behind: columns,
--- constraints, indexes, policies, triggers and views exist or are gone, and retyped
--- columns have their new type. It reads only the catalog.
+-- | A verify script that checks in the catalog what a migration's statements leave
+-- behind.
 verifyScript :: Text -> [Step] -> Text
 verifyScript header steps =
     T.intercalate "\n\n" ([header, "BEGIN;"] <> map ("    " <>) selects <> doBlock <> ["ROLLBACK;"]) <> "\n"
   where
     final = Map.elems (Map.fromList [(s.object, s) | s <- steps, s.key.aspect == Definition])
-    -- A changed object's drop phase removes the old version; its create phase brings the new one.
     gone :: Step -> Bool
     gone s = case s.change of
         Dropped _ -> True
@@ -416,7 +409,6 @@ verifyScript header steps =
                 [ let message = sqlLiteral [S.i|#{c} is not #{ty}|]
                    in [S.i|assert (select atttypid from pg_attribute where attrelid = #{reg t} and attname = #{sqlLiteral c}) = #{sqlLiteral ty}::regtype, #{message};|]
                 ]
-        -- A new key's index is built in a change before the one that attaches it.
         TableConstraint t c | "create unique index " `T.isInfixOf` T.toLower s.sql -> [relation s (QName t.schema c)]
         TableConstraint t c -> [presence s [S.i|select from pg_constraint where conrelid = #{reg t} and conname = #{sqlLiteral c}|] [S.i|constraint #{c} on #{qualified t}|]]
         Policy t n -> [presence s [S.i|select from pg_policy where polrelid = #{reg t} and polname = #{sqlLiteral n}|] [S.i|policy #{n} on #{qualified t}|]]
@@ -451,8 +443,7 @@ sqlLiteral :: Text -> Text
 sqlLiteral t = let escaped = T.replace "'" "''" t in [S.i|'#{escaped}'|]
 
 
--- | Moves the last plan entry for @name@ to the end of the plan, after the changes added
--- since. Only for an entry the branch added, since moving a line changes the ids below it.
+-- | Moves the last plan entry for @name@, one the branch added, to the end of the plan.
 moveToEnd :: FilePath -> Text -> IO ()
 moveToEnd path name = do
     text <- readFileUtf8 path
@@ -469,10 +460,8 @@ requireSqitch = do
     when (isNothing found) $ failWith "sqitch is not on PATH; load the nix environment (direnv) in this shell first"
 
 
--- | Adds a tag first when a rework needs one, then each change with @sqitch add@ or
--- @sqitch rework@, and fills in the scripts sqitch created. When the project has
--- create-migration's templates, a new change is added from the template create-migration
--- would use, and keeps the scripts that template writes in full.
+-- | Writes each change with @sqitch add@ or @sqitch rework@, from create-migration's
+-- template where the project has one, adding a tag first when a rework needs one.
 writeUnits :: FilePath -> FilePath -> SqitchPlan -> Text -> [Unit] -> IO ()
 writeUnits root topDir sqitchPlan tag us = do
     requireSqitch
@@ -499,8 +488,6 @@ writeUnits root topDir sqitchPlan tag us = do
                     . T.replace "\nalter table " [S.i|\n#{hazards}alter table |]
                     $ rendered
             (Just (_, vars), AddIndexShape t ix)
-                -- A partitioned index has no row in pg_stat_user_indexes and can't be
-                -- dropped concurrently, so the template's revert and verify don't fit it.
                 | any (\s -> EveryPartition `elem` s.hazards) u.deploy -> do
                     deploy >> revert
                     writeFileUtf8 (scriptPath "verify" u) (verifyScript [S.i|-- Verify #{project}:#{name} on pg|] u.deploy)
@@ -525,9 +512,8 @@ writeUnits root topDir sqitchPlan tag us = do
         | otherwise = writeFileUtf8 (scriptPath dir u) (renderScript header u.placement steps)
 
 
--- | Reworks a change whose deploy script was already edited in place: puts back @original@
--- for sqitch to snapshot, reworks, then restores the edit whatever happens. With
--- 'PreviousFileFails' the reworked change's revert does nothing.
+-- | Reworks a change whose deploy script was already edited in place, putting the edit
+-- back whatever happens; with 'PreviousFileFails' its revert does nothing.
 reworkEdited :: FilePath -> FilePath -> SqitchPlan -> Text -> Text -> Text -> Text -> PreviousFile -> IO ()
 reworkEdited root topDir sqitchPlan tag changeName note original previousFile = do
     let path = root </> topDir </> "deploy" </> T.unpack changeName <.> "sql"

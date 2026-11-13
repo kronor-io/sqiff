@@ -3,9 +3,8 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
--- | Functions with SQL-standard bodies keep no source text, and their printed text does
--- not always parse back or print back the same. Each is recreated from it in a rolled-back
--- transaction to find out.
+-- | Recreates functions with SQL-standard bodies from their printed text in rolled-back
+-- transactions, to see whether that text parses and prints back the same.
 module Kronor.SchemaDiff.Body (
     BodyCheck (..),
     checkBodies,
@@ -37,9 +36,8 @@ data BodyCheck
     deriving stock (Eq, Show)
 
 
--- | Checks every function in @schema@ that has a SQL-standard body. Runs DDL in rolled-back
--- transactions, so it needs a database that accepts writes; on one that does not, every
--- check ends in 'DoesNotParse' with the server's reason.
+-- | Checks every function in @schema@ that has a SQL-standard body; needs a database
+-- that accepts writes.
 checkBodies :: Connection.Connection -> Map ObjectKey Text -> IO (Map ObjectKey BodyCheck)
 checkBodies conn schema = qualifiedNames conn do
     candidates <-

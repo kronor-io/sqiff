@@ -16,9 +16,8 @@ data Mode = Plain | Single | Escaped | Double | Dollar String | LineComment | Bl
     deriving stock (Eq)
 
 
--- | Statements without their terminating semicolon. Semicolons inside quotes, dollar
--- quotes, comments and @BEGIN ATOMIC … END@ bodies do not split. Skips psql meta-commands
--- that only affect psql's output and refuses the rest.
+-- | Statements without their terminating semicolon, skipping psql meta-commands that only
+-- affect psql's output and refusing the rest.
 splitStatements :: Text -> Either Text [Text]
 splitStatements = go Plain "" False "" Nothing 0 [] . T.unpack
   where
@@ -76,11 +75,8 @@ splitStatements = go Plain "" False "" Nothing 0 [] . T.unpack
 
     isWordChar c = isAlphaNum c || c == '_'
 
-    -- Meta-commands that only change psql's own output, safe to leave out. @\\set@ and
-    -- @\\unset@ are too when they name one of psql's own upper-case variables.
     outputOnly = ["pset", "o", "out", "echo", "qecho", "timing", "x"]
 
-    -- The tag after the opening @$@, including the closing @$@.
     dollarTag more = case span isWordChar more of
         (tag, '$' : _) | maybe True (not . isDigit) (listToMaybe tag) -> Just (tag <> "$")
         _ -> Nothing

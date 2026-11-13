@@ -166,8 +166,6 @@ describeOn conns excluded partitions onlyTable = do
     parts <- concat <$> forConcurrently conns (\conn -> qualifiedNames conn (worker conn))
     (,) <$> evaluate (Map.unions (map fst parts)) <*> evaluate (Map.unions (map snd parts))
   where
-    -- The slowest queries go first, each in two halves by object id, so that no single
-    -- query holds up the others.
     ordered =
         concat [[(q, Just 0), (q, Just 1)] | q <- byName slowest]
             <> [(q, Nothing) | q <- byName middling <> [q | q@(f, _) <- describeQueries, takeBaseName f `notElem` (slowest <> middling)]]
@@ -175,8 +173,6 @@ describeOn conns excluded partitions onlyTable = do
     middling = ["constraint", "index", "relation"]
     byName names = [q | n <- names, q@(f, _) <- describeQueries, takeBaseName f == n]
 
-    -- The rows are evaluated here, in the thread that decoded them: the callers read the
-    -- results from several threads at once.
     describeOne conn ((file, body), half) = timed [i|describeQuery #{takeBaseName file} #{maybe "" show half}|] do
         rows <-
             run conn (excluded, partitions == IncludePartitions, onlyTable, half)
@@ -190,7 +186,6 @@ describeOn conns excluded partitions onlyTable = do
             <$> evaluate (Map.fromList [(ObjectKey objectAspect addr, def) | (_, addr, def) <- rows])
             <*> evaluate (Map.fromList [(ids, addr) | (ids, addr, _) <- rows])
 
-    -- Each query returns its objects' ids, the table they belong to as relid, and their definition.
     wrap body =
         [i|
             with o as (
@@ -277,8 +272,8 @@ edgesBetween addresses pairs =
     [Edge a b | (x, y) <- pairs, Just a <- [Map.lookup x addresses], Just b <- [Map.lookup y addresses]]
 
 
--- | Runs @action@ with an empty @search_path@, so that names printed by the catalog
--- functions are schema-qualified whatever the session's path is.
+-- | Runs @action@ with an empty @search_path@, which schema-qualifies the names the catalog
+-- functions print.
 qualifiedNames :: Connection.Connection -> IO a -> IO a
 qualifiedNames conn action = do
     previous <- run conn () (Statement.unpreparable "select current_setting('search_path')" mempty (D.singleRow textColumn))
@@ -296,10 +291,8 @@ type Skipped = [(Text, Text)]
 type BodyUses = ([(CatalogId, CatalogId)], Skipped)
 
 
--- | What PL/pgSQL bodies use, from plpgsql_check, as catalog ids for 'edgesBetween';
--- 'Nothing' when it is not installed. With @only@, analyses just the functions with those
--- oids. Each connection takes the next few functions until none are left, the slowest
--- first, so one slow function does not hold up the others.
+-- | What PL/pgSQL bodies use, as catalog ids, for the functions in @only@ or all of them;
+-- 'Nothing' when plpgsql_check is not installed.
 bodyUses :: NonEmpty Connection.Connection -> [Text] -> Maybe (Set Int64) -> IO (Maybe Text) -> IO (Maybe BodyUses)
 bodyUses conns@(conn :| _) excluded only madeTempTables =
     plpgsqlFunctions conn excluded >>= traverse \fs -> do
@@ -308,9 +301,8 @@ bodyUses conns@(conn :| _) excluded only madeTempTables =
         pure (uses, fs.unchecked <> failed)
 
 
--- | The statements temp_tables.sql runs on a connection that has no temp tables, to make
--- the same tables on others; empty when it fails or plpgsql_check is not installed. Runs
--- in a transaction that is rolled back.
+-- | The statements temp_tables.sql runs on a connection without temp tables; empty when
+-- it fails or plpgsql_check is not installed.
 tempTableStatements :: Connection.Connection -> IO Text
 tempTableStatements conn =
     timed "tempTableStatements"
@@ -337,9 +329,8 @@ data PlFunction = PlFunction
     }
 
 
--- | The PL/pgSQL functions to analyse, and the ones that cannot be. @implicit@ holds
--- the functions behind user-defined casts and operators: plpgsql_check reports a body
--- that uses one as using the function, though the body never names it.
+-- | The PL/pgSQL functions to analyse, the ones that cannot be, and the functions behind
+-- user-defined casts and operators.
 data PlFunctions = PlFunctions
     { query :: Text
     , tempTables :: IO Text
@@ -371,12 +362,10 @@ plpgsqlFunctions conn excluded =
 
 
 -- | What the bodies of @functions@ use, and the ones plpgsql_check failed on, in the
--- order of @fs@. Each connection takes the next few functions until none are left, the
--- slowest first, so one slow function does not hold up the others.
+-- order of @fs@, the slowest analysed first.
 analyseBodies :: NonEmpty Connection.Connection -> PlFunctions -> [PlFunction] -> IO BodyUses
 analyseBodies conns fs functions = do
     let
-        -- The slowest go first, each on its own, while the rest share the other connections.
         (slow, fast) = L.partition ((> 0) . (.cost)) functions
     queue <- newIORef (map pure (L.sortOn (Down . (.cost)) slow) <> chunks fast)
     let next = atomicModifyIORef' queue \case
@@ -384,7 +373,6 @@ analyseBodies conns fs functions = do
             b : rest -> (rest, Just b)
         batch c b = let firstName = maybe "" (\f -> f.name) (listToMaybe b) in (:) <$> timed [i|analyse.batch n=#{length b} first=#{firstName}|] (inBatches c fs.query b) <*> work c
         work c = next >>= maybe (pure []) (batch c)
-        -- A connection makes the temp tables once it has a batch to analyse.
         worker c =
             next >>= \case
                 Nothing -> pure []
@@ -402,7 +390,6 @@ analyseBodies conns fs functions = do
 
     batchSize = 16
 
-    -- One query for all functions; a batch that fails is split until the failing functions stand alone.
     inBatches _ _ [] = pure ([], [])
     inBatches c query batch =
         Connection.use c (Session.statement batch (Statement.unpreparable query dependParams (D.rowList useRow)))
@@ -423,7 +410,6 @@ analyseBodies conns fs functions = do
 
     useRow = (,,) <$> int8Column <*> int8Column <*> int8Column
 
-    -- pg_proc's own oid, which is fixed.
     pgProc = 1255
 
 
@@ -435,12 +421,8 @@ render addr = addr.objectType <> " " <> T.intercalate "." addr.objectNames <> ar
         | otherwise = let list = T.intercalate ", " addr.objectArgs in [i|(#{list})|]
 
 
--- | plpgsql_check's errors, as (function, line, message), for the functions with these
--- signatures, inside the transaction @conn@ is in; 'Nothing' when plpgsql_check is not
--- installed. A trigger function is checked against its first trigger's table, or against
--- @table@ when that trigger's table has been moved aside under @aside@. The temp tables
--- are made by the statements @made@ gives, from 'tempTableStatements', or by
--- temp_tables.sql when it gives none.
+-- | plpgsql_check's errors, as (function, line, message), for these signatures in the
+-- transaction @conn@ is in; 'Nothing' when plpgsql_check is not installed.
 bodyErrors :: Connection.Connection -> Text -> Text -> IO (Maybe Text) -> [Text] -> [Text] -> IO (Maybe (Set (Text, Int32, Text)))
 bodyErrors conn aside table made signatures sqlSignatures =
     run conn () (Statement.unpreparable "select extnamespace::regnamespace::text from pg_extension where extname = 'plpgsql_check'" mempty (D.rowMaybe textColumn))
@@ -448,21 +430,17 @@ bodyErrors conn aside table made signatures sqlSignatures =
             tempTables <- made >>= maybe (pure (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))) pure
             _ <- timed "bodyErrors.tempTables" $ guarded (Connection.use conn (Session.script tempTables))
             plErrors <- for (chunks signatures) (timed "bodyErrors.batch" . inBatches extSchema)
-            -- A SQL function with a string body is parsed again by its language's validator.
             sqlErrors <- for sqlSignatures \signature ->
                 either (\e -> [(signature, 0, errorText e)]) (const [])
                     <$> timed ("bodyErrors.sql " <> signature) (guarded (Connection.use conn (Session.statement signature (Statement.unpreparable validate (E.param (E.nonNullable E.text)) (D.singleRow (D.column (D.nullable D.text)))))))
             pure (Set.fromList (concat (plErrors <> sqlErrors)))
   where
-    -- Selecting the void result keeps the planner from skipping the call.
     validate = "select pg_catalog.fmgr_sql_validator(to_regprocedure($1))::text"
     guarded action = do
         _ <- Connection.use conn (Session.script "savepoint schema_diff_check")
         result <- action
         _ <- Connection.use conn (Session.script (either (const "rollback to savepoint schema_diff_check") (const "release savepoint schema_diff_check") result))
         pure result
-    -- One statement for several functions; a batch that fails is split until the failing
-    -- functions stand alone, and those report nothing.
     inBatches _ [] = pure []
     inBatches extSchema batch =
         guarded (Connection.use conn (Session.statement (batch, table) (Statement.unpreparable (query extSchema) params decoder))) >>= \case

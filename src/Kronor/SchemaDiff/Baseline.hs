@@ -3,9 +3,8 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
--- | A scratch PostgreSQL holding the schema a revision's sqitch plan produces. It runs
--- the repository's own @postgres@ service from a jj workspace at that revision, in a
--- Docker Compose project of its own.
+-- | A scratch PostgreSQL holding the schema a revision's sqitch plan produces, run from a
+-- jj workspace at that revision.
 module Kronor.SchemaDiff.Baseline (ensureBaseline) where
 
 import Data.String.Interpolate (i)
@@ -172,9 +171,8 @@ composeProc :: Paths -> [String] -> ProcessConfig () () ()
 composeProc p args = proc "docker" (["compose", "-p", T.unpack composeProject, "-f", p.checkout </> "docker-compose.yaml"] <> args)
 
 
--- | The caller's environment with the baseline's port and without a dev slot's compose
--- settings. pg_partman's background worker is off, as in CI, so its maintenance does not
--- take locks that the deploy then times out on.
+-- | The caller's environment with the baseline's port, without a dev slot's compose
+-- settings, and with pg_partman's background worker off.
 composeEnv :: IO [(String, String)]
 composeEnv = do
     env <- getEnvironment

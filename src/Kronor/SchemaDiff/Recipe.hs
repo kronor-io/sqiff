@@ -216,7 +216,6 @@ definition ctx key object change = case object of
     onEveryPartition s
         | any (`elem` [DeletesData, MayRewriteTable, LongLock]) s.hazards = s{hazards = s.hazards <> [EveryPartition]}
         | otherwise = s
-    -- A definition that names a column the edit drops or retypes has to go before it.
     namesAlteredColumn t = namesAlteredColumnOf (== t)
     namesAlteredColumnOf onTable def =
         let names = Set.fromList (T.split (\ch -> not (isAlphaNum ch || ch == '_')) def)
@@ -368,7 +367,6 @@ begin
     #{grantAcl (literal serialName)}
 end $$|]
         serialOf = [i|pg_get_serial_sequence(#{tableLit}, #{columnLit})|] :: Text
-        -- Gives the new sequence the grants the old one had, apart from its owner's.
         grantAcl :: Text -> Text
         grantAcl target =
             [i|execute coalesce((select string_agg(format('grant %s on sequence %s to %s', x.privilege_type, #{target}, case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end), '; ') from aclexplode(acl) x where x.grantee <> x.grantor), 'select');|]
