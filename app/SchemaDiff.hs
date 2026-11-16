@@ -7,6 +7,7 @@
 module SchemaDiff (main) where
 
 import Data.Algorithm.Diff (PolyDiff (..), getDiff)
+import Data.Char (isAlphaNum)
 import Data.String.Interpolate (i)
 import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime, defaultTimeLocale, formatTime, getCurrentTime)
@@ -22,8 +23,8 @@ import Kronor.SchemaDiff.Plan (context, invert, plan, planWith, renderStep, topo
 import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), parseColumn, recipe, referencedTable, revokeGranted)
 import Kronor.SchemaDiff.Rewrite (Rewrite (..), fileDrift, rewriteFile)
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
-import Kronor.SchemaDiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), moveToEnd, parsePlan, readPlan, requireSqitch, reworkEdited, units, writeUnits)
-import Kronor.SchemaDiff.TableEdit (Baseline (..), Drops (..), TableEdit (..), aside, columnOrder, compareTable, firstFailure, foreignKeyError, typeChangeFacts, withEditedTable)
+import Kronor.SchemaDiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), deployedChanges, moveToEnd, parsePlan, plannedChanges, readPlan, requireSqitch, reworkEdited, units, writeUnits)
+import Kronor.SchemaDiff.TableEdit (Baseline (..), Drops (..), Live (..), TableEdit (..), aside, columnOrder, compareTable, firstFailure, foreignKeyError, typeChangeFacts, withEditedTable)
 import Kronor.SchemaDiff.Timing (measure, timed)
 import Options.Applicative qualified as O
 import RIO
@@ -425,6 +426,7 @@ data TableOptions = TableOptions
     , renames :: [(Text, Text)]
     , sameTypeSwap :: SameTypeSwap
     , fileMode :: FileMode
+    , liveFrom :: Maybe Text
     }
 
 
@@ -598,9 +600,18 @@ rewriteFromDatabase = do
     unless (null opts.renames) $ failWith "--rename works with the file comparison, not --rewrite-file"
     current <- readFileUtf8 env.file
     conn <- liftIO (connect =<< resolveDb env.db)
-    order <- liftIO (columnOrder conn table)
-    when (null order) $ failWith [i|#{qualified table} is not in the database; there is nothing to rewrite the file from|]
-    edit <- timed "rewrite.compare" $ liftIO (compareTable conn (LiveTable ReportDrops) table env.statements)
+    (live, liveConn) <- case opts.liveFrom of
+        Nothing -> pure (SameDatabase, conn)
+        Just name -> liftIO $ (\c -> (OtherDatabase c, c)) <$> (connect =<< resolveDb name)
+    let liveDb = fromMaybe env.db opts.liveFrom
+    order <- liftIO (columnOrder liveConn table)
+    when (null order) $ failWith [i|#{qualified table} is not in #{liveDb}; there is nothing to rewrite the file from|]
+    for_ opts.liveFrom \_ -> do
+        pending <- undeployedTouching liveConn
+        let n = length pending
+            names = T.intercalate ", " pending
+        unless (null pending) $ failWith [i|#{liveDb} has not deployed #{n} planned changes that touch #{qualified table}, and a rewrite from it would undo them: #{names}|]
+    edit <- timed "rewrite.compare" $ liftIO (compareTable conn (LiveTable live ReportDrops) table env.statements)
     ownFiles <-
         fmap Set.fromList . filterM (\n -> doesFileExist (deployDir </> T.unpack table.schema </> "table" </> T.unpack table.name </> "index" </> T.unpack n <.> "sql"))
             $ [n | k <- Map.keys edit.current, Index q <- [fromAddress k.address], let n = q.name]
@@ -611,7 +622,7 @@ rewriteFromDatabase = do
             then pure (fileDrift ownFiles edit.desired edit.current)
             else do
                 rewritten <- parseFile env.file " as rewritten" rewrite.text
-                check <- timed "rewrite.check" $ liftIO (compareTable conn (LiveTable ReportDrops) table rewritten)
+                check <- timed "rewrite.check" $ liftIO (compareTable conn (LiveTable live ReportDrops) table rewritten)
                 pure (fileDrift ownFiles check.desired check.current)
     let still = [render k.address <> (if k.aspect == Comment then " (comment)" else "") | k <- Map.keys remaining]
     for_ still \s -> liftIO (TIO.hPutStrLn stderr [i|-- still differs: #{s}|])
@@ -638,6 +649,46 @@ rewriteFromDatabase = do
                     else do
                         liftIO $ reworkEdited env.root opts.top sqitchPlan tagName changeName [i|schema-diff: #{changeName} as the database has it|] current PreviousFileRuns
                         say [i|rewrote and reworked #{changeName}|]
+
+
+-- | The planned changes @live@'s sqitch registry lacks whose deploy scripts name the table.
+undeployedTouching :: Connection.Connection -> RIO TableEnv [Text]
+undeployedTouching live = do
+    env <- ask
+    let opts = env.opts
+        deployDir = env.root </> opts.top </> "deploy"
+        needle = T.toLower (qualified env.table)
+        changesTable text = any (changesTableIn needle) (either (const [text]) id (splitStatements text))
+        script name = let path = deployDir </> T.unpack name <.> "sql" in doesFileExist path >>= bool (pure "") (readFileUtf8 path)
+    planText <- readFileUtf8 (env.root </> opts.planPath)
+    deployed <- liftIO (deployedChanges live (parsePlan planText).project)
+    when (Set.null deployed) $ failWith "the live database's sqitch registry has no changes of this project"
+    let pending = nubOrd [name | c@(name, _) <- plannedChanges planText, c `Set.notMember` deployed]
+    filterM (fmap changesTable . script) pending
+
+
+-- | Whether @statement@ changes the table @needle@ (lower-case, qualified): creates or alters
+-- it, or creates or comments on something of its own. A do block counts if it names the table.
+changesTableIn :: Text -> Text -> Bool
+changesTableIn needle statement = case ws of
+    "alter" : "table" : rest -> target (dropWhile (`elem` ["if", "exists", "only"]) rest)
+    "comment" : "on" : "column" : n : _ -> T.dropWhileEnd (/= '.') (bare n) == needle <> "."
+    "comment" : "on" : "table" : rest -> target rest
+    "comment" : "on" : _ -> afterOn
+    "create" : rest
+        | any (`elem` ["function", "procedure", "view", "materialized"]) (take 3 rest) -> False
+        | "table" `elem` take 3 rest -> target (dropWhile (`elem` ["if", "not", "exists"]) (drop 1 (dropWhile (/= "table") rest)))
+        | otherwise -> afterOn
+    "do" : _ -> named
+    _ -> False
+  where
+    ws = T.words (T.toLower (withoutLeadingComments statement))
+    bare = T.takeWhile (`notElem` ("(;," :: String))
+    target = \case
+        n : _ -> bare n == needle
+        [] -> False
+    afterOn = target (dropWhile (== "only") (drop 1 (dropWhile (/= "on") ws)))
+    named = any (\(_, rest) -> maybe True (\(c, _) -> not (isAlphaNum c || c == '_')) (T.uncons (T.drop (T.length needle) rest))) (TP.breakOnAll needle (T.toLower statement))
 
 
 -- | The project root, the file's absolute path, its sqitch change and its table.
@@ -682,6 +733,7 @@ compareAndReport described = do
     let opts = env.opts
         table = env.table
     when (opts.compareWith == LiveDatabase && not (null opts.renames)) $ failWith "--rename works with the file comparison, not --against-database"
+    when (isJust opts.liveFrom) $ failWith "--live-from works with --rewrite-file"
     branchChanges <- branchChangesFor
     let branchStatements = concatMap snd branchChanges
         normalised = T.toLower . T.unwords . T.words . T.dropWhileEnd (== ';') . T.strip . withoutLeadingComments
@@ -689,7 +741,7 @@ compareAndReport described = do
     for_ branchChanges \(n, _) -> say [i|-- already on this branch: #{n}|]
     baseline <-
         if opts.compareWith == LiveDatabase
-            then pure (LiveTable opts.drops)
+            then pure (LiveTable SameDatabase opts.drops)
             else BaseFile . (<> (branchStatements <> map (renameSql table) pendingRenames)) <$> parseFile env.file (atBase opts) env.original
     conn <- timed "table.connect" $ liftIO (connect =<< resolveDb env.db)
     edit <- timed "table.compare1" $ liftIO (compareTable conn baseline table env.statements)
@@ -1037,6 +1089,7 @@ commandParser =
                     <*> O.many (O.option (O.eitherReader renameArg) (O.long "rename" <> O.metavar "OLD:NEW" <> O.help "Column OLD is renamed to NEW; repeat for more columns"))
                     <*> O.flag AskIfRename DropAndAdd (O.long "drop-and-add" <> O.help "A column dropped and one added with the same type are not a rename")
                     <*> O.flag MigrateToFile RewriteFromDatabase (O.long "rewrite-file" <> O.help "Print the file rewritten to create the table as --db has it; with --write, write it and rework the change")
+                    <*> O.optional (O.strOption (O.long "live-from" <> O.metavar "CONNINFO|local" <> O.help "With --rewrite-file, read the table from this database, read-only, instead of --db; --db still builds the file"))
                 )
     renameArg s = case T.split (== ':') (T.pack s) of
         [old, new] | not (T.null old), not (T.null new) -> Right (old, new)

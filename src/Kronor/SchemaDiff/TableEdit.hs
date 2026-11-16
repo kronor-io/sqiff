@@ -8,6 +8,7 @@
 module Kronor.SchemaDiff.TableEdit (
     TableEdit (..),
     Baseline (..),
+    Live (..),
     Drops (..),
     compareTable,
     compareTableWith,
@@ -125,7 +126,14 @@ data Baseline
       -- database cancels out, and everything the edit removes is meant.
       BaseFile [Text]
     | -- | The table as it is.
-      LiveTable Drops
+      LiveTable Live Drops
+
+
+-- | Where the live table is read.
+data Live
+    = SameDatabase
+    | -- | Another database, read-only; the file is still built in the comparison's database.
+      OtherDatabase Connection.Connection
 
 
 -- | What happens to columns and constraints the live table has and the file does not.
@@ -178,9 +186,12 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
                     built <- build xact "before the edit" base
                     script "rollback to savepoint schema_diff_base"
                     pure built
-                LiveTable _ -> do
+                LiveTable SameDatabase _ -> do
                     schema <- describeTable (QName aside table.name)
                     pure (Map.fromList [(moveBack k, restore def) | (k, def) <- Map.toList schema, belongsTo (QName aside table.name) k def])
+                LiveTable (OtherDatabase other) _ -> do
+                    schema <- timed "tableEdit.describeOther" $ fst <$> describeOn [other] [] SkipPartitions (Just (qualified table))
+                    pure (Map.filterWithKey (belongsTo table) schema)
             desired <- timed "tableEdit.desired" $ build xact "as edited" statements
             afterResult <- timed "tableEdit.after" $ afterEdit beforeResult
             pure (current, desired, afterResult)
@@ -204,7 +215,7 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
 
     baseStatements = case baseline of
         BaseFile base -> base
-        LiveTable _ -> []
+        LiveTable _ _ -> []
 
     build :: Text -> Text -> [Text] -> IO Schema
     build xact label stmts = do
@@ -280,5 +291,5 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             (Index _, Dropped _) -> Just "not in the file; indexes are often kept in their own files"
             (Trigger _ _, Dropped _) -> Just "not in the file; triggers are kept in their own files"
             (Policy _ _, Dropped _) -> Just "not in the file; policies may be kept in other files"
-            (_, Dropped _) | LiveTable ReportDrops <- baseline -> Just "in the database but not in the file; --allow-drops drops it"
+            (_, Dropped _) | LiveTable _ ReportDrops <- baseline -> Just "in the database but not in the file; --allow-drops drops it"
             _ -> Nothing
