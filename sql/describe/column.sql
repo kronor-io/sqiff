@@ -12,7 +12,22 @@ select
                 'not null'
                 || case when nn.convalidated then '' else ' not valid' end
                 || case
-                    when starts_with(nn.conname, c.relname || '_') and nn.conname ~ '_not_null[0-9]*$' then ''
+                    when nn.conname ~ '_not_null[0-9]*$'
+                        and (
+                            starts_with(nn.conname, c.relname || '_')
+                            -- PostgreSQL shortens the table and column names to fit a default name in 63 bytes.
+                            or (
+                                octet_length(nn.conname) = 63
+                                and exists (
+                                    select
+                                    from generate_series(1, length(c.relname)) k
+                                    cross join lateral (select regexp_replace(nn.conname, '_not_null[0-9]*$', '') as stem) s
+                                    where length(s.stem) - k - 1 between 1 and length(a.attname)
+                                        and left(c.relname, k) || '_' || left(a.attname, length(s.stem) - k - 1) = s.stem
+                                )
+                            )
+                        )
+                        then ''
                     else ' constraint ' || nn.conname
                 end
         end,

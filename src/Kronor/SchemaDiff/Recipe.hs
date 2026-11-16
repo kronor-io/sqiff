@@ -373,23 +373,23 @@ end $$|]
         notNullSteps old new = case (old.notNull, new.notNull) of
             (False, True) ->
                 create (Shared, []) [i|#{alter}add #{named new}not null #{quoteIdent c} not valid|]
-                    : [create (Own, []) (onNotNull new.notNullName "validate constraint") | new.notNullValid]
+                    : [create (Own, []) (onNotNull new.notNullName "validate constraint" "") | new.notNullValid]
             (True, False) -> [create (Shared, []) (col <> "drop not null")]
             (True, True) ->
-                [ create (Shared, []) (onNotNull old.notNullName "rename constraint" <> " to " <> quoteIdent n)
+                [ create (Shared, []) (onNotNull old.notNullName "rename constraint" (" to " <> quoteIdent n))
                 | old.notNullName /= new.notNullName
                 , let n = fromMaybe (T.concat [t.name, "_", c, "_not_null"]) new.notNullName
                 ]
                     <> case (old.notNullValid, new.notNullValid) of
-                        (False, True) -> [create (Own, []) (onNotNull new.notNullName "validate constraint")]
+                        (False, True) -> [create (Own, []) (onNotNull new.notNullName "validate constraint" "")]
                         (True, False) -> manual "a validated not null constraint cannot be made NOT VALID again"
                         _ -> []
             (False, False) -> []
         named d = maybe "" (\n -> [i|constraint #{quoteIdent n} |] :: Text) d.notNullName
-        onNotNull name action = case name of
-            Just n -> alter <> action <> " " <> quoteIdent n
+        onNotNull name action rest = case name of
+            Just n -> alter <> action <> " " <> quoteIdent n <> rest
             Nothing ->
-                let command = literal [i|#{T.replace "%" "%%" (alter <> action)} %I|]
+                let command = literal [i|#{T.replace "%" "%%" (alter <> action)} %I#{T.replace "%" "%%" rest}|]
                     tableLiteral = literal (qualified t)
                  in [i|do $$ begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal c})])); end $$|]
 
