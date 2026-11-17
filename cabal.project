@@ -1,0 +1,40 @@
+packages: .
+
+optimization: False
+
+-- Kronor's package repository, for the hasql-th fork whose syntax the quoters use.
+repository github-kronor-haskell-packages
+  url: https://kronor-io.github.io/kronor-haskell-packages
+  secure: True
+  root-keys:
+    64307ca6c1cee780dd01e5e11193ba606b21fe1dd6a9102b838daff0c747eded
+    85a0bbddb3afe87449114e7b0622c9c80bd9164b5228dbc7db9fe66f3043f540
+    f344d0824b70101babfdea1e470b7388f6b8fc51b41186a627e98c71068a838c
+
+constraints:
+  hasql == 2.0.1.0,
+  pqi == 1.1.0.1,
+  pqi-ffi == 1.0.1.0,
+  hasql-th == 0.5.1.1.0.*,
+  postgresql-syntax == 0.5.0.3.0.*,
+  crypton >= 1.0.4,
+  transformers >= 0.6
+
+allow-newer:
+  *:base,
+  *:bytestring,
+  *:containers,
+  *:deepseq,
+  *:ghc-prim,
+  *:hashable,
+  *:postgresql-libpq,
+  *:primitive,
+  *:template-haskell,
+  *:text,
+  *:th-abstraction,
+  *:vector
+
+package postgresql-libpq
+  flags: +use-pkg-config
+
+index-state: hackage.haskell.org 2026-10-26T00:00:00Z
