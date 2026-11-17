@@ -37,6 +37,7 @@ module Kronor.SchemaDiff.Catalog (
     bodyErrors,
     errorText,
     notChecked,
+    serverError,
     tempTableStatements,
     render,
 ) where
@@ -316,14 +317,14 @@ bodyUses conns@(conn :| _) excluded only madeTempTables =
         pure (uses, fs.unchecked <> failed)
 
 
--- | The statements temp_tables.sql runs on a connection without temp tables; empty when
--- it fails or plpgsql_check is not installed.
-tempTableStatements :: Connection.Connection -> IO Text
+-- | The statements temp_tables.sql runs on a connection without temp tables; 'Nothing'
+-- when it fails or plpgsql_check is not installed.
+tempTableStatements :: Connection.Connection -> IO (Maybe Text)
 tempTableStatements conn =
     timed "tempTableStatements"
         $ run conn () plpgsqlCheckSchema
         >>= \case
-            Nothing -> pure ""
+            Nothing -> pure Nothing
             Just extSchema -> do
                 result <-
                     Connection.use conn do
@@ -331,7 +332,7 @@ tempTableStatements conn =
                         Session.script (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))
                         Session.statement () [singletonStatement| select coalesce(current_setting('schema_diff.temp_tables', true), '') :: text |]
                 _ <- Connection.use conn (Session.script "rollback")
-                pure (either (const "") ("set client_min_messages = error;\n" <>) result)
+                pure (either (const Nothing) (Just . ("set client_min_messages = error;\n" <>)) result)
 
 
 -- | A PL/pgSQL function plpgsql_check can analyse: its oid, name, trigger table and
@@ -426,7 +427,7 @@ analyseBodies conns fs functions = do
                         (e1, s1) <- inBatches c query left
                         (e2, s2) <- inBatches c query right
                         pure (e1 <> e2, s1 <> s2)
-                Left e -> failWith ("query failed: " <> tshow e)
+                Left e -> failWith [i|query failed: #{errorText e}|]
 
     dependParams =
         contramap (map (.oid)) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int8))))
@@ -530,6 +531,14 @@ notChecked :: Text
 notChecked = "not checked: "
 
 
+-- | The message of an error the server raised; 'Nothing' for connection and client errors.
+serverError :: Errors.SessionError -> Maybe Text
+serverError e = case e of
+    Errors.ScriptSessionError _ _ -> Just (errorText e)
+    Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError _) -> Just (errorText e)
+    _ -> Nothing
+
+
 errorText :: Errors.SessionError -> Text
 errorText = \case
     Errors.ScriptSessionError _ (Errors.ServerError _ message detail _ _) -> message <> maybe "" ("; " <>) detail
@@ -578,7 +587,7 @@ plpgsqlCheckSchema =
 run :: Connection.Connection -> params -> Statement.Statement params a -> IO a
 run conn params statement =
     Connection.use conn (Session.statement params statement)
-        >>= either (\e -> failWith ("query failed: " <> tshow e)) pure
+        >>= either (\e -> failWith [i|query failed: #{errorText e}|]) pure
 
 
 excludedParam :: E.Params [Text]

@@ -17,7 +17,7 @@ import Hasql.Connection qualified as Connection
 import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
 import Hasql.TH (singletonStatement, vectorStatement)
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), failWith, qualifiedNames)
+import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), errorText, failWith, qualifiedNames)
 import RIO
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
@@ -49,7 +49,7 @@ checkBodies conn schema = qualifiedNames conn do
   where
     definitionKey names args kind = ObjectKey Definition (Address kind names args)
 
-    -- | Runs the printed definition and compares it with what PostgreSQL prints back.
+    -- Runs the printed definition and compares it with what PostgreSQL prints back.
     roundTrip k original =
         rolledBack (recreate original *> printDefinition k) >>= \case
             Right reprinted
@@ -62,7 +62,7 @@ checkBodies conn schema = qualifiedNames conn do
                     pure if fromRepaired == Right original then Repaired repaired else DoesNotParse parseError
 
     run :: Statement.Statement p a -> p -> IO a
-    run statement params = Connection.use conn (Session.statement params statement) >>= either (\e -> failWith ("query failed: " <> tshow e)) pure
+    run statement params = Connection.use conn (Session.statement params statement) >>= either (\e -> failWith [i|query failed: #{errorText e}|]) pure
 
     recreate :: Text -> Session.Session ()
     recreate definition = Session.script (definition <> ";")
@@ -76,7 +76,7 @@ checkBodies conn schema = qualifiedNames conn do
             Right a -> pure (Right a)
             Left err -> do
                 void (Connection.use conn (Session.script "rollback"))
-                pure . Left . T.take 300 . T.unwords . T.words . tshow $ err
+                pure . Left . T.take 300 . T.unwords . T.words . errorText $ err
 
     printedSql :: Statement.Statement (Vector Text, Vector Text) Text
     printedSql =

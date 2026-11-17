@@ -178,9 +178,9 @@ pieces :: Text -> Either Text [Part]
 pieces original = splitStatements original >>= go original
   where
     go rest [] = Right [Gap rest]
-    go rest (s : ss) = case T.breakOn s rest of
-        (_, "") -> Left "a statement cannot be found in the file's text"
-        (before, after) -> (\more -> Gap before : Stmt s : more) <$> go (T.drop (T.length s) after) ss
+    go rest (s : ss) = case [(stmt, found) | stmt <- [s, snd (splitLead s)], let found = T.breakOn stmt rest, not (T.null (snd found))] of
+        [] -> Left "a statement cannot be found in the file's text"
+        (stmt, (before, after)) : _ -> (\more -> Gap before : Stmt stmt : more) <$> go (T.drop (T.length stmt) after) ss
 
 
 data Out = Out Text | Gone
@@ -301,22 +301,42 @@ data Region = Code | Quoted | Remark
 
 -- | Each character with whether it is code, inside quotes, or inside a comment.
 regions :: Text -> [(Char, Region)]
-regions = code . T.unpack
+regions = code ' ' . T.unpack
   where
-    code = \case
+    code prev = \case
         [] -> []
-        '-' : '-' : rest -> let (c, more) = break (== '\n') rest in map (,Remark) ('-' : '-' : c) <> code more
+        '-' : '-' : rest -> let (c, more) = break (== '\n') rest in map (,Remark) ('-' : '-' : c) <> code ' ' more
         '/' : '*' : rest -> ('/', Remark) : ('*', Remark) : block (1 :: Int) rest
+        e : '\'' : rest | e `elem` ("eE" :: String), not (wordChar prev) -> (e, Quoted) : ('\'', Quoted) : escaped rest
+        '$' : rest
+            | not (wordChar prev)
+            , Just tag <- dollarTag rest ->
+                map (,Quoted) ('$' : tag) <> dollar ('$' : tag) (drop (length tag) rest)
         q : rest | q == '\'' || q == '"' -> (q, Quoted) : quoted q rest
-        c : rest -> (c, Code) : code rest
+        c : rest -> (c, Code) : code c rest
     quoted q = \case
         [] -> []
         c : d : more | c == q && d == q -> (c, Quoted) : (d, Quoted) : quoted q more
-        c : more | c == q -> (c, Quoted) : code more
+        c : more | c == q -> (c, Quoted) : code c more
         c : more -> (c, Quoted) : quoted q more
+    escaped = \case
+        [] -> []
+        '\\' : x : more -> ('\\', Quoted) : (x, Quoted) : escaped more
+        '\'' : '\'' : more -> ('\'', Quoted) : ('\'', Quoted) : escaped more
+        '\'' : more -> ('\'', Quoted) : code '\'' more
+        c : more -> (c, Quoted) : escaped more
+    dollar tag s = case L.stripPrefix tag s of
+        Just after -> map (,Quoted) tag <> code '$' after
+        Nothing -> case s of
+            [] -> []
+            c : more -> (c, Quoted) : dollar tag more
+    dollarTag more = case span (\c -> isAlphaNum c || c == '_') more of
+        (tag, '$' : _) | maybe True (not . isDigit) (listToMaybe tag) -> Just (tag <> "$")
+        _ -> Nothing
+    wordChar c = isAlphaNum c || c == '_' || c == '$'
     block depth = \case
         [] -> []
-        '*' : '/' : more -> ('*', Remark) : ('/', Remark) : if depth == 1 then code more else block (depth - 1) more
+        '*' : '/' : more -> ('*', Remark) : ('/', Remark) : if depth == 1 then code '/' more else block (depth - 1) more
         '/' : '*' : more -> ('/', Remark) : ('*', Remark) : block (depth + 1) more
         c : more -> (c, Remark) : block depth more
 
@@ -353,10 +373,12 @@ withLiteral new code = case [k | (k, "is") <- topWords code] of
 
 literal :: Maybe Text -> Text -> Text
 literal tag t = case tag of
-    Just q | not (q `T.isInfixOf` t) -> q <> t <> q
+    Just q | fits q -> q <> t <> q
     _
-        | "\n" `T.isInfixOf` t && not ("$comment$" `T.isInfixOf` t) -> "$comment$" <> t <> "$comment$"
+        | "\n" `T.isInfixOf` t && fits "$comment$" -> "$comment$" <> t <> "$comment$"
         | otherwise -> "'" <> T.replace "'" "''" t <> "'"
+  where
+    fits q = not (q `T.isInfixOf` (t <> "$"))
 
 
 commentTarget :: Address -> Maybe Text
@@ -510,7 +532,14 @@ editCreateTable table order columns constraints options code = do
                 _ -> (Just e, [])
             _ -> (Just e, [])
         edited = map edit kinds
-        kept = [(e, isColumn k) | ((Just e, _), (_, k)) <- zip edited kinds]
+        kept = keep "" (zip edited kinds)
+        keep pending = \case
+            [] -> []
+            ((Just e, _), (_, k)) : rest -> (e{lead = pending <> e.lead}, isColumn k) : keep "" rest
+            ((Nothing, _), (e, _)) : rest -> keep (pending <> separateComments e.lead) rest
+        separateComments l = case T.breakOnEnd "\n\n" l of
+            (before, _) | "--" `T.isInfixOf` before -> T.dropEnd 1 before
+            _ -> ""
         isColumn = \case ColumnElement _ _ -> True; _ -> False
         added = [(c, def) | c <- order, Just (Added def) <- [lookup c columns]]
         addedColumns = [Element newLead (columnLine c def) "" | (c, def) <- added]

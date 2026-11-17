@@ -24,7 +24,7 @@ import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (
 import Kronor.SchemaDiff.Rewrite (Rewrite (..), fileDrift, rewriteFile)
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
 import Kronor.SchemaDiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), deployedChanges, moveToEnd, parsePlan, plannedChanges, readPlan, requireSqitch, reworkEdited, units, writeUnits)
-import Kronor.SchemaDiff.TableEdit (Baseline (..), Drops (..), Live (..), TableEdit (..), aside, columnOrder, compareTable, firstFailure, foreignKeyError, readOnly, requireScratch, typeChangeFacts, withEditedTable)
+import Kronor.SchemaDiff.TableEdit (Baseline (..), Drops (..), Live (..), TableEdit (..), TableRewrite (..), TargetType (..), TypeChange (..), aside, columnOrder, compareTable, firstFailure, foreignKeyError, readOnly, requireScratch, typeChangeFacts, withEditedTable)
 import Kronor.SchemaDiff.Timing (measure, timed)
 import Options.Applicative qualified as O
 import RIO
@@ -62,11 +62,16 @@ data Needed
       NoEdges
 
 
+-- | Whether a command lists the differences or plans the migration.
+data Purpose = ForDiff | ForPlan
+    deriving stock (Eq)
+
+
 -- | The edges a command needs, given the objects that differ between the databases.
-neededFor :: Bool -> Map ObjectKey Change -> Needed
-neededFor forPlan changes
+neededFor :: Purpose -> Map ObjectKey Change -> Needed
+neededFor purpose changes
     | Map.null changes = NoEdges
-    | forPlan = BodiesOf (Set.fromList [k.address | k <- Map.keys changes])
+    | purpose == ForPlan = BodiesOf (Set.fromList [k.address | k <- Map.keys changes])
     | null starts = NoEdges
     | otherwise = ReachableFrom (Set.fromList starts)
   where
@@ -356,40 +361,41 @@ connectScratch name = do
 describeDatabase :: Scope -> Text -> IO Connected
 describeDatabase scope name = do
     db <- resolveDb name
-    tempTables <- async (either (const Nothing) Just <$> tryAny (bracket (connect db) Connection.release tempTableStatements))
+    tempTables <- async (either (const Nothing) id <$> tryAny (bracket (connect db) Connection.release tempTableStatements))
     (conn, extra) <- concurrently (connect db) (replicateConcurrently (describeConnections - 1) (connect db))
     (schema, addresses) <- describeOn (conn : extra) scope.excluded scope.partitions Nothing
     pure (Connected conn extra schema addresses (wait tempTables))
 
 
 -- | Reads both databases at the same time, then the edges each command needs, given what
--- differs, alongside the body checks; the edges of @--to@ only when @forPlan@.
-readBoth :: Scope -> Source -> Text -> Bool -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
-readBoth scope from toDb forPlan = do
+-- differs, alongside the body checks; the edges of @--to@ only for 'ForPlan'.
+readBoth :: Scope -> Source -> Text -> Purpose -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
+readBoth scope from toDb purpose = do
     toDescribed <- async (timed "describe --to" $ describeDatabase scope toDb)
-    checkConn <- async (connect =<< resolveDb toDb)
     fromDb <- timed "connInfoOf" $ connInfoOf from
     (fromDatabase@(Connected _ _ fromSchema _ _), toDatabase@(Connected _ _ toSchema _ _)) <-
         timed "readBoth.describe" $ concurrently (timed "describe --from" $ describeDatabase scope fromDb) (wait toDescribed)
     let plainChanges = diff (\_ a b -> a == b) fromSchema toSchema
-        needed = neededFor forPlan plainChanges
+        needed = neededFor purpose plainChanges
     measure "readBoth.plainDiff" (Map.size plainChanges)
     (((fromEdges, fromNotes), (toEdges, toNotes)), checks) <-
         timed "readBoth.edgesAndChecks"
             $ concurrently
                 ( concurrently
                     (edgesOf "--from" scope needed fromDatabase)
-                    (if forPlan then edgesOf "--to" scope needed toDatabase else pure ([], []))
+                    (if purpose == ForPlan then edgesOf "--to" scope needed toDatabase else pure ([], []))
                 )
-                (wait checkConn >>= \conn -> bodyChecks scope conn toSchema plainChanges)
+                (bodyChecks scope toDb toSchema plainChanges)
     for_ (fromNotes <> toNotes) (TIO.hPutStrLn stderr)
     pure ((fromSchema, fromEdges), (toSchema, toEdges), checks)
 
 
 -- | Body checks for the definitions that are added or changed: no other check is consulted.
-bodyChecks :: Scope -> Connection.Connection -> Schema -> Map ObjectKey Change -> IO (Map ObjectKey BodyCheck)
-bodyChecks scope conn toSchema plainChanges
-    | scope.bodyCheck == CheckBodies = timed "bodyChecks" $ checkBodies conn (Map.restrictKeys toSchema addedOrChanged)
+bodyChecks :: Scope -> Text -> Schema -> Map ObjectKey Change -> IO (Map ObjectKey BodyCheck)
+bodyChecks scope toDb toSchema plainChanges
+    | scope.bodyCheck == CheckBodies =
+        bracket (connect =<< resolveDb toDb) Connection.release \conn ->
+            timed "bodyChecks" $ checkBodies conn (Map.restrictKeys toSchema addedOrChanged)
     | otherwise = pure Map.empty
   where
     addedOrChanged = Map.keysSet (Map.filter (\case Dropped _ -> False; _ -> True) plainChanges)
@@ -469,7 +475,8 @@ data SqitchOptions = SqitchOptions
 
 main :: IO ()
 main =
-    handle (\(UserError message) -> TIO.hPutStrLn stderr [i|schema-diff: #{message}|] >> exitWith (ExitFailure 2))
+    handleAny unexpected
+        . handle (\(UserError message) -> TIO.hPutStrLn stderr [i|schema-diff: #{message}|] >> exitWith (ExitFailure 2))
         $ O.execParser (O.info (commandParser O.<**> O.helper) O.fullDesc)
         >>= \case
             Describe name out replace scope -> do
@@ -482,7 +489,7 @@ main =
                         for_ (Map.toList (Map.fromListWith (+) [(k.address.objectType, 1 :: Int) | k <- Map.keys schema])) \(kind, n) ->
                             TIO.putStrLn [i|#{n}\t#{kind}|]
             Diff from toDb scope -> do
-                ((fromSchema, edges), (toSchema, _), checks) <- timed "readBoth" $ readBoth scope from toDb False
+                ((fromSchema, edges), (toSchema, _), checks) <- timed "readBoth" $ readBoth scope from toDb ForDiff
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     known = Set.fromList [k.address | k <- Map.keys fromSchema, k.aspect == Definition]
                     affectedBy = affected known edges changes
@@ -494,14 +501,14 @@ main =
                 TIO.putStrLn (summary changes)
                 unless (Map.null changes) $ exitWith (ExitFailure 1)
             Plan from toDb scope -> do
-                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope from toDb True
+                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope from toDb ForPlan
                 let steps = plan checks fromSchema toSchema fromEdges toEdges (diff (sameDefinition checks) fromSchema toSchema)
                 measure "plan.planRender" (T.length (T.unlines (map renderStep steps)))
                 for_ steps (TIO.putStrLn . renderStep)
             Sqitch from toDb scope opts -> do
                 unless opts.dryRun requireSqitch
                 sqitchPlan <- readPlan (opts.projectDir </> opts.planFile)
-                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope from toDb True
+                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope from toDb ForPlan
                 now <- getCurrentTime
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     steps = plan checks fromSchema toSchema fromEdges toEdges changes
@@ -518,6 +525,10 @@ main =
                         TIO.putStrLn [i|#{kind}\t#{changeName}\t#{count} statements\t#{note}|]
                     else writeUnits opts.projectDir opts.topDir sqitchPlan tagName written
             TableFile file db opts -> tableCommand file db opts
+  where
+    unexpected e = case fromException e of
+        Just code -> throwIO (code :: ExitCode)
+        Nothing -> TIO.hPutStrLn stderr [i|schema-diff: #{displayException e}|] >> exitWith (ExitFailure 2)
 
 
 -- | What the table command works on: its options, the deploy file before and after the
@@ -553,7 +564,7 @@ data Evidence = Evidence
     , bodies :: BodyResults
     , retyped :: [Retyped]
     , foreignKeyBreaks :: Map Address [(Address, Text)]
-    , typeFacts :: Map Address (Bool, Bool)
+    , typeFacts :: Map Address TypeChange
     , branchChanges :: [(Text, [Text])]
     , pendingRenames :: [(Text, Text)]
     , renamedFrom :: Set Address
@@ -863,7 +874,7 @@ foreignKeyBreaksFor conn deps retyped =
 
 -- | For each retyped column, whether the change rewrites the table and whether the new
 -- type is a domain.
-typeFactsFor :: Connection.Connection -> TableEdit -> [Retyped] -> IO (Map Address (Bool, Bool))
+typeFactsFor :: Connection.Connection -> TableEdit -> [Retyped] -> IO (Map Address TypeChange)
 typeFactsFor conn edit retyped =
     timed "table.typeChangeFacts" $ Map.fromList . catMaybes <$> for retyped \(_, _, addr, newType) ->
         case parseColumn <$> Map.lookup (ObjectKey Definition addr) edit.current of
@@ -895,10 +906,12 @@ findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames
               ]
     convertNote = MayFail "fails when an existing value does not convert to the new type"
     withTypeFacts s = case Map.lookup s.address ev.typeFacts of
-        Just (rewrites, domain)
+        Just (TypeChange rewrite target)
             | MayRewriteTable `elem` s.hazards ->
-                let kept = concatMap (\h -> if h == MayRewriteTable then [RewritesTable | rewrites] else [h | h /= convertNote || rewrites || domain]) s.hazards
-                 in s{hazards = kept <> concat [LocksOther o : [RechecksForeignKey o | rewrites] | o <- otherTables s.address]}
+                let rewrites = rewrite == RewritesFiles
+                    domain = target == DomainType
+                 in let kept = concatMap (\h -> if h == MayRewriteTable then [RewritesTable | rewrites] else [h | h /= convertNote || rewrites || domain]) s.hazards
+                     in s{hazards = kept <> concat [LocksOther o : [RechecksForeignKey o | rewrites] | o <- otherTables s.address]}
         _ -> s
     breaksFor addr = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.named <> Map.findWithDefault Set.empty addr deps.exact), a `Map.member` breaking]
     dependents = deps.exact

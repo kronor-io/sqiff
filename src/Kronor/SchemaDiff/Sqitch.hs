@@ -317,7 +317,7 @@ slug = T.take 80 . T.intercalate "-" . filter (not . T.null) . T.split (not . al
 -- | A script: shared steps in one transaction, others in their own or none.
 renderScript :: Text -> Placement -> [Step] -> Text
 renderScript header placement steps =
-    T.intercalate "\n\n" (header : map block (L.groupBy together steps)) <> "\n"
+    T.intercalate "\n\n" (header : ["set lock_timeout to '50ms';" | placement == Conventional] <> map block (L.groupBy together steps)) <> "\n"
   where
     together a b = a.txn == Shared && b.txn == Shared
     block group' = case group' of

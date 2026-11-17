@@ -213,6 +213,7 @@ definition ctx key object change = case object of
     createAt rank (txn, hazards) sql = Step CreatePhase rank addr object sql txn hazards key change
     remove (txn, hazards) sql = Step DropPhase (dropRank object) addr object sql txn hazards key change
     manual why = [create (Shared, [Manual why]) ("-- " <> why)]
+    notValid = " NOT VALID" :: Text
     onEveryPartition s
         | any (`elem` [DeletesData, MayRewriteTable, LongLock]) s.hazards = s{hazards = s.hazards <> [EveryPartition]}
         | otherwise = s
@@ -398,7 +399,10 @@ end $$|]
     tableConstraint t c = case change of
         Added def -> addConstraint def
         Dropped old -> [dropConstraint old]
-        Changed old new -> dropConstraint old : addConstraint new
+        Changed old new
+            | old == new <> notValid -> [create (Own, []) (alterT <> "validate constraint " <> quoteIdent c)]
+            | new == old <> notValid -> manual "a validated constraint cannot be made NOT VALID again"
+            | otherwise -> dropConstraint old : addConstraint new
       where
         alterT = [i|alter table #{qualified t} |]
         dropConstraint old =
@@ -410,8 +414,9 @@ end $$|]
         plain hazards def = create (Shared, hazards <> locksOther def) (alterT <> "add constraint " <> quoteIdent c <> " " <> def)
         addConstraint def
             | t `Set.member` ctx.newTables = [plain [] def]
-            | validatable def && not (" NOT VALID" `T.isSuffixOf` def) =
-                [ plain [] (def <> " NOT VALID")
+            | validatable def && notValid `T.isSuffixOf` def = [plain [] def]
+            | validatable def =
+                [ plain [] (def <> notValid)
                 , create (Own, []) (alterT <> "validate constraint " <> quoteIdent c)
                 ]
             | Just (kind, cols) <- simpleKey def
@@ -433,13 +438,16 @@ end $$|]
     domainConstraint d c = case change of
         Added def -> add def
         Dropped _ -> [remove (Shared, []) (alterD <> "drop constraint " <> quoteIdent c)]
-        Changed _ new -> remove (Shared, []) (alterD <> "drop constraint " <> quoteIdent c) : add new
+        Changed old new
+            | old == new <> notValid -> [validate]
+            | new == old <> notValid -> manual "a validated constraint cannot be made NOT VALID again"
+            | otherwise -> remove (Shared, []) (alterD <> "drop constraint " <> quoteIdent c) : add new
       where
         alterD = [i|alter domain #{d} |]
-        add def =
-            [ create (Shared, []) [i|#{alterD}add constraint #{quoteIdent c} #{def} NOT VALID|]
-            , create (Own, []) (alterD <> "validate constraint " <> quoteIdent c)
-            ]
+        validate = create (Own, []) (alterD <> "validate constraint " <> quoteIdent c)
+        add def
+            | notValid `T.isSuffixOf` def = [create (Shared, []) [i|#{alterD}add constraint #{quoteIdent c} #{def}|]]
+            | otherwise = [create (Shared, []) [i|#{alterD}add constraint #{quoteIdent c} #{def}#{notValid}|], validate]
 
     indexRecipe ix = case change of
         Added def -> addIndex def

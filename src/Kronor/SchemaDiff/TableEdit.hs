@@ -16,6 +16,9 @@ module Kronor.SchemaDiff.TableEdit (
     foreignKeyError,
     firstFailure,
     typeChangeFacts,
+    TypeChange (..),
+    TableRewrite (..),
+    TargetType (..),
     aside,
     columnOrder,
     requireScratch,
@@ -27,7 +30,7 @@ import Data.Text qualified as T
 import Hasql.Connection qualified as Connection
 import Hasql.Session qualified as Session
 import Hasql.TH (singletonStatement, vectorStatement)
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Partitions (..), Schema, describeOn, errorText, failWith)
+import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Partitions (..), Schema, describeOn, errorText, failWith, serverError)
 import Kronor.SchemaDiff.Diff (Change (..), diff)
 import Kronor.SchemaDiff.Object
 import Kronor.SchemaDiff.Timing (timed)
@@ -56,10 +59,12 @@ readOnly conn =
 -- | The error PostgreSQL gives for a foreign key from columns of the first types to columns
 -- of the second, tried on temporary tables in a transaction that is rolled back.
 foreignKeyError :: Connection.Connection -> [(Text, Text)] -> IO (Maybe Text)
-foreignKeyError conn types = do
-    result <- Connection.use conn (Session.script [i|begin; create temp table schema_diff_pk (#{columns snd}, primary key (#{names})); create temp table schema_diff_fk (#{columns fst}, foreign key (#{names}) references schema_diff_pk (#{names}))|])
-    _ <- Connection.use conn (Session.script "rollback")
-    pure (either (Just . tidy . errorText) (const Nothing) result)
+foreignKeyError conn types =
+    rolledBack conn "the foreign key check" do
+        result <- Connection.use conn (Session.script [i|create temp table schema_diff_pk (#{columns snd}, primary key (#{names})); create temp table schema_diff_fk (#{columns fst}, foreign key (#{names}) references schema_diff_pk (#{names}))|])
+        case result of
+            Right () -> pure Nothing
+            Left e -> maybe (failWith [i|the foreign key check failed: #{errorText e}|]) (pure . Just . tidy) (serverError e)
   where
     tidy e = case T.breakOn "are of incompatible types" e of
         (_, "") -> e
@@ -68,19 +73,32 @@ foreignKeyError conn types = do
     columns side = T.intercalate ", " [[i|c#{n} #{side ty}|] | (n, ty) <- zip [1 :: Int ..] types]
 
 
--- | Whether changing a column from @old@ to @new@ rewrites the table, and whether @new@ is
--- a domain, found on a temporary table in a transaction that is rolled back.
-typeChangeFacts :: Connection.Connection -> Text -> Text -> IO (Maybe (Bool, Bool))
-typeChangeFacts conn old new = do
-    _ <- Connection.use conn (Session.script [i|begin; create temp table schema_diff_retype (c #{old})|])
-    before <- fileNode
-    altered <- Connection.use conn (Session.script [i|alter table pg_temp.schema_diff_retype alter column c type #{new} using c::#{new}|])
-    after <- fileNode
-    domain <- Connection.use conn (Session.statement new isDomain)
-    _ <- Connection.use conn (Session.script "rollback")
-    pure case (before, altered, after, domain) of
-        (Right b, Right (), Right a, Right d) -> Just (a /= b, d)
-        _ -> Nothing
+-- | Whether a column type change rewrites the table's files.
+data TableRewrite = RewritesFiles | KeepsFiles
+    deriving stock (Eq)
+
+
+-- | Whether a column's new type is a domain.
+data TargetType = DomainType | PlainType
+    deriving stock (Eq)
+
+
+data TypeChange = TypeChange TableRewrite TargetType
+
+
+-- | What changing a column from @old@ to @new@ does, found on a temporary table in a
+-- transaction that is rolled back.
+typeChangeFacts :: Connection.Connection -> Text -> Text -> IO (Maybe TypeChange)
+typeChangeFacts conn old new =
+    rolledBack conn "the type change check" do
+        made <- Connection.use conn (Session.script [i|create temp table schema_diff_retype (c #{old})|])
+        before <- fileNode
+        altered <- Connection.use conn (Session.script [i|alter table pg_temp.schema_diff_retype alter column c type #{new} using c::#{new}|])
+        after <- fileNode
+        domain <- Connection.use conn (Session.statement new isDomain)
+        pure case (made, before, altered, after, domain) of
+            (Right (), Right b, Right (), Right a, Right d) -> Just (TypeChange (if a /= b then RewritesFiles else KeepsFiles) (if d then DomainType else PlainType))
+            _ -> Nothing
   where
     fileNode =
         Connection.use conn
@@ -95,6 +113,13 @@ typeChangeFacts conn old new = do
         [singletonStatement|
             select coalesce((select typtype = 'd' from pg_type where oid = to_regtype($1::text)), false)::bool
         |]
+
+
+-- | Runs @action@ in a transaction that is always rolled back.
+rolledBack :: Connection.Connection -> Text -> IO a -> IO a
+rolledBack conn label action = do
+    Connection.use conn (Session.script "begin") >>= either (\e -> failWith [i|#{label} could not start: #{errorText e}|]) pure
+    action `finally` void (Connection.use conn (Session.script "rollback"))
 
 
 -- | The table's column names in the table's order.
@@ -189,7 +214,9 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             script "begin"
             xact <- currentXact
             script "set local lock_timeout = '5s'"
-            exists <- script' [i|select 1 from pg_class where oid = to_regclass(#{literal (qualified table)})|]
+            exists <-
+                Connection.use conn (Session.statement (qualified table) [singletonStatement| select (to_regclass($1::text) is not null)::bool |])
+                    >>= either setupFailed pure
             unless exists $ failWith [i|#{qualified table} does not exist yet; a new table only needs its own change|]
             beforeResult <- timed "tableEdit.before" beforeEdit
             owned <-
@@ -275,14 +302,6 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
         |]
 
     withoutLineComments = T.unlines . map (fst . T.breakOn "--") . T.lines
-
-    script' :: Text -> IO Bool
-    script' sql = do
-        result <- Connection.use conn (Session.script [i|do $$ begin if not exists (#{sql}) then raise exception 'missing'; end if; end $$|])
-        pure (isRight result)
-
-    literal :: Text -> Text
-    literal t = [i|'#{T.replace "'" "''" t}'|]
 
     asideRef = [i|#{quoteIdent aside}.|] :: Text
     tableSchemaRef = let schema = quoteIdent table.schema in [i|#{schema}.|] :: Text
