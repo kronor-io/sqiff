@@ -35,6 +35,27 @@ select
             when 'a' then 'identity always'
             when 'd' then 'identity by default'
         end,
+        case when a.attidentity <> '' then (
+            select 'identity options ' || nullif(concat_ws(
+                ', ',
+                case when s.seqincrement <> 1 then 'increment by ' || s.seqincrement end,
+                case when s.seqmin <> 1 then 'minvalue ' || s.seqmin end,
+                case
+                    when s.seqmax <> case s.seqtypid when 'int2'::regtype then 32767 when 'int4'::regtype then 2147483647 else 9223372036854775807 end
+                        then 'maxvalue ' || s.seqmax
+                end,
+                case when s.seqstart <> s.seqmin then 'start with ' || s.seqstart end,
+                case when s.seqcache <> 1 then 'cache ' || s.seqcache end,
+                case when s.seqcycle then 'cycle' end
+            ), '')
+            from pg_depend d
+            join pg_sequence s on s.seqrelid = d.objid
+            where d.classid = 'pg_class'::regclass
+                and d.refclassid = 'pg_class'::regclass
+                and d.refobjid = a.attrelid
+                and d.refobjsubid = a.attnum
+                and d.deptype = 'i'
+        ) end,
         case a.attgenerated
             when 's' then 'generated stored ' || pg_get_expr(ad.adbin, ad.adrelid)
             when 'v' then 'generated virtual ' || pg_get_expr(ad.adbin, ad.adrelid)

@@ -14,7 +14,7 @@ import Data.Time (UTCTime, defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
 import Kronor.SchemaDiff.Baseline (ensureBaseline)
 import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
-import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), Partitions (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, plpgsqlFunctions, relationColumns, render, tempTableStatements)
+import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), Partitions (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, notChecked, plpgsqlFunctions, relationColumns, render, tempTableStatements)
 import Kronor.SchemaDiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
 import Kronor.SchemaDiff.Folder (Existing (..), writeFolder)
 import Kronor.SchemaDiff.Git (Repo, findRepo, showFile)
@@ -24,7 +24,7 @@ import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (
 import Kronor.SchemaDiff.Rewrite (Rewrite (..), fileDrift, rewriteFile)
 import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
 import Kronor.SchemaDiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), deployedChanges, moveToEnd, parsePlan, plannedChanges, readPlan, requireSqitch, reworkEdited, units, writeUnits)
-import Kronor.SchemaDiff.TableEdit (Baseline (..), Drops (..), Live (..), TableEdit (..), aside, columnOrder, compareTable, firstFailure, foreignKeyError, typeChangeFacts, withEditedTable)
+import Kronor.SchemaDiff.TableEdit (Baseline (..), Drops (..), Live (..), TableEdit (..), aside, columnOrder, compareTable, firstFailure, foreignKeyError, readOnly, requireScratch, typeChangeFacts, withEditedTable)
 import Kronor.SchemaDiff.Timing (measure, timed)
 import Options.Applicative qualified as O
 import RIO
@@ -264,7 +264,7 @@ viewsAroundTypeChanges deps retyped =
                 Nothing -> False
             more = Set.filter (\r -> isRoutine r && r `Set.notMember` members && holds r) closure
          in if Set.null more then members else held column closure (members <> more)
-    signature = T.unlines . takeWhile (\l -> not (" AS " `T.isPrefixOf` l || "BEGIN ATOMIC" `T.isInfixOf` l)) . T.lines
+    signature = T.unlines . takeWhile (\l -> not ("AS " `T.isPrefixOf` T.stripStart l || "BEGIN ATOMIC" `T.isInfixOf` l)) . T.lines
     relation a = case (a.objectType, a.objectNames) of
         (kind, [s, t, _]) | Just rel <- T.stripSuffix " column" kind -> Address rel [s, t] []
         _ -> a
@@ -342,6 +342,14 @@ resolveDb = \case
         port <- fromMaybe "5432" <$> lookupEnv "KRONOR_PG_PORT"
         pure [i|host=localhost port=#{port} user=kronor dbname=kronor|]
     db -> pure db
+
+
+-- | A connection to the database the table command edits in rolled-back transactions.
+connectScratch :: Text -> IO Connection.Connection
+connectScratch name = do
+    conn <- connect =<< resolveDb name
+    requireScratch name conn
+    pure conn
 
 
 -- | A database's schema over 'describeConnections' connections.
@@ -599,10 +607,13 @@ rewriteFromDatabase = do
         deployDir = env.root </> opts.top </> "deploy"
     unless (null opts.renames) $ failWith "--rename works with the file comparison, not --rewrite-file"
     current <- readFileUtf8 env.file
-    conn <- liftIO (connect =<< resolveDb env.db)
+    conn <- liftIO (connectScratch env.db)
     (live, liveConn) <- case opts.liveFrom of
         Nothing -> pure (SameDatabase, conn)
-        Just name -> liftIO $ (\c -> (OtherDatabase c, c)) <$> (connect =<< resolveDb name)
+        Just name -> liftIO do
+            c <- connect =<< resolveDb name
+            readOnly c
+            pure (OtherDatabase c, c)
     let liveDb = fromMaybe env.db opts.liveFrom
     order <- liftIO (columnOrder liveConn table)
     when (null order) $ failWith [i|#{qualified table} is not in #{liveDb}; there is nothing to rewrite the file from|]
@@ -613,7 +624,8 @@ rewriteFromDatabase = do
         unless (null pending) $ failWith [i|#{liveDb} has not deployed #{n} planned changes that touch #{qualified table}, and a rewrite from it would undo them: #{names}|]
     edit <- timed "rewrite.compare" $ liftIO (compareTable conn (LiveTable live ReportDrops) table env.statements)
     ownFiles <-
-        fmap Set.fromList . filterM (\n -> doesFileExist (deployDir </> T.unpack table.schema </> "table" </> T.unpack table.name </> "index" </> T.unpack n <.> "sql"))
+        fmap Set.fromList
+            . filterM (\n -> doesFileExist (deployDir </> T.unpack table.schema </> "table" </> T.unpack table.name </> "index" </> T.unpack n <.> "sql"))
             $ [n | k <- Map.keys edit.current, Index q <- [fromAddress k.address], let n = q.name]
     let path = env.file
     rewrite <- either (\e -> failWith [i|#{path}: #{e}|]) pure (rewriteFile table ownFiles order edit.current edit.desired current)
@@ -658,13 +670,20 @@ undeployedTouching live = do
     let opts = env.opts
         deployDir = env.root </> opts.top </> "deploy"
         needle = T.toLower (qualified env.table)
-        changesTable text = any (changesTableIn needle) (either (const [text]) id (splitStatements text))
-        script name = let path = deployDir </> T.unpack name <.> "sql" in doesFileExist path >>= bool (pure "") (readFileUtf8 path)
+        touching name = do
+            let path = deployDir </> T.unpack name <.> "sql"
+            exists <- doesFileExist path
+            if not exists
+                then pure (Just [i|#{name} (no deploy file)|])
+                else
+                    splitStatements <$> readFileUtf8 path <&> \case
+                        Left _ -> Just [i|#{name} (its statements could not be read)|]
+                        Right statements -> bool Nothing (Just name) (any (changesTableIn needle) statements)
     planText <- readFileUtf8 (env.root </> opts.planPath)
     deployed <- liftIO (deployedChanges live (parsePlan planText).project)
     when (Set.null deployed) $ failWith "the live database's sqitch registry has no changes of this project"
     let pending = nubOrd [name | c@(name, _) <- plannedChanges planText, c `Set.notMember` deployed]
-    filterM (fmap changesTable . script) pending
+    catMaybes <$> traverse touching pending
 
 
 -- | Whether @statement@ changes the table @needle@ (lower-case, qualified): creates or alters
@@ -743,7 +762,7 @@ compareAndReport described = do
         if opts.compareWith == LiveDatabase
             then pure (LiveTable SameDatabase opts.drops)
             else BaseFile . (<> (branchStatements <> map (renameSql table) pendingRenames)) <$> parseFile env.file (atBase opts) env.original
-    conn <- timed "table.connect" $ liftIO (connect =<< resolveDb env.db)
+    conn <- timed "table.connect" $ liftIO (connectScratch env.db)
     edit <- timed "table.compare1" $ liftIO (compareTable conn baseline table env.statements)
     let renamedFrom = Set.fromList [columnAddress table old | (old, _) <- opts.renames]
     deps <- timed "table.dependentsIn" $ liftIO (dependentsIn described (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom)))
@@ -784,7 +803,8 @@ bodyResultsFor conn baseline deps = do
     env <- ask
     let table = env.table
         definitionOf a = Map.lookup (ObjectKey Definition a) deps.dbSchema
-        routines = Set.toList (Set.filter (\a -> a.objectType `elem` ["function", "procedure"]) (fold deps.named <> fold deps.exact))
+        takesRowType a = any (`elem` [qualified table, qualified table <> "[]"]) a.objectArgs
+        routines = Set.toList (Set.filter (\a -> a.objectType `elem` ["function", "procedure"] && not (takesRowType a)) (fold deps.named <> fold deps.exact))
         plpgsql = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE plpgsql" `T.isInfixOf` def]
         sqlBodies = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE sql" `T.isInfixOf` def, not (standardBody def)]
         signature a = case a.objectNames of
@@ -793,16 +813,17 @@ bodyResultsFor conn baseline deps = do
         bySignature = Map.fromList [(signature a, a) | a <- plpgsql <> sqlBodies]
         check made = timed [i|table.bodyErrors n=#{Map.size bySignature}|] $ bodyErrors conn aside (qualified table) made (map signature plpgsql) (map signature sqlBodies)
         rowTypeCall message = "function " `T.isPrefixOf` message && any (\end -> (qualified table <> end) `T.isInfixOf` message) [")", ","]
-    checked <-
+    results <-
         if null plpgsql && null sqlBodies
             then pure Nothing
             else
                 timed "table.compare2"
                     . liftIO
-                    $ fmap (Set.filter (\(_, _, message) -> not (rowTypeCall message)))
-                    <$> withEditedTable conn baseline table env.statements (check deps.dbTempTables) (\before -> (\after -> Set.difference <$> after <*> before) <$> check (pure Nothing))
-    let breaking = Map.fromListWith (\_ earlier -> earlier) [(a, message) | (s, _, message) <- maybe [] Set.toList checked, Just a <- [Map.lookup s bySignature]]
-        passed = Set.fromList [a | isJust checked, a <- plpgsql <> sqlBodies, a `Map.notMember` breaking, Just def <- [definitionOf a], not ("execute" `T.isInfixOf` T.toLower def)]
+                    $ withEditedTable conn baseline table env.statements (check deps.dbTempTables) (\before -> (\after -> (,) <$> before <*> after) <$> check (pure Nothing))
+    let checked = Set.filter (\(_, _, message) -> not (rowTypeCall message)) . uncurry (flip Set.difference) <$> results
+        unchecked = Set.fromList [s | Just (_, after) <- [results], (s, _, message) <- Set.toList after, notChecked `T.isPrefixOf` message]
+        breaking = Map.fromListWith (\_ earlier -> earlier) [(a, message) | (s, _, message) <- maybe [] Set.toList checked, Just a <- [Map.lookup s bySignature]]
+        passed = Set.fromList [a | isJust checked, a <- plpgsql <> sqlBodies, a `Map.notMember` breaking, signature a `Set.notMember` unchecked, Just def <- [definitionOf a], not ("execute" `T.isInfixOf` T.toLower def)]
     pure BodyResults{breaking, passed}
 
 

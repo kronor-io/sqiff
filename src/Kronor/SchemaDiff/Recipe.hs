@@ -323,11 +323,13 @@ definition ctx key object change = case object of
                         _ -> []
                     <> notNullSteps old new
                     <> case (old.identity, new.identity) of
-                        _ | serialToIdentity, Just k <- new.identity -> [create (Shared, []) (toIdentity k)]
+                        _ | serialToIdentity, Just k <- new.identity -> [create (Shared, []) (toIdentity (k <> " as identity" <> identityOptionsSql new.identityOptions))]
                         _ | identityToSerial -> [create (Shared, []) (toSerial new.colType)]
-                        (Nothing, Just k) -> [create (Shared, []) [i|#{col}add generated #{k} as identity|]]
+                        (Nothing, Just k) -> [create (Shared, []) (col <> "add generated " <> k <> " as identity" <> identityOptionsSql new.identityOptions)]
                         (Just _, Nothing) -> [create (Shared, []) (col <> "drop identity")]
-                        (Just a, Just b) | a /= b -> [create (Shared, []) (col <> "set generated " <> b)]
+                        (Just a, Just b) ->
+                            let clauses = ["set generated " <> b | a /= b] <> identityOptionChanges old.identityOptions new.identityOptions
+                             in [create (Shared, []) (col <> T.unwords clauses) | not (null clauses)]
                         _ -> []
                     <> case (old.generated, new.generated) of
                         (Just (k, _), Just (k', e))
@@ -350,7 +352,7 @@ begin
     select relacl into acl from pg_class where oid = seq::regclass;
     #{col}drop default;
     execute format('drop sequence %s', seq);
-    #{col}add generated #{k} as identity;
+    #{col}add generated #{k};
     perform setval(pg_get_serial_sequence(#{tableLit}, #{columnLit}), last, called);
     #{grantAcl serialOf}
 end $$|]
@@ -460,7 +462,12 @@ end $$|]
                     ]
       where
         addIndex def
-            | onOnly def = [create (Shared, [WriteLock, EveryPartition, IndexBuild]) (T.replace " ON ONLY " " ON " def)]
+            | onOnly def =
+                [ create (Shared, []) def
+                , create
+                    (Shared, [Manual [i|build the index on each partition with create index concurrently, then alter index #{qualified ix} attach partition each one; it stays invalid until every partition has one|]])
+                    [i|-- create index concurrently and attach partition for #{qualified ix}|]
+                ]
             | indexTable def `elem` map (Just . qualified) (Set.toList ctx.newTables) = [create (Shared, []) def]
             | otherwise = [create (None, [IndexBuild]) (concurrentBuild ix (T.replace " INDEX " " INDEX CONCURRENTLY " def))]
         onOnly def = " ON ONLY " `T.isInfixOf` def
@@ -653,6 +660,7 @@ data ColumnDef = ColumnDef
     , notNullValid :: Bool
     , notNullName :: Maybe Text
     , identity :: Maybe Text
+    , identityOptions :: [Text]
     , generated :: Maybe (Text, Text)
     , defaultExpr :: Maybe Text
     , rewritesOnAdd :: Bool
@@ -661,7 +669,7 @@ data ColumnDef = ColumnDef
 
 
 parseColumn :: Text -> ColumnDef
-parseColumn = foldl' add (ColumnDef "" Nothing False False Nothing Nothing Nothing Nothing False) . T.lines
+parseColumn = foldl' add (ColumnDef "" Nothing False False Nothing Nothing [] Nothing Nothing False) . T.lines
   where
     add c line
         | Just t <- T.stripPrefix "type " line = c{colType = t}
@@ -670,6 +678,7 @@ parseColumn = foldl' add (ColumnDef "" Nothing False False Nothing Nothing Nothi
             let (valid, named) = maybe (True, x) (False,) (T.stripPrefix " not valid" x)
              in c{notNull = True, notNullValid = valid, notNullName = T.stripPrefix " constraint " named}
         | line == "rewrites the table when added" = c{rewritesOnAdd = True}
+        | Just x <- T.stripPrefix "identity options " line = c{identityOptions = T.splitOn ", " x}
         | Just x <- T.stripPrefix "identity " line = c{identity = Just x}
         | Just x <- T.stripPrefix "generated " line = let (kind, expr) = T.breakOn " " x in c{generated = Just (kind, T.drop 1 expr)}
         | Just x <- T.stripPrefix "default " line = c{defaultExpr = Just x}
@@ -683,10 +692,34 @@ columnSql c =
             [ Just c.colType
             , ("collate " <>) <$> c.collation
             , (\(kind, e) -> "generated always as (" <> e <> ") " <> kind) <$> c.generated
-            , (\kind -> [i|generated #{kind} as identity|]) <$> c.identity
+            , (\kind -> [i|generated #{kind} as identity|] <> identityOptionsSql c.identityOptions) <$> c.identity
             , if c.notNull then Just (maybe "" (\n -> [i|constraint #{quoteIdent n} |]) c.notNullName <> "not null") else Nothing
             , ("default " <>) <$> c.defaultExpr
             ]
+
+
+identityOptionsSql :: [Text] -> Text
+identityOptionsSql = \case
+    [] -> ""
+    options -> [i| (#{T.unwords options})|]
+
+
+-- | The @set@ clauses of @alter column@ that turn the identity options @old@ into @new@.
+identityOptionChanges :: [Text] -> [Text] -> [Text]
+identityOptionChanges old new =
+    ["set " <> o | o <- new, o `notElem` old]
+        <> ["set " <> reset k | k <- nubOrd (map optionKey old), k `notElem` map optionKey new]
+  where
+    optionKey o = if o == "cycle" then o else T.stripEnd (fst (T.breakOnEnd " " o))
+    minimum' = fromMaybe "1" (L.headMaybe [v | o <- new, Just v <- [T.stripPrefix "minvalue " o]])
+    reset = \case
+        "increment by" -> "increment by 1"
+        "minvalue" -> "no minvalue"
+        "maxvalue" -> "no maxvalue"
+        "start with" -> "start with " <> minimum'
+        "cache" -> "cache 1"
+        "cycle" -> "no cycle"
+        k -> k
 
 
 extensionParts :: Text -> (Text, Text)

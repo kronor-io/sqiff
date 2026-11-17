@@ -18,6 +18,8 @@ module Kronor.SchemaDiff.TableEdit (
     typeChangeFacts,
     aside,
     columnOrder,
+    requireScratch,
+    readOnly,
 ) where
 
 import Data.String.Interpolate (i)
@@ -31,6 +33,24 @@ import Kronor.SchemaDiff.Object
 import Kronor.SchemaDiff.Timing (timed)
 import RIO
 import RIO.Map qualified as Map
+
+
+-- | Fails when @conn@ is a standby or streams to standbys: the comparison holds an
+-- exclusive lock on the table for the whole run.
+requireScratch :: Text -> Connection.Connection -> IO ()
+requireScratch name conn = do
+    (standby, standbys) <-
+        Connection.use conn (Session.statement () [singletonStatement| select pg_is_in_recovery() :: bool, (select count(*) from pg_stat_replication) :: int8 |])
+            >>= either (\e -> failWith [i|could not inspect #{name}: #{errorText e}|]) pure
+    when standby $ failWith [i|#{name} is a standby; --db needs a scratch database|]
+    when (standbys > 0) $ failWith [i|#{name} streams to #{standbys} standbys; --db needs a scratch database, since the comparison locks the table exclusively while it runs|]
+
+
+-- | Makes every later transaction on @conn@ read-only.
+readOnly :: Connection.Connection -> IO ()
+readOnly conn =
+    Connection.use conn (Session.script "set default_transaction_read_only = on")
+        >>= either (\e -> failWith [i|could not make the connection read-only: #{errorText e}|]) pure
 
 
 -- | The error PostgreSQL gives for a foreign key from columns of the first types to columns
@@ -197,7 +217,10 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             pure (current, desired, afterResult)
         )
             `finally` void (Connection.use conn (Session.script "rollback"))
-    let all' = diff (\_ a b -> a == b) current (Map.mapWithKey (keepSettings current) desired)
+    let kept = case baseline of
+            BaseFile _ -> desired
+            LiveTable _ _ -> Map.mapWithKey (keepSettings current) desired
+        all' = diff (\_ a b -> a == b) current kept
         reasons = Map.mapMaybeWithKey leftOut all'
     pure
         ( TableEdit

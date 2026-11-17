@@ -36,6 +36,7 @@ module Kronor.SchemaDiff.Catalog (
     relationColumns,
     bodyErrors,
     errorText,
+    notChecked,
     tempTableStatements,
     render,
 ) where
@@ -183,10 +184,11 @@ describeOn conns excluded partitions onlyTable = do
     describeOne conn ((file, body), parity) =
         timed [i|describeQuery #{name} #{maybe "" show parity}|] do
             rows <- run conn (excluded, partitions == IncludePartitions, onlyTable, parity) (describeStatement body)
-            evaluate $ force
-                ( Map.fromList [(ObjectKey (aspectOf name) address, definition) | (_, address, definition) <- rows]
-                , Map.fromList [(ids, address) | (ids, address, _) <- rows]
-                )
+            evaluate
+                $ force
+                    ( Map.fromList [(ObjectKey (aspectOf name) address, definition) | (_, address, definition) <- rows]
+                    , Map.fromList [(ids, address) | (ids, address, _) <- rows]
+                    )
       where
         name = takeBaseName file
 
@@ -450,25 +452,41 @@ bodyErrors conn aside table made signatures sqlSignatures =
     run conn () plpgsqlCheckSchema
         >>= traverse \extSchema -> do
             tempTables <- made >>= maybe (pure (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))) pure
-            _ <- timed "bodyErrors.tempTables" $ guarded (Connection.use conn (Session.script tempTables))
-            plErrors <- for (chunks signatures) (timed "bodyErrors.batch" . inBatches extSchema)
+            made' <- timed "bodyErrors.tempTables" $ guarded (Connection.use conn (Session.script tempTables))
+            recompiled <- if null signatures then pure (Right ()) else timed "bodyErrors.recompile" $ guarded (Connection.use conn (Session.script recompile))
+            plErrors <- case (made', recompiled) of
+                (Left e, _) -> pure [[(s, 0, notChecked <> "plpgsql_check's temp tables could not be made: " <> errorText e) | s <- signatures]]
+                (_, Left e) -> pure [[(s, 0, notChecked <> "the functions could not be recompiled: " <> errorText e) | s <- signatures]]
+                _ -> for (chunks signatures) (timed "bodyErrors.batch" . inBatches extSchema)
             sqlErrors <- for sqlSignatures \signature ->
                 either (\e -> [(signature, 0, errorText e)]) (const [])
                     <$> timed ("bodyErrors.sql " <> signature) (guarded (Connection.use conn (Session.statement signature validate)))
             pure (Set.fromList (concat (plErrors <> sqlErrors)))
   where
     validate = [singletonStatement| select pg_catalog.fmgr_sql_validator(to_regprocedure($1 :: text)) :: text? |]
+    recompile =
+        let list = T.intercalate ", " (map literal signatures)
+         in [i|do $schema_diff$
+declare f record;
+begin
+    for f in select p.oid::regprocedure as signature, p.prosecdef from pg_proc p where p.oid in (select to_regprocedure(s) from unnest(array[#{list}]::text[]) s) loop
+        execute format('alter routine %s %s', f.signature, case when f.prosecdef then 'security definer' else 'security invoker' end);
+    end loop;
+end $schema_diff$|]
     guarded action = do
-        _ <- Connection.use conn (Session.script "savepoint schema_diff_check")
+        savepoint "savepoint schema_diff_check"
         result <- action
-        _ <- Connection.use conn (Session.script (either (const "rollback to savepoint schema_diff_check") (const "release savepoint schema_diff_check") result))
+        savepoint (either (const "rollback to savepoint schema_diff_check") (const "release savepoint schema_diff_check") result)
         pure result
+    savepoint sql = Connection.use conn (Session.script sql) >>= either (\e -> failWith [i|the body check lost its transaction: #{errorText e}|]) pure
     inBatches _ [] = pure []
     inBatches extSchema batch =
         guarded (Connection.use conn (Session.statement (batch, table) (Statement.unpreparable (query extSchema) params decoder))) >>= \case
             Right errors -> pure errors
-            Left _
-                | [_] <- batch -> pure []
+            Left e@(Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError _))
+                | [s] <- batch -> pure [(s, 0, notChecked <> errorText e)]
+            Left e
+                | [_] <- batch -> failWith [i|the body check failed: #{errorText e}|]
                 | otherwise -> do
                     let (left, right) = L.splitAt (length batch `div` 2) batch
                     (<>) <$> inBatches extSchema left <*> inBatches extSchema right
@@ -505,6 +523,11 @@ bodyErrors conn aside table made signatures sqlSignatures =
             order by s.n
         |]
     literal t = [i|'#{TP.replace "'" "''" t}'|] :: Text
+
+
+-- | How 'bodyErrors' starts the message for a function it could not check.
+notChecked :: Text
+notChecked = "not checked: "
 
 
 errorText :: Errors.SessionError -> Text
