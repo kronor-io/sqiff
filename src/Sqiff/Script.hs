@@ -3,7 +3,7 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Splits a deploy script into statements, so it can run inside a transaction of ours.
-module Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl) where
+module Sqiff.Script (splitStatements, withoutTransactionControl) where
 
 import Data.Char (isAlphaNum, isAsciiUpper, isDigit, isSpace, toLower)
 import Data.String.Interpolate (i)

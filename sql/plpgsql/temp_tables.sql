@@ -5,7 +5,7 @@
 -- repeats until no new table appears. It warns, whatever client_min_messages says, for
 -- each table that already exists, so a function is described only while none of the
 -- tables it creates do. The statements that made them are appended to the setting
--- schema_diff.temp_tables. @extschema@ is replaced with plpgsql_check's schema; before
+-- sqiff.temp_tables. @extschema@ is replaced with plpgsql_check's schema; before
 -- 2.10 this does nothing.
 set client_min_messages = error;
 do $$
@@ -45,7 +45,7 @@ begin
                     if name is not null and to_regclass(name) is null then
                         ddl := format('create temp table %s %s', name, substring(pragma from '^table:\s*[^(]+(\(.*\))\s*$'));
                         execute ddl;
-                        perform set_config('schema_diff.temp_tables', coalesce(current_setting('schema_diff.temp_tables', true), '') || ddl || E';\n', false);
+                        perform set_config('sqiff.temp_tables', coalesce(current_setting('sqiff.temp_tables', true), '') || ddl || E';\n', false);
                         added := added + 1;
                     end if;
                 end loop;

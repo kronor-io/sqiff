@@ -5,22 +5,22 @@
 
 -- | A scratch PostgreSQL holding the schema a revision's sqitch plan produces, run from a
 -- git worktree at that revision.
-module Kronor.SchemaDiff.Baseline (ensureBaseline) where
+module Sqiff.Baseline (ensureBaseline) where
 
 import Data.String.Interpolate (i)
 import Data.Text.IO qualified as TIO
-import Kronor.SchemaDiff.Catalog (failWith)
-import Kronor.SchemaDiff.Git (Repo, findRepo, git, resolveCommit)
 import RIO
 import RIO.Directory (XdgDirectory (..), createDirectoryIfMissing, doesDirectoryExist, doesFileExist, doesPathExist, findExecutable, getXdgDirectory, removeDirectoryRecursive, removeFile)
 import RIO.FilePath (takeDirectory, (</>))
 import RIO.Text qualified as T
+import Sqiff.Catalog (failWith)
+import Sqiff.Git (Repo, findRepo, git, resolveCommit)
 import System.Environment (getEnvironment)
 import System.Process.Typed (ProcessConfig, nullStream, proc, readProcess, runProcess, setEnv, setStdin, setStdout, useHandleOpen)
 
 
 composeProject :: Text
-composeProject = "schema-diff-baseline"
+composeProject = "sqiff-baseline"
 
 
 port :: Int
@@ -44,7 +44,7 @@ ensureBaseline rev = do
     for_ ["docker", "git"] \tool -> do
         found <- findExecutable tool
         when (isNothing found) $ failWith [i|#{tool} is not on PATH; the baseline database needs it|]
-    cache <- getXdgDirectory XdgCache "schema-diff"
+    cache <- getXdgDirectory XdgCache "sqiff"
     let p = Paths{checkout = cache </> "checkout", stateFile = cache </> "baseline-commit"}
     repo <- findRepo "."
     commit <- resolveCommit repo rev
@@ -72,7 +72,7 @@ ensureBaseline rev = do
 
 
 note :: Text -> IO ()
-note message = TIO.hPutStrLn stderr ("schema-diff: " <> message)
+note message = TIO.hPutStrLn stderr ("sqiff: " <> message)
 
 
 -- | Creates the git worktree at @commit@, or moves it there. A checkout that is not a

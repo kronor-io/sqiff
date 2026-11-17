@@ -4,7 +4,7 @@
 {-# LANGUAGE NoFieldSelectors #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
-module SchemaDiff (main) where
+module Sqiff (main) where
 
 import Data.Algorithm.Diff (PolyDiff (..), getDiff)
 import Data.Char (isAlphaNum)
@@ -12,20 +12,6 @@ import Data.String.Interpolate (i)
 import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime, defaultTimeLocale, formatTime, getCurrentTime)
 import Hasql.Connection qualified as Connection
-import Kronor.SchemaDiff.Baseline (ensureBaseline)
-import Kronor.SchemaDiff.Body (BodyCheck, checkBodies, sameDefinition)
-import Kronor.SchemaDiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), Partitions (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, notChecked, plpgsqlFunctions, relationColumns, render, tempTableStatements)
-import Kronor.SchemaDiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
-import Kronor.SchemaDiff.Folder (Existing (..), writeFolder)
-import Kronor.SchemaDiff.Git (Repo, findRepo, showFile)
-import Kronor.SchemaDiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
-import Kronor.SchemaDiff.Plan (context, invert, plan, planWith, renderStep, topoOrder)
-import Kronor.SchemaDiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), parseColumn, recipe, referencedTable, revokeGranted)
-import Kronor.SchemaDiff.Rewrite (Rewrite (..), fileDrift, rewriteFile)
-import Kronor.SchemaDiff.Script (splitStatements, withoutTransactionControl)
-import Kronor.SchemaDiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), deployedChanges, moveToEnd, parsePlan, plannedChanges, readPlan, requireSqitch, reworkEdited, units, writeUnits)
-import Kronor.SchemaDiff.TableEdit (Baseline (..), Drops (..), Live (..), TableEdit (..), TableRewrite (..), TargetType (..), TypeChange (..), aside, columnOrder, compareTable, firstFailure, foreignKeyError, readOnly, requireScratch, typeChangeFacts, withEditedTable)
-import Kronor.SchemaDiff.Timing (measure, timed)
 import Options.Applicative qualified as O
 import RIO
 import RIO.Directory (doesFileExist, makeAbsolute)
@@ -37,6 +23,20 @@ import RIO.NonEmpty (nonEmpty)
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import RIO.Text.Partial qualified as TP
+import Sqiff.Baseline (ensureBaseline)
+import Sqiff.Body (BodyCheck, checkBodies, sameDefinition)
+import Sqiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), Partitions (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, notChecked, plpgsqlFunctions, relationColumns, render, tempTableStatements)
+import Sqiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
+import Sqiff.Folder (Existing (..), writeFolder)
+import Sqiff.Git (Repo, findRepo, showFile)
+import Sqiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
+import Sqiff.Plan (context, invert, plan, planWith, renderStep, topoOrder)
+import Sqiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), parseColumn, recipe, referencedTable, revokeGranted)
+import Sqiff.Rewrite (Rewrite (..), fileDrift, rewriteFile)
+import Sqiff.Script (splitStatements, withoutTransactionControl)
+import Sqiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), deployedChanges, moveToEnd, parsePlan, plannedChanges, readPlan, requireSqitch, reworkEdited, units, writeUnits)
+import Sqiff.TableEdit (Baseline (..), Drops (..), Live (..), TableEdit (..), TableRewrite (..), TargetType (..), TypeChange (..), aside, columnOrder, compareTable, firstFailure, foreignKeyError, readOnly, requireScratch, typeChangeFacts, withEditedTable)
+import Sqiff.Timing (measure, timed)
 import System.Environment (lookupEnv)
 
 
@@ -109,11 +109,11 @@ pgClass = 1259
 
 bodyNotes :: Text -> Maybe Skipped -> [Text]
 bodyNotes label = \case
-    Nothing -> ["schema-diff: plpgsql_check is not installed; PL/pgSQL body dependencies are left out"]
+    Nothing -> ["sqiff: plpgsql_check is not installed; PL/pgSQL body dependencies are left out"]
     Just [] -> []
     Just skipped ->
         let n = length skipped
-         in [i|schema-diff: plpgsql_check could not analyse #{n} PL/pgSQL functions on #{label}; their body dependencies are left out:|]
+         in [i|sqiff: plpgsql_check could not analyse #{n} PL/pgSQL functions on #{label}; their body dependencies are left out:|]
                 : [[i|  #{name}: #{reason}|] | (name, reason) <- skipped]
 
 
@@ -476,7 +476,7 @@ data SqitchOptions = SqitchOptions
 main :: IO ()
 main =
     handleAny unexpected
-        . handle (\(UserError message) -> TIO.hPutStrLn stderr [i|schema-diff: #{message}|] >> exitWith (ExitFailure 2))
+        . handle (\(UserError message) -> TIO.hPutStrLn stderr [i|sqiff: #{message}|] >> exitWith (ExitFailure 2))
         $ O.execParser (O.info (commandParser O.<**> O.helper) O.fullDesc)
         >>= \case
             Describe name out replace scope -> do
@@ -528,7 +528,7 @@ main =
   where
     unexpected e = case fromException e of
         Just code -> throwIO (code :: ExitCode)
-        Nothing -> TIO.hPutStrLn stderr [i|schema-diff: #{displayException e}|] >> exitWith (ExitFailure 2)
+        Nothing -> TIO.hPutStrLn stderr [i|sqiff: #{displayException e}|] >> exitWith (ExitFailure 2)
 
 
 -- | What the table command works on: its options, the deploy file before and after the
@@ -670,7 +670,7 @@ rewriteFromDatabase = do
                 if entries sqitchPlan > entries basePlan
                     then say [i|rewrote #{changeName}; the branch already reworks it|]
                     else do
-                        liftIO $ reworkEdited env.root opts.top sqitchPlan tagName changeName [i|schema-diff: #{changeName} as the database has it|] current PreviousFileRuns
+                        liftIO $ reworkEdited env.root opts.top sqitchPlan tagName changeName [i|sqiff: #{changeName} as the database has it|] current PreviousFileRuns
                         say [i|rewrote and reworked #{changeName}|]
 
 
@@ -1059,7 +1059,7 @@ writeMigration conn baseline edit f = do
         afterUnits <- liftIO (readPlan (root </> opts.planPath))
         timed "write.reworkEdited"
             . liftIO
-            $ reworkEdited root opts.top afterUnits tagName changeName [i|schema-diff: #{changeName} as edited|] env.original (maybe PreviousFileRuns (const PreviousFileFails) oldFileFails)
+            $ reworkEdited root opts.top afterUnits tagName changeName [i|sqiff: #{changeName} as edited|] env.original (maybe PreviousFileRuns (const PreviousFileFails) oldFileFails)
     when alreadyReworked . liftIO $ moveToEnd (root </> opts.planPath) changeName
     for_ written \u -> let name = u.changeName in say [i|added #{name}|]
     say
@@ -1070,7 +1070,7 @@ writeMigration conn baseline edit f = do
 
 
 -- | Whether a sqitch change is about the table, by the names create-migration and
--- schema-diff give: <schema>/table/<table>/index/…, or <schema>.<table> in a migration's name.
+-- sqiff give: <schema>/table/<table>/index/…, or <schema>.<table> in a migration's name.
 forTable :: QName -> Text -> Bool
 forTable t n =
     let (schema, name) = (t.schema, t.name)
@@ -1151,7 +1151,7 @@ commandParser =
         Describe
             <$> O.strOption (O.long "db" <> O.metavar "CONNINFO|local" <> O.help "local is the dev stack's database")
             <*> O.optional (O.strOption (O.long "out" <> O.metavar "DIR"))
-            <*> O.flag KeepExisting ReplaceOwn (O.long "replace" <> O.help "Clear --out first, if schema-diff wrote it")
+            <*> O.flag KeepExisting ReplaceOwn (O.long "replace" <> O.help "Clear --out first, if sqiff wrote it")
             <*> scopeParser
     diffParser = twoDatabases Diff
     scopeParser =
@@ -1195,9 +1195,9 @@ report key change dependents = do
         Comment -> " (comment)"
 
 
--- | The tag a rework gets when none is named: today's date with @_schema_diff@.
+-- | The tag a rework gets when none is named: today's date with @_sqiff@.
 defaultTag :: UTCTime -> Text
-defaultTag now = let day = formatTime defaultTimeLocale "%Y-%m-%d" now in [i|#{day}_schema_diff|]
+defaultTag now = let day = formatTime defaultTimeLocale "%Y-%m-%d" now in [i|#{day}_sqiff|]
 
 
 summary :: Map ObjectKey Change -> Text

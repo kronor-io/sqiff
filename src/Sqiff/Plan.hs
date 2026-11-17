@@ -4,19 +4,19 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Orders recipe steps: drops before creates, then by rank, then by dependencies.
-module Kronor.SchemaDiff.Plan (plan, planWith, context, invert, renderStep, topoOrder) where
+module Sqiff.Plan (plan, planWith, context, invert, renderStep, topoOrder) where
 
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
-import Kronor.SchemaDiff.Body (BodyCheck)
-import Kronor.SchemaDiff.Catalog (Aspect (..), Edge (..), ObjectKey (..), Schema, render)
-import Kronor.SchemaDiff.Diff (Change (..))
-import Kronor.SchemaDiff.Object
-import Kronor.SchemaDiff.Recipe
 import RIO
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
+import Sqiff.Body (BodyCheck)
+import Sqiff.Catalog (Aspect (..), Edge (..), ObjectKey (..), Schema, render)
+import Sqiff.Diff (Change (..))
+import Sqiff.Object
+import Sqiff.Recipe
 
 
 -- | @fromEdges@ come from the database being changed; @toEdges@ and @checks@ from the desired one.

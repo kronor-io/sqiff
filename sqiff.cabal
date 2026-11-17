@@ -1,5 +1,5 @@
 cabal-version:      3.0
-name:               kronor-schema-diff
+name:               sqiff
 version:            0.1.0.0
 synopsis:           Describe and diff PostgreSQL schemas from their catalogs
 build-type:         Simple
@@ -23,20 +23,20 @@ library
   import:          shared
   hs-source-dirs:  src
   exposed-modules:
-    Kronor.SchemaDiff.Baseline
-    Kronor.SchemaDiff.Body
-    Kronor.SchemaDiff.Catalog
-    Kronor.SchemaDiff.Diff
-    Kronor.SchemaDiff.Folder
-    Kronor.SchemaDiff.Git
-    Kronor.SchemaDiff.Object
-    Kronor.SchemaDiff.Plan
-    Kronor.SchemaDiff.Recipe
-    Kronor.SchemaDiff.Rewrite
-    Kronor.SchemaDiff.Script
-    Kronor.SchemaDiff.Sqitch
-    Kronor.SchemaDiff.TableEdit
-    Kronor.SchemaDiff.Timing
+    Sqiff.Baseline
+    Sqiff.Body
+    Sqiff.Catalog
+    Sqiff.Diff
+    Sqiff.Folder
+    Sqiff.Git
+    Sqiff.Object
+    Sqiff.Plan
+    Sqiff.Recipe
+    Sqiff.Rewrite
+    Sqiff.Script
+    Sqiff.Sqitch
+    Sqiff.TableEdit
+    Sqiff.Timing
 
   build-depends:
     , base
@@ -54,12 +54,12 @@ library
     , typed-process
     , vector
 
-executable schema-diff
+executable sqiff
   import:         shared
   hs-source-dirs: app
-  main-is:        SchemaDiff.hs
+  main-is:        Sqiff.hs
   ghc-options:
-    -main-is SchemaDiff.main -threaded -rtsopts -with-rtsopts=-N4
+    -main-is Sqiff.main -threaded -rtsopts -with-rtsopts=-N4
 
   build-depends:
     , base
@@ -67,7 +67,7 @@ executable schema-diff
     , Diff
     , filepath
     , hasql
-    , kronor-schema-diff
+    , sqiff
     , optparse-applicative
     , rio
     , string-interpolate

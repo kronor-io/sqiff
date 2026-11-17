@@ -4,7 +4,7 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Catalog addresses as one constructor per object kind, and the SQL names to use for them.
-module Kronor.SchemaDiff.Object (
+module Sqiff.Object (
     QName (..),
     RoutineKind (..),
     Object (..),
@@ -17,9 +17,9 @@ module Kronor.SchemaDiff.Object (
 import Data.Char (isAsciiLower, isDigit)
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
-import Kronor.SchemaDiff.Catalog (Address (..))
 import RIO
 import RIO.Set qualified as Set
+import Sqiff.Catalog (Address (..))
 
 
 data QName = QName

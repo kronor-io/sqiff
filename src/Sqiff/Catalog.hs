@@ -8,7 +8,7 @@
 
 -- | Reads a database's schema from its catalog: one definition per object, keyed by
 -- @pg_identify_object_as_address@ so the same object matches across databases.
-module Kronor.SchemaDiff.Catalog (
+module Sqiff.Catalog (
     Aspect (..),
     Address (..),
     ObjectKey (..),
@@ -53,7 +53,6 @@ import Hasql.Errors qualified as Errors
 import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
 import Hasql.TH (maybeStatement, singletonStatement, vectorStatement)
-import Kronor.SchemaDiff.Timing (timed)
 import Pqi.Ffi qualified
 import RIO
 import RIO.FilePath (takeBaseName)
@@ -64,6 +63,7 @@ import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import RIO.Text.Partial qualified as TP
 import RIO.Vector qualified as V
+import Sqiff.Timing (timed)
 
 
 data Aspect = Definition | Privileges | Comment
@@ -330,7 +330,7 @@ tempTableStatements conn =
                     Connection.use conn do
                         Session.script "begin"
                         Session.script (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))
-                        Session.statement () [singletonStatement| select coalesce(current_setting('schema_diff.temp_tables', true), '') :: text |]
+                        Session.statement () [singletonStatement| select coalesce(current_setting('sqiff.temp_tables', true), '') :: text |]
                 _ <- Connection.use conn (Session.script "rollback")
                 pure (either (const Nothing) (Just . ("set client_min_messages = error;\n" <>)) result)
 
@@ -467,17 +467,17 @@ bodyErrors conn aside table made signatures sqlSignatures =
     validate = [singletonStatement| select pg_catalog.fmgr_sql_validator(to_regprocedure($1 :: text)) :: text? |]
     recompile =
         let list = T.intercalate ", " (map literal signatures)
-         in [i|do $schema_diff$
+         in [i|do $sqiff$
 declare f record;
 begin
     for f in select p.oid::regprocedure as signature, p.prosecdef from pg_proc p where p.oid in (select to_regprocedure(s) from unnest(array[#{list}]::text[]) s) loop
         execute format('alter routine %s %s', f.signature, case when f.prosecdef then 'security definer' else 'security invoker' end);
     end loop;
-end $schema_diff$|]
+end $sqiff$|]
     guarded action = do
-        savepoint "savepoint schema_diff_check"
+        savepoint "savepoint sqiff_check"
         result <- action
-        savepoint (either (const "rollback to savepoint schema_diff_check") (const "release savepoint schema_diff_check") result)
+        savepoint (either (const "rollback to savepoint sqiff_check") (const "release savepoint sqiff_check") result)
         pure result
     savepoint sql = Connection.use conn (Session.script sql) >>= either (\e -> failWith [i|the body check lost its transaction: #{errorText e}|]) pure
     inBatches _ [] = pure []

@@ -4,14 +4,14 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Reading revisions with git, also from a jj workspace that has no @.git@ of its own.
-module Kronor.SchemaDiff.Git (Repo (..), findRepo, showFile, resolveCommit, git) where
+module Sqiff.Git (Repo (..), findRepo, showFile, resolveCommit, git) where
 
 import Data.String.Interpolate (i)
-import Kronor.SchemaDiff.Catalog (failWith)
 import RIO
 import RIO.Directory (canonicalizePath, doesDirectoryExist, doesFileExist, makeAbsolute)
 import RIO.FilePath (makeRelative, takeDirectory, (</>))
 import RIO.Text qualified as T
+import Sqiff.Catalog (failWith)
 import System.Process.Typed (ProcessConfig, nullStream, proc, readProcess, setStdin, setWorkingDir)
 
 

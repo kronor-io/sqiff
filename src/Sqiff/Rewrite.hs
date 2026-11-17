@@ -6,7 +6,7 @@
 
 -- | Rewrites a table's deploy file so it creates the table as a database has it, keeping
 -- the file's text wherever it already matches.
-module Kronor.SchemaDiff.Rewrite (
+module Sqiff.Rewrite (
     Rewrite (..),
     rewriteFile,
     fileDrift,
@@ -15,16 +15,16 @@ module Kronor.SchemaDiff.Rewrite (
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, render)
-import Kronor.SchemaDiff.Diff (Change (..), diff)
-import Kronor.SchemaDiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
-import Kronor.SchemaDiff.Recipe (ColumnDef (..), columnSql, parseColumn)
-import Kronor.SchemaDiff.Script (splitStatements)
-import Kronor.SchemaDiff.Sqitch (tidyConstraint, tidyIndex)
 import RIO
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
+import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, render)
+import Sqiff.Diff (Change (..), diff)
+import Sqiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
+import Sqiff.Recipe (ColumnDef (..), columnSql, parseColumn)
+import Sqiff.Script (splitStatements)
+import Sqiff.Sqitch (tidyConstraint, tidyIndex)
 
 
 data Rewrite = Rewrite

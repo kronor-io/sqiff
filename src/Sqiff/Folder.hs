@@ -5,16 +5,16 @@
 
 -- | Writes a schema as one file per object, for example
 -- @table-column/public/payment/amount.sql@.
-module Kronor.SchemaDiff.Folder (Existing (..), writeFolder) where
+module Sqiff.Folder (Existing (..), writeFolder) where
 
 import Crypto.Hash qualified as Hash
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, failWith)
 import RIO
 import RIO.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory, removeDirectoryRecursive)
 import RIO.FilePath (joinPath, takeDirectory, (<.>), (</>))
 import RIO.Map qualified as Map
+import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, failWith)
 
 
 -- | What to do with a folder that is not empty.
@@ -31,17 +31,17 @@ writeFolder existing root schema = do
     unless (null entries) do
         when (existing == KeepExisting) $ failWith (T.pack root <> " is not empty; pass --replace to rewrite it, or choose another folder")
         written <- doesFileExist (root </> marker)
-        unless written $ failWith (T.pack root <> " was not written by schema-diff, so --replace leaves it alone")
+        unless written $ failWith (T.pack root <> " was not written by sqiff, so --replace leaves it alone")
         removeDirectoryRecursive root
     for_ (Map.toList schema) \(key, definition) -> do
         let path = root </> objectPath key
         createDirectoryIfMissing True (takeDirectory path)
         writeFileUtf8 path (definition <> "\n")
-    writeFileUtf8 (root </> marker) "Written by schema-diff describe --out; --replace clears this folder.\n"
+    writeFileUtf8 (root </> marker) "Written by sqiff describe --out; --replace clears this folder.\n"
 
 
 marker :: FilePath
-marker = ".schema-diff"
+marker = ".sqiff"
 
 
 objectPath :: ObjectKey -> FilePath

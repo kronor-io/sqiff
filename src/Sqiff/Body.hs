@@ -5,7 +5,7 @@
 
 -- | Recreates functions with SQL-standard bodies from their printed text in rolled-back
 -- transactions, to see whether that text parses and prints back the same.
-module Kronor.SchemaDiff.Body (
+module Sqiff.Body (
     BodyCheck (..),
     checkBodies,
     sameDefinition,
@@ -17,11 +17,11 @@ import Hasql.Connection qualified as Connection
 import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
 import Hasql.TH (singletonStatement, vectorStatement)
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), errorText, failWith, qualifiedNames)
 import RIO
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Vector qualified as V
+import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), errorText, failWith, qualifiedNames)
 
 
 data BodyCheck

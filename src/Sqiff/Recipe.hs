@@ -4,7 +4,7 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | One fixed recipe per kind of object and kind of change.
-module Kronor.SchemaDiff.Recipe (
+module Sqiff.Recipe (
     Phase (..),
     Txn (..),
     Hazard (..),
@@ -23,14 +23,14 @@ import Data.ByteString qualified as B
 import Data.Char (isAlphaNum)
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
-import Kronor.SchemaDiff.Body (BodyCheck (..))
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..))
-import Kronor.SchemaDiff.Diff (Change (..))
-import Kronor.SchemaDiff.Object
 import RIO
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
+import Sqiff.Body (BodyCheck (..))
+import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..))
+import Sqiff.Diff (Change (..))
+import Sqiff.Object
 
 
 data Phase = DropPhase | CreatePhase

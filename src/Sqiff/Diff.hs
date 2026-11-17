@@ -2,7 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
-module Kronor.SchemaDiff.Diff (
+module Sqiff.Diff (
     Change (..),
     diff,
     affected,
@@ -14,7 +14,6 @@ module Kronor.SchemaDiff.Diff (
 ) where
 
 import Data.Map.Merge.Strict qualified as Merge
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), Edge (..), ObjectKey (..), Schema)
 import RIO
 import RIO.Char (isAlphaNum)
 import RIO.HashSet qualified as HS
@@ -22,6 +21,7 @@ import RIO.Map qualified as Map
 import RIO.NonEmpty qualified as L
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
+import Sqiff.Catalog (Address (..), Aspect (..), Edge (..), ObjectKey (..), Schema)
 
 
 data Change

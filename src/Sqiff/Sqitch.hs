@@ -4,7 +4,7 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Splits a plan into sqitch changes and writes them with sqitch's own commands.
-module Kronor.SchemaDiff.Sqitch (
+module Sqiff.Sqitch (
     UnitKind (..),
     Placement (..),
     PreviousFile (..),
@@ -31,18 +31,18 @@ import Data.Time (UTCTime, addUTCTime, defaultTimeLocale, formatTime)
 import Hasql.Connection qualified as Connection
 import Hasql.Session qualified as Session
 import Hasql.TH (vectorStatement)
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), errorText, failWith, render)
-import Kronor.SchemaDiff.Diff (Change (..))
-import Kronor.SchemaDiff.Object
-import Kronor.SchemaDiff.Plan (invert)
-import Kronor.SchemaDiff.Recipe
-import Kronor.SchemaDiff.Timing (timed)
 import RIO
 import RIO.Directory (doesDirectoryExist, doesFileExist, findExecutable)
 import RIO.FilePath ((<.>), (</>))
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
+import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), errorText, failWith, render)
+import Sqiff.Diff (Change (..))
+import Sqiff.Object
+import Sqiff.Plan (invert)
+import Sqiff.Recipe
+import Sqiff.Timing (timed)
 import System.Process.Typed (proc, runProcess, setWorkingDir)
 
 
@@ -210,7 +210,7 @@ units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (
         | otherwise = "alter"
 
     note :: Text -> Step -> Text
-    note v s = let what = render s.address in [S.i|schema-diff: #{v} #{what}|]
+    note v s = let what = render s.address in [S.i|sqiff: #{v} #{what}|]
 
     isAdded = \case Added _ -> True; _ -> False
 
@@ -501,7 +501,7 @@ writeUnits root topDir sqitchPlan tag us = do
     requireSqitch
     templates <- doesDirectoryExist templateDir
     when (any (\u -> u.kind == ReworkChange && u.changeName `Set.notMember` sqitchPlan.tagged) us)
-        $ sqitch ["tag", tag, "-n", "schema-diff: before the changes it writes"]
+        $ sqitch ["tag", tag, "-n", "sqiff: before the changes it writes"]
     for_ us \u -> do
         let template = if templates && u.kind == AddChange then templateOf u else Nothing
             project = sqitchPlan.project
@@ -556,7 +556,7 @@ reworkEdited root topDir sqitchPlan tag changeName note original previousFile = 
     ( do
             writeFileUtf8 path original
             unless (changeName `Set.member` sqitchPlan.tagged)
-                $ runSqitch root ["tag", tag, "-n", "schema-diff: before the changes it writes"]
+                $ runSqitch root ["tag", tag, "-n", "sqiff: before the changes it writes"]
             runSqitch root ["rework", changeName, "-n", note]
         )
         `finally` writeFileUtf8 path edited

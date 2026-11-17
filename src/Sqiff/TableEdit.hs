@@ -5,7 +5,7 @@
 
 -- | Compares the table a deploy file creates with the one before the edit, or with the
 -- live table, in a transaction that is always rolled back.
-module Kronor.SchemaDiff.TableEdit (
+module Sqiff.TableEdit (
     TableEdit (..),
     Baseline (..),
     Live (..),
@@ -30,12 +30,12 @@ import Data.Text qualified as T
 import Hasql.Connection qualified as Connection
 import Hasql.Session qualified as Session
 import Hasql.TH (singletonStatement, vectorStatement)
-import Kronor.SchemaDiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Partitions (..), Schema, describeOn, errorText, failWith, serverError)
-import Kronor.SchemaDiff.Diff (Change (..), diff)
-import Kronor.SchemaDiff.Object
-import Kronor.SchemaDiff.Timing (timed)
 import RIO
 import RIO.Map qualified as Map
+import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Partitions (..), Schema, describeOn, errorText, failWith, serverError)
+import Sqiff.Diff (Change (..), diff)
+import Sqiff.Object
+import Sqiff.Timing (timed)
 
 
 -- | Fails when @conn@ is a standby or streams to standbys: the comparison holds an
@@ -61,7 +61,7 @@ readOnly conn =
 foreignKeyError :: Connection.Connection -> [(Text, Text)] -> IO (Maybe Text)
 foreignKeyError conn types =
     rolledBack conn "the foreign key check" do
-        result <- Connection.use conn (Session.script [i|create temp table schema_diff_pk (#{columns snd}, primary key (#{names})); create temp table schema_diff_fk (#{columns fst}, foreign key (#{names}) references schema_diff_pk (#{names}))|])
+        result <- Connection.use conn (Session.script [i|create temp table sqiff_pk (#{columns snd}, primary key (#{names})); create temp table sqiff_fk (#{columns fst}, foreign key (#{names}) references sqiff_pk (#{names}))|])
         case result of
             Right () -> pure Nothing
             Left e -> maybe (failWith [i|the foreign key check failed: #{errorText e}|]) (pure . Just . tidy) (serverError e)
@@ -91,9 +91,9 @@ data TypeChange = TypeChange TableRewrite TargetType
 typeChangeFacts :: Connection.Connection -> Text -> Text -> IO (Maybe TypeChange)
 typeChangeFacts conn old new =
     rolledBack conn "the type change check" do
-        made <- Connection.use conn (Session.script [i|create temp table schema_diff_retype (c #{old})|])
+        made <- Connection.use conn (Session.script [i|create temp table sqiff_retype (c #{old})|])
         before <- fileNode
-        altered <- Connection.use conn (Session.script [i|alter table pg_temp.schema_diff_retype alter column c type #{new} using c::#{new}|])
+        altered <- Connection.use conn (Session.script [i|alter table pg_temp.sqiff_retype alter column c type #{new} using c::#{new}|])
         after <- fileNode
         domain <- Connection.use conn (Session.statement new isDomain)
         pure case (made, before, altered, after, domain) of
@@ -107,7 +107,7 @@ typeChangeFacts conn old new =
                 [singletonStatement|
                     select relfilenode::int8
                     from pg_class
-                    where oid = to_regclass('pg_temp.schema_diff_retype')
+                    where oid = to_regclass('pg_temp.sqiff_retype')
                 |]
     isDomain =
         [singletonStatement|
@@ -143,9 +143,9 @@ columnOrder conn table =
 -- transaction under a savepoint that is rolled back.
 firstFailure :: Connection.Connection -> [Text] -> IO (Maybe Text)
 firstFailure conn statements = do
-    _ <- Connection.use conn (Session.script "savepoint schema_diff_first_failure")
+    _ <- Connection.use conn (Session.script "savepoint sqiff_first_failure")
     result <- go (zip [1 :: Int ..] statements)
-    _ <- Connection.use conn (Session.script "rollback to savepoint schema_diff_first_failure")
+    _ <- Connection.use conn (Session.script "rollback to savepoint sqiff_first_failure")
     pure result
   where
     go [] = pure Nothing
@@ -162,7 +162,7 @@ data TableEdit = TableEdit
 
 
 aside :: Text
-aside = "schema_diff_aside"
+aside = "sqiff_aside"
 
 
 -- | What the edited file is compared with.
@@ -229,9 +229,9 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             current <- timed "tableEdit.current" case baseline of
                 _ | describing == SkipDescribe -> pure Map.empty
                 BaseFile base -> do
-                    script "savepoint schema_diff_base"
+                    script "savepoint sqiff_base"
                     built <- build xact "before the edit" base
-                    script "rollback to savepoint schema_diff_base"
+                    script "rollback to savepoint sqiff_base"
                     pure built
                 LiveTable SameDatabase _ -> do
                     schema <- describeTable (QName aside table.name)
