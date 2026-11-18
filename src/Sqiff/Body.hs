@@ -21,7 +21,8 @@ import RIO
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Vector qualified as V
-import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), errorText, failWith, qualifiedNames)
+import Sqiff.Catalog (errorText, failWith, qualifiedNames)
+import Sqiff.Model (Address (..), Aspect (..), ObjectKey (..), fromAddress, isRoutine, toAddress)
 
 
 data BodyCheck
@@ -41,13 +42,13 @@ data BodyCheck
 checkBodies :: Connection.Connection -> Map ObjectKey Text -> IO (Map ObjectKey BodyCheck)
 checkBodies conn schema = qualifiedNames conn do
     sqlBodyFunctions <-
-        if any (\k -> k.address.objectType `elem` ["function", "procedure"]) (Map.keys schema)
+        if any (isRoutine . (.object)) (Map.keys schema)
             then toList <$> run sqlBodies ()
             else pure []
     let keys = Set.fromList [definitionKey (toList names) (toList args) kind | (names, args, kind) <- sqlBodyFunctions]
     Map.traverseWithKey roundTrip (Map.restrictKeys schema keys)
   where
-    definitionKey names args kind = ObjectKey Definition (Address kind names args)
+    definitionKey names args kind = ObjectKey Definition (fromAddress (Address kind names args))
 
     -- Runs the printed definition and compares it with what PostgreSQL prints back.
     roundTrip k original =
@@ -68,7 +69,7 @@ checkBodies conn schema = qualifiedNames conn do
     recreate definition = Session.script (definition <> ";")
 
     printDefinition :: ObjectKey -> Session.Session Text
-    printDefinition k = Session.statement (V.fromList k.address.objectNames, V.fromList k.address.objectArgs) printedSql
+    printDefinition k = let addr = toAddress k.object in Session.statement (V.fromList addr.objectNames, V.fromList addr.objectArgs) printedSql
 
     rolledBack :: Session.Session a -> IO (Either Text a)
     rolledBack session =

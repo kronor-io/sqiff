@@ -14,7 +14,8 @@ import RIO
 import RIO.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory, removeDirectoryRecursive)
 import RIO.FilePath (joinPath, takeDirectory, (<.>), (</>))
 import RIO.Map qualified as Map
-import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, failWith)
+import Sqiff.Catalog (failWith)
+import Sqiff.Model (Address (..), Aspect (..), ObjectKey (..), Schema, toAddress)
 
 
 -- | What to do with a folder that is not empty.
@@ -47,7 +48,7 @@ marker = ".sqiff"
 objectPath :: ObjectKey -> FilePath
 objectPath key = segment addr.objectType </> joinPath (map segment parents) </> (segment name <> args) <.> extension
   where
-    addr = key.address
+    addr = toAddress key.object
 
     (parents, name) = case reverse addr.objectNames of
         [] -> ([], "_")

@@ -1,93 +1,110 @@
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
--- | Catalog addresses as one constructor per object kind, and the SQL names to use for them.
-module Sqiff.Object (
+-- | Names as PostgreSQL stores them, kept apart from SQL text: a name reaches SQL only
+-- through 'quoted' or 'qualified', so it cannot be spliced in unquoted by mistake.
+module Sqiff.Identifier (
+    Identifier,
+    identifier,
+    nameText,
+    quoted,
     QName (..),
-    RoutineKind (..),
-    Object (..),
-    fromAddress,
-    owningTable,
-    quoteIdent,
+    qname,
     qualified,
+    dotted,
+    TypeName,
+    typeName,
+    typeText,
+    quoteIdent,
 ) where
 
 import Data.Char (isAsciiLower, isDigit)
 import Data.String.Interpolate (i)
+import Data.String.Interpolate.Conversion (InterpSink, Interpolatable (..))
 import Data.Text qualified as T
+import GHC.TypeLits (ErrorMessage (..), TypeError)
 import RIO
 import RIO.Set qualified as Set
-import Sqiff.Catalog (Address (..))
 
 
+-- | One name as the catalog stores it: unquoted, case and all.
+newtype Identifier = Identifier Text
+    deriving newtype (Eq, Ord, NFData)
+
+
+-- | Shows the name as SQL would quote it, which keeps test failures readable.
+instance Show Identifier where
+    show = T.unpack . quoted
+
+
+-- | Any text is a name: PostgreSQL quotes what it cannot leave bare.
+identifier :: Text -> Identifier
+identifier = Identifier
+
+
+-- | The name itself, for messages, file names and change names; never for SQL.
+nameText :: Identifier -> Text
+nameText (Identifier t) = t
+
+
+-- | The name as SQL writes it.
+quoted :: Identifier -> Text
+quoted (Identifier t) = quoteIdent t
+
+
+-- | Interpolating a name into SQL would splice it in unquoted: say how to render it.
+instance {-# OVERLAPPING #-} (TypeError ('Text "Interpolate an Identifier with quoted (SQL) or nameText (messages, paths)"), InterpSink flag dst) => Interpolatable flag Identifier dst where
+    interpolate = error "unreachable"
+
+
+instance {-# OVERLAPPING #-} (TypeError ('Text "Interpolate a QName with qualified (SQL) or dotted (messages, paths)"), InterpSink flag dst) => Interpolatable flag QName dst where
+    interpolate = error "unreachable"
+
+
+instance {-# OVERLAPPING #-} (TypeError ('Text "Interpolate a TypeName with typeText"), InterpSink flag dst) => Interpolatable flag TypeName dst where
+    interpolate = error "unreachable"
+
+
+-- | A name in a schema.
 data QName = QName
-    { schema :: Text
-    , name :: Text
+    { schema :: Identifier
+    , name :: Identifier
     }
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Generic)
+    deriving anyclass (NFData)
 
 
-data RoutineKind = Function | Procedure | Aggregate
-    deriving stock (Eq, Ord, Show)
+qname :: Text -> Text -> QName
+qname s n = QName (identifier s) (identifier n)
 
 
-data Object
-    = Schema Text
-    | Extension Text
-    | Table QName
-    | View QName
-    | MaterializedView QName
-    | Column QName Text
-    | TableConstraint QName Text
-    | -- | The domain as @format_type@ prints it, and the constraint name.
-      DomainConstraint Text Text
-    | Index QName
-    | Sequence QName
-    | -- | As @format_type@ prints it: qualified and quoted.
-      Type Text
-    | Routine RoutineKind QName [Text]
-    | Trigger QName Text
-    | Policy QName Text
-    | Unknown Address
-    deriving stock (Eq, Ord, Show)
-
-
-fromAddress :: Address -> Object
-fromAddress addr = case (addr.objectType, addr.objectNames, addr.objectArgs) of
-    ("schema", [s], _) -> Schema s
-    ("extension", [e], _) -> Extension e
-    ("table", [s, n], _) -> Table (QName s n)
-    ("view", [s, n], _) -> View (QName s n)
-    ("materialized view", [s, n], _) -> MaterializedView (QName s n)
-    ("table column", [s, t, c], _) -> Column (QName s t) c
-    ("table constraint", [s, t, c], _) -> TableConstraint (QName s t) c
-    ("domain constraint", [d], [c]) -> DomainConstraint d c
-    ("index", [s, n], _) -> Index (QName s n)
-    ("sequence", [s, n], _) -> Sequence (QName s n)
-    ("type", [t], _) -> Type t
-    ("function", [s, n], args) -> Routine Function (QName s n) args
-    ("procedure", [s, n], args) -> Routine Procedure (QName s n) args
-    ("aggregate", [s, n], args) -> Routine Aggregate (QName s n) args
-    ("trigger", [s, t, n], _) -> Trigger (QName s t) n
-    ("policy", [s, t, n], _) -> Policy (QName s t) n
-    _ -> Unknown addr
-
-
--- | The table a column, constraint, trigger or policy belongs to. Indexes name their
--- table only in their definition.
-owningTable :: Object -> Maybe QName
-owningTable = \case
-    Column t _ -> Just t
-    TableConstraint t _ -> Just t
-    Trigger t _ -> Just t
-    Policy t _ -> Just t
-    _ -> Nothing
-
-
+-- | @schema.name@, each part quoted as needed.
 qualified :: QName -> Text
-qualified q = quoteIdent q.schema <> "." <> quoteIdent q.name
+qualified q = quoted q.schema <> "." <> quoted q.name
+
+
+-- | @schema.name@ unquoted, as pg_identify_object_as_address and messages give it.
+dotted :: QName -> Text
+dotted q = nameText q.schema <> "." <> nameText q.name
+
+
+-- | A type as @format_type@ prints it: already SQL, qualified and quoted as needed.
+newtype TypeName = TypeName Text
+    deriving newtype (Eq, Ord, Show, NFData)
+
+
+typeName :: Text -> TypeName
+typeName = TypeName
+
+
+-- | The type's SQL text.
+typeText :: TypeName -> Text
+typeText (TypeName t) = t
 
 
 -- | Like PostgreSQL's @quote_ident@: quotes unless the name is lower case and not reserved.

@@ -13,9 +13,9 @@ import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import Sqiff.Body (BodyCheck)
-import Sqiff.Catalog (Aspect (..), Edge (..), ObjectKey (..), Schema, render)
 import Sqiff.Diff (Change (..))
-import Sqiff.Object
+import Sqiff.Identifier
+import Sqiff.Model
 import Sqiff.Recipe
 
 
@@ -34,10 +34,10 @@ planWith adjust checks fromSchema toSchema fromEdges toEdges changes =
             | (n, s) <- zip [0 :: Int ..] (concatMap (uncurry (recipe (adjust (context checks fromSchema toSchema fromEdges changes)))) (Map.toList changes))
             ]
   where
-    stepObjects = Set.fromList [fromAddress k.address | k <- Map.keys changes]
+    stepObjects = Set.fromList [k.object | k <- Map.keys changes]
 
     withOwners edges =
-        [(fromAddress e.dependent, fromAddress e.referenced) | e <- edges]
+        [(e.dependent, e.referenced) | e <- edges]
             <> [(o, Table t) | o <- Set.toList stepObjects, Just t <- [owningTable o]]
 
     createOrder = indexOf (topoOrder stepObjects (withOwners toEdges))
@@ -53,14 +53,14 @@ context :: Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> Map ObjectKe
 context checks fromSchema toSchema fromEdges changes =
     Context
         { bodyChecks = Map.intersectionWith (,) toSchema checks
-        , withDependents = Set.fromList [fromAddress e.referenced | e <- fromEdges]
+        , withDependents = Set.fromList [e.referenced | e <- fromEdges]
         , recreatedViews =
             Map.fromList
                 [ (v, (indexesOn v, (grantsKey,) <$> Map.lookup grantsKey toSchema))
                 | (k, Changed _ _) <- Map.toList changes
                 , k.aspect == Definition
                 , let grantsKey = k{aspect = Privileges}
-                , MaterializedView v <- [fromAddress k.address]
+                , MaterializedView v <- [k.object]
                 ]
         , newTables = tablesWith isAdded
         , droppedTables = tablesWith isDropped
@@ -70,7 +70,7 @@ context checks fromSchema toSchema fromEdges changes =
                 | (k, def) <- Map.toList fromSchema <> Map.toList toSchema
                 , k.aspect == Definition
                 , any ("partition by " `T.isPrefixOf`) (T.lines def)
-                , Table t <- [fromAddress k.address]
+                , Table t <- [k.object]
                 ]
         , droppedColumns = Set.fromList [(t, c) | (Column t c, Dropped _) <- definitions]
         , retypedColumns =
@@ -82,21 +82,21 @@ context checks fromSchema toSchema fromEdges changes =
                 , o.colType /= n.colType || o.collation /= n.collation
                 ]
         , viewsAround = Map.empty
-        , droppedObjects = Set.fromList [k.address | (k, Dropped _) <- Map.toList changes, k.aspect == Definition]
+        , droppedObjects = Set.fromList [k.object | (k, Dropped _) <- Map.toList changes, k.aspect == Definition]
         , newTableColumns =
             Map.fromListWith
                 (flip (<>))
                 [(t, [(c, parseColumn def)]) | (Column t c, Added def) <- definitions, t `Set.member` tablesWith isAdded]
         }
   where
-    definitions = [(fromAddress k.address, change) | (k, change) <- Map.toList changes, k.aspect == Definition]
+    definitions = [(k.object, change) | (k, change) <- Map.toList changes, k.aspect == Definition]
     indexesOn v =
         [ def
         | (k, def) <- Map.toList toSchema
         , k.aspect == Definition
         , k `Map.notMember` changes
         , [i| ON #{qualified v} |] `T.isInfixOf` def
-        , Index _ <- [fromAddress k.address]
+        , Index _ <- [k.object]
         ]
     tablesWith p = Set.fromList [t | (Table t, change) <- definitions, p change]
     isAdded = \case Added _ -> True; _ -> False
@@ -137,7 +137,7 @@ topoOrder nodes pairs = go ready0 indegree0 []
 renderStep :: Step -> Text
 renderStep s =
     T.unlines
-        $ ["-- " <> render s.address]
+        $ ["-- " <> render s.object]
         <> ["-- " <> note | note <- txnNote <> map hazardText s.hazards]
         <> [s.sql <> if "--" `T.isPrefixOf` s.sql then "" else ";"]
   where

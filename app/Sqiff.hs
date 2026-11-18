@@ -1,4 +1,5 @@
 {-# LANGUAGE DisambiguateRecordFields #-}
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
@@ -26,12 +27,13 @@ import RIO.Text qualified as T
 import RIO.Text.Partial qualified as TP
 import Sqiff.Baseline (ensureBaseline)
 import Sqiff.Body (BodyCheck, checkBodies, sameDefinition)
-import Sqiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), Partitions (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, notChecked, plpgsqlFunctions, relationColumns, render, tempTableStatements)
+import Sqiff.Catalog (Addresses, CatalogId (..), Partitions (..), PlFunction (..), PlFunctions (..), Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, notChecked, pgClass, pgProc, plpgsqlFunctions, relationColumns, tempTableStatements)
 import Sqiff.Config (Config (..), Layout (..), Names (..), fill, loadConfig, match, sqitchLayout)
 import Sqiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
 import Sqiff.Folder (Existing (..), writeFolder)
 import Sqiff.Git (Repo, findRepo, showFile)
-import Sqiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
+import Sqiff.Identifier
+import Sqiff.Model
 import Sqiff.Plan (context, invert, plan, planWith, renderStep, topoOrder)
 import Sqiff.Recipe (ColumnDef (..), Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), parseColumn, recipe, referencedTable, revokeGranted)
 import Sqiff.Rewrite (Rewrite (..), fileDrift, rewriteFile)
@@ -56,9 +58,9 @@ data BodyChecks = CheckBodies | SkipBodyChecks
 -- | Which edges a command uses.
 data Needed
     = -- | Edges from @pg_depend@, and the body edges 'affected' can reach from these.
-      ReachableFrom (Set Address)
+      ReachableFrom (Set ObjectId)
     | -- | Edges from @pg_depend@, and edges from the bodies of these functions only.
-      BodiesOf (Set Address)
+      BodiesOf (Set ObjectId)
     | -- | None; plpgsql_check still lists the functions it cannot analyse.
       NoEdges
 
@@ -72,23 +74,24 @@ data Purpose = ForDiff | ForPlan
 neededFor :: Purpose -> Map ObjectKey Change -> Needed
 neededFor purpose changes
     | Map.null changes = NoEdges
-    | purpose == ForPlan = BodiesOf (Set.fromList [k.address | k <- Map.keys changes])
+    | purpose == ForPlan = BodiesOf (Set.fromList [k.object | k <- Map.keys changes])
     | null starts = NoEdges
     | otherwise = ReachableFrom (Set.fromList starts)
   where
-    starts = [k.address | (k, c) <- Map.toList changes, k.aspect == Definition, removesOrChanges c]
+    starts = [k.object | (k, c) <- Map.toList changes, k.aspect == Definition, removesOrChanges c]
     removesOrChanges = \case Added _ -> False; _ -> True
 
 
 -- | Edges from @pg_depend@ and, when plpgsql_check is installed, from PL/pgSQL bodies,
 -- with notes for stderr. @label@ names the database in the notes.
 edgesOf :: Text -> Scope -> Needed -> Connected -> IO ([Edge], [Text])
-edgesOf label scope needed connected@(Connected conn extra _ addresses made) = timed [i|edgesOf #{label}|] case needed of
-    ReachableFrom starts -> let Connected _ _ schema _ _ = connected in reachableEdges label scope starts connected (routineWords schema)
+edgesOf label scope needed connected = timed [i|edgesOf #{label}|] case needed of
+    ReachableFrom starts -> reachableEdges label scope starts connected (routineWords connected.schema)
     _ -> do
-        let wantedIds wanted = [ids | (ids, addr) <- Map.toList addresses, addr `Set.member` wanted]
+        let Connected{conn, extra, addresses, tempTableScript = made} = connected
+            wantedIds wanted = [ids | (ids, object) <- Map.toList addresses, object `Set.member` wanted]
             only = case needed of
-                BodiesOf wanted -> Just (Set.fromList [oid | (classid, oid, _) <- wantedIds wanted, classid == pgProc])
+                BodiesOf wanted -> Just (Set.fromList [ids.objectOid | ids <- wantedIds wanted, ids.classId == pgProc])
                 _ -> Just Set.empty
         (edges, body) <-
             concurrently
@@ -98,14 +101,6 @@ edgesOf label scope needed connected@(Connected conn extra _ addresses made) = t
                 )
                 (timed [i|edgesOf.bodyUses #{label}|] $ fmap (first (edgesBetween addresses)) <$> bodyUses (fromMaybe (conn :| []) (nonEmpty extra)) scope.excluded only made)
         pure (edges <> maybe [] fst body, bodyNotes label (snd <$> body))
-
-
-pgProc :: Int64
-pgProc = 1255
-
-
-pgClass :: Int64
-pgClass = 1259
 
 
 bodyNotes :: Text -> Maybe Skipped -> [Text]
@@ -120,11 +115,12 @@ bodyNotes label = \case
 
 -- | The @pg_depend@ edges reachable from @starts@, and the body edges of the PL/pgSQL
 -- functions 'bodiesToAnalyse' picks, repeated until nothing new is reached or picked.
-reachableEdges :: Text -> Scope -> Set Address -> Connected -> IO (Map Address BodyText) -> IO ([Edge], [Text])
-reachableEdges label scope starts (Connected conn extra schema addresses made) splitWords = timed [i|reachableEdges #{label}|] do
-    let idsOf = Map.fromListWith (<>) [(addr, [ids]) | (ids, addr) <- Map.toList addresses]
+reachableEdges :: Text -> Scope -> Set ObjectId -> Connected -> IO (Map ObjectId BodyText) -> IO ([Edge], [Text])
+reachableEdges label scope starts Connected{conn, extra, schema, addresses, tempTableScript = made} splitWords = timed [i|reachableEdges #{label}|] do
+    let idsOf = Map.fromListWith (<>) [(object, [ids]) | (ids, object) <- Map.toList addresses]
         idsFor = concatMap (\a -> Map.findWithDefault [] a idsOf) . Set.toList
-        columnsOf = Map.fromListWith (<>) [(rel, [addr]) | ((classid, objid, sub), addr) <- Map.toList addresses, classid == pgClass, sub > 0, Just rel <- [Map.lookup (pgClass, objid, 0) addresses]]
+        relationWith ids = Map.lookup (CatalogId pgClass ids.objectOid 0) addresses
+        columnsOf = Map.fromListWith (<>) [(rel, [object]) | (ids, object) <- Map.toList addresses, ids.classId == pgClass, ids.subId > 0, Just rel <- [relationWith ids]]
         withColumns xs = xs <> Set.fromList (concatMap (\a -> Map.findWithDefault [] a columnsOf) (Set.toList xs))
     (edges, functions) <-
         concurrently
@@ -133,13 +129,13 @@ reachableEdges label scope starts (Connected conn extra schema addresses made) s
                 $ plpgsqlFunctions (fromMaybe conn (listToMaybe extra)) scope.excluded
                 >>= traverse \fs -> do
                     split_ <- splitWords
-                    let wordsAt addr = fromMaybe (bodyText (Map.findWithDefault "" (ObjectKey Definition addr) schema)) (Map.lookup addr split_)
+                    let wordsAt object = fromMaybe (bodyText (Map.findWithDefault "" (definitionKey object) schema)) (Map.lookup object split_)
                         split part = do
                             let described =
                                     [ (f, addr, wordsAt addr, trigger)
                                     | f <- part
-                                    , let trigger = f.relid >>= \r -> Map.lookup (pgClass, r, 0) addresses
-                                    , Just addr <- [Map.lookup (pgProc, f.oid, 0) addresses]
+                                    , let trigger = f.relid >>= \r -> Map.lookup (CatalogId pgClass r 0) addresses
+                                    , Just addr <- [Map.lookup (CatalogId pgProc f.oid 0) addresses]
                                     ]
                             _ <- evaluate (foldl' (\n (_, _, b, _) -> n + HS.size b.wordSet) (0 :: Int) described)
                             pure described
@@ -151,7 +147,7 @@ reachableEdges label scope starts (Connected conn extra schema addresses made) s
         Nothing -> pure (edges, bodyNotes label Nothing)
         Just (fs, described) -> do
             let position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
-                implicit = [a | o <- fs.implicit, Just a <- [Map.lookup (pgProc, o, 0) addresses]]
+                implicit = [a | o <- fs.implicit, Just a <- [Map.lookup (CatalogId pgProc o 0) addresses]]
                 go explored pgEdges done bodyEdges failed = do
                     let dependents = dependentsBy (pgEdges <> bodyEdges)
                         frontier = (starts <> reachedFrom dependents starts) `Set.difference` explored
@@ -174,9 +170,9 @@ reachableEdges label scope starts (Connected conn extra schema addresses made) s
 
 
 -- | The words of every function's and procedure's definition, split on every core.
-routineWords :: Schema -> IO (Map Address BodyText)
+routineWords :: Schema -> IO (Map ObjectId BodyText)
 routineWords schema = do
-    let routines = [(k.address, def) | (k, def) <- Map.toList schema, k.aspect == Definition, k.address.objectType `elem` ["function", "procedure"]]
+    let routines = [(k.object, def) | (k, def) <- Map.toList schema, k.aspect == Definition, isRoutine k.object]
         split part = do
             let split_ = [(addr, bodyText def) | (addr, def) <- part]
             _ <- evaluate (foldl' (\n (_, b) -> n + HS.size b.wordSet + T.length b.lowered) (0 :: Int) split_)
@@ -192,28 +188,31 @@ dependentsScope excluded = Scope{excluded, partitions = SkipPartitions, bodyChec
 
 -- | For each dropped or changed definition, its dependents by @pg_depend@ and PL/pgSQL
 -- bodies, and the other functions whose text names it.
-dependentsIn :: [Text] -> IO (Connected, Map Address BodyText) -> Map ObjectKey Change -> IO Dependents
+dependentsIn :: [Text] -> IO (Connected, Map ObjectId BodyText) -> Map ObjectKey Change -> IO Dependents
 dependentsIn excluded described changes
     | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty [] (pure Nothing))
     | otherwise = do
-        (connected@(Connected conn _ schema _ made), split_) <- timed "deps.describeDatabase" described
+        (connected@Connected{conn, schema, tempTableScript = made}, split_) <- timed "deps.describeDatabase" described
         (edges, notes) <- timed "deps.reachableEdges" $ reachableEdges "--db" (dependentsScope excluded) starts connected (pure split_)
         for_ notes (TIO.hPutStrLn stderr)
-        let known = Set.fromList [k.address | k <- Map.keys schema, k.aspect == Definition]
+        let known = Set.fromList [k.object | k <- Map.keys schema, k.aspect == Definition]
             exact = affected known edges changes
-            viewsOf addr = [(s, v) | a <- Set.toList (Map.findWithDefault Set.empty addr exact), a.objectType `elem` ["view", "materialized view"], [s, v] <- [a.objectNames]]
+            viewsOf object = [v | a <- Set.toList (Map.findWithDefault Set.empty object exact), isView a, Just v <- [isRelation a]]
         measure "deps.affected" (Map.foldl' (\n s -> n + Set.size s) (0 :: Int) exact)
         viewColumns <- timed "deps.relationColumns" $ relationColumns conn (Set.toList (Set.fromList (concatMap viewsOf (Set.toList starts))))
         let routines = Map.toList split_
-            skip = Set.fromList (map (.address) (Map.keys changes)) <> fold exact
-            throughViews column addr =
-                [ T.toLower s : T.toLower v : [T.toLower c | Just c <- [column], keepsName c]
-                | (s, v) <- viewsOf addr
-                , let keepsName c = c `Set.member` Map.findWithDefault Set.empty (s, v) viewColumns
+            skip = Set.fromList (map (.object) (Map.keys changes)) <> fold exact
+            lower = T.toLower . nameText
+            throughViews column object =
+                [ lower v.schema : lower v.name : [lower c | Just c <- [column], keepsName c]
+                | v <- viewsOf object
+                , let keepsName c = c `Set.member` Map.findWithDefault Set.empty v viewColumns
                 ]
-            named addr = case (addr.objectType, addr.objectNames) of
-                ("table column", [_, t, c]) -> [T.toLower t, T.toLower c] : throughViews (Just c) addr
-                (kind, [_, t]) | kind `elem` relationKinds, droppedHere addr -> [T.toLower t] : throughViews Nothing addr
+            -- The words a function body must contain to use the object: a column by its
+            -- table and name, a dropped relation by its name, and both through views.
+            named object = case object of
+                Column t c -> [lower t.name, lower c] : throughViews (Just c) object
+                _ | Just q <- isRelation object, droppedHere object -> [lower q.name] : throughViews Nothing object
                 _ -> []
             textual =
                 Map.filter (not . Set.null)
@@ -226,18 +225,17 @@ dependentsIn excluded described changes
         measure "deps.textMatch" (Map.foldl' (\n s -> n + Set.size s) (0 :: Int) textual)
         pure (Dependents exact textual schema edges made)
   where
-    relationKinds = ["table", "view", "materialized view", "foreign table"]
-    droppedHere addr = case Map.lookup (ObjectKey Definition addr) changes of
+    droppedHere object = case Map.lookup (definitionKey object) changes of
         Just (Dropped _) -> True
         _ -> False
-    starts = Set.fromList [k.address | (k, c) <- Map.toList changes, k.aspect == Definition, removesOrChanges c]
+    starts = Set.fromList [k.object | (k, c) <- Map.toList changes, k.aspect == Definition, removesOrChanges c]
     removesOrChanges = \case Added _ -> False; _ -> True
 
 
 -- | What depends on an edit's dropped or changed objects, in the database it runs on.
 data Dependents = Dependents
-    { exact :: Map Address (Set Address)
-    , named :: Map Address (Set Address)
+    { exact :: Map ObjectId (Set ObjectId)
+    , named :: Map ObjectId (Set ObjectId)
     , dbSchema :: Schema
     , dbEdges :: [Edge]
     , dbTempTables :: IO (Maybe Text)
@@ -247,45 +245,39 @@ data Dependents = Dependents
 
 -- | For each retyped column, the statements that drop the views, policies, triggers and
 -- routines that hold it, and the ones that create them again.
-viewsAroundTypeChanges :: Dependents -> [(QName, Text, Address)] -> Map (QName, Text) (Set Address, ([Text], [Text]))
+viewsAroundTypeChanges :: Dependents -> [(QName, Identifier, ObjectId)] -> Map (QName, Identifier) (Set ObjectId, ([Text], [Text]))
 viewsAroundTypeChanges deps retyped =
     Map.fromList
-        [ ((t, c), (members, (map dropView (reverse order), concatMap createView order)))
-        | (t, c, addr) <- retyped
-        , let closure = Map.findWithDefault Set.empty addr deps.exact
-              onColumn = Set.filter (\a -> a.objectType `elem` ["policy", "trigger"] && any (\e -> e.dependent == a && e.referenced == addr) deps.dbEdges) closure
-              members = held addr closure (Set.filter isView closure <> onColumn)
-              order = topoOrder members [(d, r) | e <- deps.dbEdges, let d = relation e.dependent, let r = relation e.referenced, d `Set.member` members, r `Set.member` members]
+        [ ((t, c), (members, (map dropStatement (reverse order), concatMap createAgain order)))
+        | (t, c, column) <- retyped
+        , let closure = Map.findWithDefault Set.empty column deps.exact
+              onColumn = Set.filter (\a -> isPolicyOrTrigger a && any (\e -> e.dependent == a && e.referenced == column) deps.dbEdges) closure
+              members = held column closure (Set.filter isView closure <> onColumn)
+              order = topoOrder members [(d, r) | e <- deps.dbEdges, let d = relationOf e.dependent, let r = relationOf e.referenced, d `Set.member` members, r `Set.member` members]
         , not (Set.null members)
         ]
   where
-    isView a = a.objectType `elem` ["view", "materialized view"]
-    isRoutine a = a.objectType `elem` ["function", "procedure"]
+    isPolicyOrTrigger = \case
+        Policy{} -> True
+        Trigger{} -> True
+        _ -> False
+    -- Adds the routines whose definitions hold the column or one of the members, until
+    -- no more do.
     held column closure members =
         let views = Set.filter isView members
-            holds r = case Map.lookup (ObjectKey Definition r) deps.dbSchema of
+            holds r = case Map.lookup (definitionKey r) deps.dbSchema of
                 Just def
-                    | standardBody def -> any (\e -> e.dependent == r && (e.referenced == column || relation e.referenced `Set.member` members)) deps.dbEdges
-                    | otherwise -> any (\v -> qualifiedAddress v `T.isInfixOf` signature def) views
+                    | standardBody def -> any (\e -> e.dependent == r && (e.referenced == column || relationOf e.referenced `Set.member` members)) deps.dbEdges
+                    | otherwise -> any (\v -> qualifiedName v `T.isInfixOf` signature def) views
                 Nothing -> False
             more = Set.filter (\r -> isRoutine r && r `Set.notMember` members && holds r) closure
          in if Set.null more then members else held column closure (members <> more)
     signature = T.unlines . takeWhile (\l -> not ("AS " `T.isPrefixOf` T.stripStart l || "BEGIN ATOMIC" `T.isInfixOf` l)) . T.lines
-    relation a = case (a.objectType, a.objectNames) of
-        (kind, [s, t, _]) | Just rel <- T.stripSuffix " column" kind -> Address rel [s, t] []
-        _ -> a
     ctx0 = context Map.empty Map.empty Map.empty [] Map.empty
-    dropView a
-        | isRoutine a = let kind = a.objectType; args = T.intercalate ", " a.objectArgs in [i|drop #{kind} #{qualifiedAddress a}(#{args})|]
-        | [s, t, n] <- a.objectNames, a.objectType `elem` ["policy", "trigger"] = let kind = a.objectType in [i|drop #{kind} #{quoteIdent n} on #{qualified (QName s t)}|]
-        | otherwise = let kind = a.objectType in [i|drop #{kind} #{qualifiedAddress a}|]
-    qualifiedAddress a = case a.objectNames of
-        [s, n] -> qualified (QName s n)
-        ns -> T.intercalate "." ns
     stepsFor key c = map (.sql) (recipe ctx0 key c)
-    createView a =
+    createAgain a =
         concat
-            [ [revokeGranted (qualifiedAddress a) | aspect == Privileges, isView a] <> stepsFor key (Added def)
+            [ [revokeGranted (qualifiedName a) | aspect == Privileges, isView a] <> stepsFor key (Added def)
             | aspect <- [Definition, Privileges]
             , let key = ObjectKey aspect a
             , Just def <- [Map.lookup key deps.dbSchema]
@@ -293,17 +285,47 @@ viewsAroundTypeChanges deps retyped =
             <> [ def
                | (k, def) <- Map.toList deps.dbSchema
                , k.aspect == Definition
-               , case fromAddress k.address of
-                    Index _ -> [i| ON #{qualifiedAddress a} |] `T.isInfixOf` def
-                    Trigger t _ -> [t.schema, t.name] == a.objectNames
+               , case k.object of
+                    Index _ -> [i| ON #{qualifiedName a} |] `T.isInfixOf` def
+                    Trigger t _ -> isRelation a == Just t
                     _ -> False
                ]
             <> concat
                 [ stepsFor k (Added def)
                 | (k, def) <- Map.toList deps.dbSchema
                 , k.aspect == Comment
-                , k.address == a || (relation k.address == a && k.address /= a)
+                , k.object == a || (relationOf k.object == a && k.object /= a)
                 ]
+
+
+-- | The relation a column belongs to; any other object is its own.
+relationOf :: ObjectId -> ObjectId
+relationOf = \case
+    Column t _ -> Table t
+    OtherColumn OfView t _ -> View t
+    OtherColumn OfMaterializedView t _ -> MaterializedView t
+    OtherColumn OfCompositeType t _ -> Unknown (Address "composite type" [nameText t.schema, nameText t.name] [])
+    OtherColumn OfForeignTable t _ -> Unknown (Address "foreign table" [nameText t.schema, nameText t.name] [])
+    object -> object
+
+
+-- | An object's name as SQL writes it after its kind.
+qualifiedName :: ObjectId -> Text
+qualifiedName object = case (toAddress object).objectNames of
+    [s, n] -> qualified (qname s n)
+    names -> T.intercalate "." names
+
+
+-- | The statement that drops a view, routine, policy or trigger around a type change.
+dropStatement :: ObjectId -> Text
+dropStatement object = case object of
+    Routine _ q args ->
+        let keyword = (toAddress object).objectType
+            list = T.intercalate ", " (map typeText args)
+         in [i|drop #{keyword} #{qualified q}(#{list})|]
+    Policy t n -> [i|drop policy #{quoted n} on #{qualified t}|]
+    Trigger t n -> [i|drop trigger #{quoted n} on #{qualified t}|]
+    _ -> let keyword = (toAddress object).objectType in [i|drop #{keyword} #{qualifiedName object}|]
 
 
 -- | A SQL-standard body, which PostgreSQL parses once and tracks in pg_depend.
@@ -312,22 +334,22 @@ standardBody def = "BEGIN ATOMIC" `T.isInfixOf` def || any ("RETURN " `T.isPrefi
 
 
 -- | For a foreign key constraint's definition, each of its columns' types paired with the
--- referenced column's, by @typeIn schema table column@.
-foreignKeyTypes :: (Text -> Text -> Text -> Maybe Text) -> Address -> Text -> Maybe [(Text, Text)]
-foreignKeyTypes typeIn k def = do
-    [s, t, _] <- Just k.objectNames
+-- referenced column's, by @typeIn table column@.
+foreignKeyTypes :: (QName -> Identifier -> Maybe Text) -> ObjectId -> Text -> Maybe [(Text, Text)]
+foreignKeyTypes typeIn constraint def = do
+    TableConstraint table _ <- Just constraint
     rest <- T.stripPrefix "FOREIGN KEY " def
     let (cols, afterCols) = columnList rest
     refPart <- T.stripPrefix " REFERENCES " afterCols
     let (refTable, refRest) = T.break (== '(') refPart
         (refCols, _) = columnList refRest
-        (rs, rt) = case T.break (== '.') refTable of
-            (name, "") -> ("public", unquote name)
-            (schema, name) -> (unquote schema, unquote (T.drop 1 name))
+        referenced = case T.break (== '.') refTable of
+            (name, "") -> qname "public" (unquote name)
+            (schema, name) -> qname (unquote schema) (unquote (T.drop 1 name))
     guard (length cols == length refCols && not (null cols))
-    for (zip cols refCols) \(a, b) -> (,) <$> typeIn s t a <*> typeIn rs rt b
+    for (zip cols refCols) \(a, b) -> (,) <$> typeIn table a <*> typeIn referenced b
   where
-    columnList x = let (inside, after) = T.break (== ')') (T.drop 1 x) in (map (unquote . T.strip) (T.split (== ',') inside), T.drop 1 after)
+    columnList x = let (inside, after) = T.break (== ')') (T.drop 1 x) in (map (identifier . unquote . T.strip) (T.split (== ',') inside), T.drop 1 after)
     unquote c = fromMaybe c (T.stripPrefix "\"" c >>= T.stripSuffix "\"")
 
 
@@ -336,9 +358,16 @@ describeConnections :: Int
 describeConnections = 4
 
 
--- | A described database, its open connections, and the statements that make
--- plpgsql_check's temp tables there.
-data Connected = Connected Connection.Connection [Connection.Connection] Schema Addresses (IO (Maybe Text))
+-- | A described database and its open connections.
+data Connected = Connected
+    { conn :: Connection.Connection
+    , extra :: [Connection.Connection]
+    -- ^ More connections to spread queries over.
+    , schema :: Schema
+    , addresses :: Addresses
+    , tempTableScript :: IO (Maybe Text)
+    -- ^ The statements that make plpgsql_check's temp tables there.
+    }
 
 
 -- | A connection to the database the table command edits in rolled-back transactions.
@@ -360,7 +389,7 @@ describeDatabase scope db = do
     tempTables <- async (either (const Nothing) id <$> tryAny (bracket (connect db) Connection.release tempTableStatements))
     (conn, extra) <- concurrently (connect db) (replicateConcurrently (describeConnections - 1) (connect db))
     (schema, addresses) <- describeOn (conn : extra) scope.excluded scope.partitions Nothing
-    pure (Connected conn extra schema addresses (wait tempTables))
+    pure Connected{conn, extra, schema, addresses, tempTableScript = wait tempTables}
 
 
 -- | Reads both databases at the same time, then the edges each command needs, given what
@@ -369,9 +398,11 @@ readBoth :: Config -> Scope -> Source -> Text -> Purpose -> IO ((Schema, [Edge])
 readBoth config scope from toDb purpose = do
     toDescribed <- async (timed "describe --to" $ describeDatabase scope toDb)
     fromDb <- timed "connInfoOf" $ connInfoOf config from
-    (fromDatabase@(Connected _ _ fromSchema _ _), toDatabase@(Connected _ _ toSchema _ _)) <-
+    (fromDatabase, toDatabase) <-
         timed "readBoth.describe" $ concurrently (timed "describe --from" $ describeDatabase scope fromDb) (wait toDescribed)
-    let plainChanges = diff (\_ a b -> a == b) fromSchema toSchema
+    let fromSchema = fromDatabase.schema
+        toSchema = toDatabase.schema
+        plainChanges = diff (\_ a b -> a == b) fromSchema toSchema
         needed = neededFor purpose plainChanges
     measure "readBoth.plainDiff" (Map.size plainChanges)
     (((fromEdges, fromNotes), (toEdges, toNotes)), checks) <-
@@ -433,7 +464,7 @@ data TableOptions = TableOptions
     , top :: Maybe FilePath
     , planPath :: Maybe FilePath
     , tableTag :: Maybe Text
-    , renames :: [(Text, Text)]
+    , renames :: [(Identifier, Identifier)]
     , sameTypeSwap :: SameTypeSwap
     , fileMode :: FileMode
     , liveFrom :: Maybe Text
@@ -482,20 +513,22 @@ main =
                 case out of
                     Just dir -> writeFolder replace dir schema
                     Nothing ->
-                        for_ (Map.toList (Map.fromListWith (+) [(k.address.objectType, 1 :: Int) | k <- Map.keys schema])) \(kind, n) ->
+                        for_ (Map.toList (Map.fromListWith (+) [((toAddress k.object).objectType, 1 :: Int) | k <- Map.keys schema])) \(kind, n) ->
                             TIO.putStrLn [i|#{n}\t#{kind}|]
             Diff from toDb scope' -> do
                 config <- loadConfig "."
                 let scope = withConfigured config scope'
                 ((fromSchema, edges), (toSchema, _), checks) <- timed "readBoth" $ readBoth config scope from toDb ForDiff
                 let changes = diff (sameDefinition checks) fromSchema toSchema
-                    known = Set.fromList [k.address | k <- Map.keys fromSchema, k.aspect == Definition]
+                    known = Set.fromList [k.object | k <- Map.keys fromSchema, k.aspect == Definition]
                     affectedBy = affected known edges changes
                     dependentsOf key = case key.aspect of
-                        Definition -> Map.findWithDefault Set.empty key.address affectedBy
+                        Definition -> Map.findWithDefault Set.empty key.object affectedBy
                         _ -> Set.empty
                 measure "diff.diffAndAffected" (Map.size changes + Map.foldl' (\n s -> n + Set.size s) 0 affectedBy)
-                for_ (Map.toList changes) \(key, change) -> report key change (dependentsOf key)
+                -- In catalog order: by aspect, then kind and names as the catalog spells them.
+                for_ (L.sortOn (\(key, _) -> (key.aspect, toAddress key.object)) (Map.toList changes)) \(key, change) ->
+                    report key change (dependentsOf key)
                 TIO.putStrLn (summary changes)
                 unless (Map.null changes) $ exitWith (ExitFailure 1)
             Plan from toDb scope' -> do
@@ -562,14 +595,22 @@ data TableEnv = TableEnv
     }
 
 
--- | A retyped column: its table, name, address and new type.
-type Retyped = (QName, Text, Address, Text)
+-- | A column whose type the edit changes.
+data Retyped = Retyped
+    { table :: QName
+    , column :: Identifier
+    , newType :: Text
+    }
+
+
+retypedObject :: Retyped -> ObjectId
+retypedObject r = Column r.table r.column
 
 
 -- | The functions the body check finds broken by the edit, and the ones it passes.
 data BodyResults = BodyResults
-    { breaking :: Map Address Text
-    , passed :: Set Address
+    { breaking :: Map ObjectId Text
+    , passed :: Set ObjectId
     }
 
 
@@ -579,11 +620,11 @@ data Evidence = Evidence
     , deps :: Dependents
     , bodies :: BodyResults
     , retyped :: [Retyped]
-    , foreignKeyBreaks :: Map Address [(Address, Text)]
-    , typeFacts :: Map Address TypeChange
+    , foreignKeyBreaks :: Map ObjectId [(ObjectId, Text)]
+    , typeFacts :: Map ObjectId TypeChange
     , branchChanges :: [(Text, [Text])]
-    , pendingRenames :: [(Text, Text)]
-    , renamedFrom :: Set Address
+    , pendingRenames :: [(Identifier, Identifier)]
+    , renamedFrom :: Set ObjectId
     }
 
 
@@ -591,10 +632,10 @@ data Evidence = Evidence
 data Findings = Findings
     { steps :: [Step]
     , renameSteps :: [Step]
-    , newRenames :: [(Text, Text)]
+    , newRenames :: [(Identifier, Identifier)]
     , usage :: [Text]
-    , blocking :: [Address]
-    , renameLike :: [(Text, Text)]
+    , blocking :: [ObjectId]
+    , renameLike :: [(Identifier, Identifier)]
     , same :: Text
     , withViews :: Context -> Context
     }
@@ -610,7 +651,7 @@ tableCommand file db opts = do
     layout <- layoutOf root opts.top opts.planPath
     (absFile, changeName, table) <- locateTable config.names layout root file
     statements <- parseFile file "" =<< readFileUtf8 absFile
-    let describeWithWords = describeDatabase (dependentsScope config.excludeSchemas) db >>= \c@(Connected _ _ schema _ _) -> (c,) <$> routineWords schema
+    let describeWithWords = describeDatabase (dependentsScope config.excludeSchemas) db >>= \c -> (c,) <$> routineWords c.schema
         migrating = opts.fileMode == MigrateToFile
     early <- if migrating && (opts.compareWith == LiveDatabase || not (null opts.renames)) then Just <$> async describeWithWords else pure Nothing
     repo <- findRepo root
@@ -655,8 +696,8 @@ rewriteFromDatabase = do
     edit <- timed "rewrite.compare" $ liftIO (compareTable conn (LiveTable live ReportDrops) table env.statements)
     ownFiles <-
         fmap Set.fromList
-            . filterM (\n -> doesFileExist (deployDir </> T.unpack (fill env.config.names.index [("schema", table.schema), ("table", table.name), ("name", n)]) <.> "sql"))
-            $ [n | k <- Map.keys edit.current, Index q <- [fromAddress k.address], let n = q.name]
+            . filterM (\n -> doesFileExist (deployDir </> T.unpack (fill env.config.names.index [("schema", nameText table.schema), ("table", nameText table.name), ("name", nameText n)]) <.> "sql"))
+            $ [q.name | k <- Map.keys edit.current, Index q <- [k.object]]
     let path = env.file
     rewrite <- either (\e -> failWith [i|#{path}: #{e}|]) pure (rewriteFile table ownFiles order edit.current edit.desired current)
     remaining <-
@@ -666,7 +707,7 @@ rewriteFromDatabase = do
                 rewritten <- parseFile env.file " as rewritten" rewrite.text
                 check <- timed "rewrite.check" $ liftIO (compareTable conn (LiveTable live ReportDrops) table rewritten)
                 pure (fileDrift ownFiles check.desired check.current)
-    let still = [render k.address <> (if k.aspect == Comment then " (comment)" else "") | k <- Map.keys remaining]
+    let still = [render k.object <> (if k.aspect == Comment then " (comment)" else "") | k <- Map.keys remaining]
     for_ still \s -> liftIO (TIO.hPutStrLn stderr [i|-- still differs: #{s}|])
     case opts.output of
         PrintMigration -> do
@@ -752,7 +793,7 @@ locateTable names layout root file = do
             | Just s <- lookup "schema" values
             , Just t <- lookup "name" values
             , not ("@" `T.isInfixOf` t) ->
-                pure (QName s t)
+                pure (qname s t)
         _ -> failWith [i|#{file} is not a table's own deploy file (#{pattern}.sql under #{deployDir})|]
     pure (absFile, changeName, table)
 
@@ -766,12 +807,8 @@ atBase :: TableOptions -> Text
 atBase opts = let base = opts.base in [i| at #{base}|]
 
 
-renameSql :: QName -> (Text, Text) -> Text
-renameSql table (old, new) = [i|alter table #{qualified table} rename column #{quoteIdent old} to #{quoteIdent new}|]
-
-
-columnAddress :: QName -> Text -> Address
-columnAddress table c = Address "table column" [table.schema, table.name, c] []
+renameSql :: QName -> (Identifier, Identifier) -> Text
+renameSql table (old, new) = [i|alter table #{qualified table} rename column #{quoted old} to #{quoted new}|]
 
 
 say :: MonadIO m => Text -> m ()
@@ -779,7 +816,7 @@ say = liftIO . TIO.putStrLn
 
 
 -- | Compares the table, checks what depends on the edit, and prints or writes the migration.
-compareAndReport :: IO (Connected, Map Address BodyText) -> RIO TableEnv ()
+compareAndReport :: IO (Connected, Map ObjectId BodyText) -> RIO TableEnv ()
 compareAndReport described = do
     env <- ask
     let opts = env.opts
@@ -797,7 +834,7 @@ compareAndReport described = do
             else BaseFile . (<> (branchStatements <> map (renameSql table) pendingRenames)) <$> parseFile env.file (atBase opts) env.original
     conn <- timed "table.connect" $ liftIO (connectScratch env.db)
     edit <- timed "table.compare1" $ liftIO (compareTable conn baseline table env.statements)
-    let renamedFrom = Set.fromList [columnAddress table old | (old, _) <- opts.renames]
+    let renamedFrom = Set.fromList [Column table old | (old, _) <- opts.renames]
     deps <- timed "table.dependentsIn" $ liftIO (dependentsIn env.config.excludeSchemas described (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom)))
     bodies <- bodyResultsFor conn baseline deps
     let retyped = retypedColumns edit
@@ -836,15 +873,17 @@ bodyResultsFor conn baseline deps = do
     env <- ask
     let table = env.table
         definitionOf a = Map.lookup (ObjectKey Definition a) deps.dbSchema
-        takesRowType a = any (`elem` [qualified table, qualified table <> "[]"]) a.objectArgs
-        routines = Set.toList (Set.filter (\a -> a.objectType `elem` ["function", "procedure"] && not (takesRowType a)) (fold deps.named <> fold deps.exact))
+        takesRowType = \case
+            Routine _ _ args -> any ((`elem` [qualified table, qualified table <> "[]"]) . typeText) args
+            _ -> False
+        routines = Set.toList (Set.filter (\a -> isRoutine a && not (takesRowType a)) (fold deps.named <> fold deps.exact))
         plpgsql = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE plpgsql" `T.isInfixOf` def]
         sqlBodies = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE sql" `T.isInfixOf` def, not (standardBody def)]
-        signature a = case a.objectNames of
-            [s, n] -> let args = T.intercalate ", " a.objectArgs in [i|#{quoteIdent s}.#{quoteIdent n}(#{args})|]
+        signature a = case a of
+            Routine _ q args -> let list = T.intercalate ", " (map typeText args) in [i|#{qualified q}(#{list})|]
             _ -> render a
         bySignature = Map.fromList [(signature a, a) | a <- plpgsql <> sqlBodies]
-        check made = timed [i|table.bodyErrors n=#{Map.size bySignature}|] $ bodyErrors conn aside (qualified table) made (map signature plpgsql) (map signature sqlBodies)
+        check made = timed [i|table.bodyErrors n=#{Map.size bySignature}|] $ bodyErrors conn (nameText aside) (qualified table) made (map signature plpgsql) (map signature sqlBodies)
         rowTypeCall message = "function " `T.isPrefixOf` message && any (\end -> (qualified table <> end) `T.isInfixOf` message) [")", ","]
     results <-
         if null plpgsql && null sqlBodies
@@ -862,46 +901,46 @@ bodyResultsFor conn baseline deps = do
 
 retypedColumns :: TableEdit -> [Retyped]
 retypedColumns edit =
-    [ (t, c, k.address, n.colType)
+    [ Retyped{table = t, column = c, newType = n.colType}
     | (k, Changed old new) <- Map.toList edit.changes
     , k.aspect == Definition
     , let o = parseColumn old
           n = parseColumn new
     , o.colType /= n.colType || o.collation /= n.collation
-    , Column t c <- [fromAddress k.address]
+    , Column t c <- [k.object]
     ]
 
 
 -- | The foreign keys on retyped columns that cannot be rebuilt with the new types, with
 -- PostgreSQL's error.
-foreignKeyBreaksFor :: Connection.Connection -> Dependents -> [Retyped] -> IO (Map Address [(Address, Text)])
+foreignKeyBreaksFor :: Connection.Connection -> Dependents -> [Retyped] -> IO (Map ObjectId [(ObjectId, Text)])
 foreignKeyBreaksFor conn deps retyped =
     timed "table.foreignKeys"
         $ Map.fromListWith (<>)
         . catMaybes
         <$> for
             [ (addr, k, types)
-            | (_, _, addr, _) <- retyped
-            , k <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
-            , k.objectType == "table constraint"
-            , Just def <- [Map.lookup (ObjectKey Definition k) deps.dbSchema]
+            | addr <- map retypedObject retyped
+            , k@TableConstraint{} <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
+            , Just def <- [Map.lookup (definitionKey k) deps.dbSchema]
             , Just types <- [foreignKeyTypes typeIn k def]
             ]
             \(addr, k, types) -> fmap (\err -> (addr, [(k, err)])) <$> foreignKeyError conn types
   where
-    typeIn s t c = case [ty | (QName s' t', c', _, ty) <- retyped, (s', t', c') == (s, t, c)] of
+    typeIn t c = case [r.newType | r <- retyped, r.table == t, r.column == c] of
         ty : _ -> Just ty
-        [] -> (.colType) . parseColumn <$> Map.lookup (ObjectKey Definition (Address "table column" [s, t, c] [])) deps.dbSchema
+        [] -> (.colType) . parseColumn <$> Map.lookup (definitionKey (Column t c)) deps.dbSchema
 
 
 -- | For each retyped column, whether the change rewrites the table and whether the new
 -- type is a domain.
-typeFactsFor :: Connection.Connection -> TableEdit -> [Retyped] -> IO (Map Address TypeChange)
+typeFactsFor :: Connection.Connection -> TableEdit -> [Retyped] -> IO (Map ObjectId TypeChange)
 typeFactsFor conn edit retyped =
-    timed "table.typeChangeFacts" $ Map.fromList . catMaybes <$> for retyped \(_, _, addr, newType) ->
-        case parseColumn <$> Map.lookup (ObjectKey Definition addr) edit.current of
-            Just o -> fmap (addr,) <$> typeChangeFacts conn o.colType newType
-            Nothing -> pure Nothing
+    timed "table.typeChangeFacts" $ Map.fromList . catMaybes <$> for retyped \r ->
+        let addr = retypedObject r
+         in case parseColumn <$> Map.lookup (definitionKey addr) edit.current of
+                Just o -> fmap (addr,) <$> typeChangeFacts conn o.colType r.newType
+                Nothing -> pure Nothing
 
 
 findingsFor :: TableEnv -> Evidence -> Findings
@@ -918,37 +957,35 @@ findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames
         Set.toList
             . Set.fromList
             $ [ other
-              | k <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
-              , k.objectType == "table constraint"
-              , [s, t, _] <- [k.objectNames]
-              , Just def <- [Map.lookup (ObjectKey Definition k) deps.dbSchema]
+              | k@(TableConstraint onTable _) <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
+              , Just def <- [Map.lookup (definitionKey k) deps.dbSchema]
               , Just referenced <- [referencedTable def]
-              , let other = if QName s t == table then referenced else qualified (QName s t)
+              , let other = if onTable == table then referenced else qualified onTable
               , other /= qualified table
               ]
     convertNote = MayFail "fails when an existing value does not convert to the new type"
-    withTypeFacts s = case Map.lookup s.address ev.typeFacts of
+    withTypeFacts s = case Map.lookup s.object ev.typeFacts of
         Just (TypeChange rewrite target)
             | MayRewriteTable `elem` s.hazards ->
                 let rewrites = rewrite == RewritesFiles
                     domain = target == DomainType
                  in let kept = concatMap (\h -> if h == MayRewriteTable then [RewritesTable | rewrites] else [h | h /= convertNote || rewrites || domain]) s.hazards
-                     in s{hazards = kept <> concat [LocksOther o : [RechecksForeignKey o | rewrites] | o <- otherTables s.address]}
+                     in s{hazards = kept <> concat [LocksOther o : [RechecksForeignKey o | rewrites] | o <- otherTables s.object]}
         _ -> s
     breaksFor addr = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.named <> Map.findWithDefault Set.empty addr deps.exact), a `Map.member` breaking]
     dependents = deps.exact
     mentions = Map.map (Set.filter (\a -> a `Map.notMember` breaking && a `Set.notMember` passed)) deps.named
-    retypedAddresses = Set.fromList [a | (_, _, a, _) <- retyped]
-    around = viewsAroundTypeChanges deps [(t, c, a) | (t, c, a, _) <- retyped]
+    retypedAddresses = Set.fromList (map retypedObject retyped)
+    around = viewsAroundTypeChanges deps [(r.table, r.column, retypedObject r) | r <- retyped]
     withViews c = c{viewsAround = Map.map snd around}
-    aroundOf addr = fold [members | (t, c, a, _) <- retyped, a == addr, Just (members, _) <- [Map.lookup (t, c) around]]
+    aroundOf addr = fold [members | r <- retyped, retypedObject r == addr, Just (members, _) <- [Map.lookup (r.table, r.column) around]]
     foreignKeysFor addr = Map.findWithDefault [] addr ev.foreignKeyBreaks
     renameHazard = MayFail ("breaks running code that still uses the old name" <> foldMap ("; " <>) env.config.renameHint)
     renameSteps =
-        [ Step DropPhase (-1) addr (Column table new) (renameSql table (old, new)) Shared [renameHazard] (ObjectKey Definition addr) (Changed def def)
+        [ Step DropPhase (-1) addr (renameSql table (old, new)) Shared [renameHazard] (definitionKey addr) (Changed def def)
         | (old, new) <- ev.pendingRenames
-        , let addr = columnAddress table new
-              def = Map.findWithDefault "" (ObjectKey Definition addr) edit.desired
+        , let addr = Column table new
+              def = Map.findWithDefault "" (definitionKey addr) edit.desired
         ]
     steps = renameSteps <> map withTypeFacts (planWith withViews Map.empty edit.current edit.desired [] [] edit.changes)
     same :: Text
@@ -956,7 +993,7 @@ findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames
         | opts.compareWith == LiveDatabase = "the file matches the table"
         | not (null ev.branchChanges) = "this branch's changes already cover the file"
         | otherwise = let base = opts.base in [i|the file has no schema changes since #{base}|]
-    columnsWhere p = [(c, (parseColumn (changeText ch)).colType) | (k, ch) <- Map.toList edit.changes, k.aspect == Definition, p ch, Column _ c <- [fromAddress k.address]]
+    columnsWhere p = [(c, (parseColumn (changeText ch)).colType) | (k, ch) <- Map.toList edit.changes, k.aspect == Definition, p ch, Column _ c <- [k.object]]
     changeText = \case Added d -> d; Dropped d -> d; Changed _ d -> d
     renameLike =
         [ (old, new)
@@ -966,22 +1003,36 @@ findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames
         , (new, newType) <- columnsWhere (\case Added _ -> True; _ -> False)
         , oldType == newType
         ]
-    renameNotes = [[i|#{old} is dropped and #{new} added with the same type; pass --rename #{old}:#{new} if it is a rename, or --drop-and-add if it is not|] | (old, new) <- renameLike]
-    dropped addr = case Map.lookup (ObjectKey Definition addr) edit.changes of
+    renameNotes =
+        [ [i|#{old} is dropped and #{new} added with the same type; pass --rename #{old}:#{new} if it is a rename, or --drop-and-add if it is not|]
+        | (oldName, newName) <- renameLike
+        , let old = nameText oldName
+              new = nameText newName
+        ]
+    dropped addr = case Map.lookup (definitionKey addr) edit.changes of
         Just (Dropped _) -> True
         _ -> False
-    goesWith d = d.objectType == "index" || (d.objectType == "table constraint" && take 2 d.objectNames == [table.schema, table.name])
+    -- What goes when a dropped column goes: its indexes and its table's constraints.
+    goesWith = \case
+        Index _ -> True
+        TableConstraint t _ -> t == table
+        _ -> False
     listed = fold dependents <> fold mentions
-    overloaded = Map.keysSet (Map.filter (> (1 :: Int)) (Map.fromListWith (+) [((a.objectType, a.objectNames), 1) | a <- Set.toList listed]))
+    -- Routines are listed by name, with their arguments only when the name is overloaded.
+    overloaded = Map.keysSet (Map.filter (> (1 :: Int)) (Map.fromListWith (+) [(withoutArgs a, 1) | a <- Set.toList listed]))
+    withoutArgs = \case
+        Routine kind q _ -> Routine kind q []
+        a -> a
     short a =
-        let objectType = a.objectType
-            kind = if objectType `elem` ["function", "procedure"] then "" else [i|#{objectType} |] :: Text
-            name = T.intercalate "." a.objectNames
-            args = if (a.objectType, a.objectNames) `Set.member` overloaded then let list = T.intercalate ", " a.objectArgs in [i|(#{list})|] else "" :: Text
+        let addr = toAddress a
+            objectType = addr.objectType
+            kind = if isRoutine a then "" else [i|#{objectType} |] :: Text
+            name = T.intercalate "." addr.objectNames
+            args = if withoutArgs a `Set.member` overloaded then let list = T.intercalate ", " addr.objectArgs in [i|(#{list})|] else "" :: Text
          in [i|#{kind}#{name}#{args}|] :: Text
     item d = [i|    #{short d}|] :: Text
     detail t = [i|      #{t}|] :: Text
-    section :: Text -> [Address] -> [Text]
+    section :: Text -> [ObjectId] -> [Text]
     section heading = \case
         [] -> []
         ds -> [i|  #{heading}|] : map item ds
@@ -991,12 +1042,19 @@ findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames
     foreignKeySection = \case
         [] -> []
         ks -> "  cannot be rebuilt with the new type" : concat [[item k, detail err] | (k, err) <- ks]
-    isView d = d.objectType `elem` ["view", "materialized view"]
-    recreated addr d = d `Set.member` aroundOf addr || (d.objectType == "trigger" && any (\v -> isView v && v.objectNames == take 2 d.objectNames) (aroundOf addr))
-    rebuiltWith d = d.objectType `elem` ["index", "table constraint", "sequence"]
+    -- A trigger on a view that is created again comes back with it.
+    recreated addr d =
+        d `Set.member` aroundOf addr || case d of
+            Trigger t _ -> any (\v -> isView v && isRelation v == Just t) (aroundOf addr)
+            _ -> False
+    rebuiltWith = \case
+        Index _ -> True
+        TableConstraint{} -> True
+        Sequence _ -> True
+        _ -> False
     usage =
         concat
-            [ T.intercalate "." addr.objectNames
+            [ T.intercalate "." (toAddress addr).objectNames
                 : section (if addr `Set.member` ev.renamedFrom then "used by, and follows the rename" else "used by") users
                     <> section "dropped with it" with
                     <> section "dropped and created again around it" again
@@ -1022,9 +1080,9 @@ findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames
 -- goes with it.
 printLeftAlone :: MonadIO m => TableEdit -> m ()
 printLeftAlone edit = do
-    let leftAlone = Set.fromList [k.address | (k, _) <- edit.ignored, k.aspect == Definition]
-    for_ [(k, reason) | (k, reason) <- edit.ignored, not (k.aspect == Comment && k.address `Set.member` leftAlone)] \(k, reason) -> do
-        let name = render k.address <> if k.aspect == Privileges then " (privileges)" else ""
+    let leftAlone = Set.fromList [k.object | (k, _) <- edit.ignored, k.aspect == Definition]
+    for_ [(k, reason) | (k, reason) <- edit.ignored, not (k.aspect == Comment && k.object `Set.member` leftAlone)] \(k, reason) -> do
+        let name = render k.object <> if k.aspect == Privileges then " (privileges)" else ""
         say [i|-- left alone: #{name}: #{reason}|]
 
 
@@ -1060,7 +1118,7 @@ writeMigration conn baseline edit f = do
     now <- liftIO getCurrentTime
     let inverseCtx = f.withViews (context Map.empty edit.desired edit.current [] (Map.map invert edit.changes))
         renameBack =
-            [ Step DropPhase (-1) (columnAddress table old) (Column table old) (renameSql table (new, old)) Shared [] s.key s.change
+            [ Step DropPhase (-1) (Column table old) (renameSql table (new, old)) Shared [] s.key s.change
             | (s, (old, new)) <- zip f.renameSteps f.newRenames
             ]
         withRenameBack u
@@ -1095,9 +1153,8 @@ writeMigration conn baseline edit f = do
 -- indexes, or <schema>.<table> in a migration's name.
 forTable :: Names -> QName -> Text -> Bool
 forTable names t n =
-    let (schema, name) = (t.schema, t.name)
-        key = [i|#{schema}.#{name}|] :: Text
-        indexes = fill names.index [("schema", schema), ("table", name), ("name", "")]
+    let key = dotted t
+        indexes = fill names.index [("schema", nameText t.schema), ("table", nameText t.name), ("name", "")]
         padded = [i|#{n}-|] :: Text
      in indexes `T.isPrefixOf` n || any (`T.isInfixOf` padded) [[i|#{before}#{key}#{after}|] | before <- ["-", "/" :: Text], after <- [".", "-" :: Text]]
 
@@ -1148,7 +1205,7 @@ commandParser =
                     <*> O.optional (O.strOption (O.long "live-from" <> O.metavar "CONNINFO" <> O.help "With --rewrite-file, read the table from this database, read-only, instead of --db; --db still builds the file"))
                 )
     renameArg s = case T.split (== ':') (T.pack s) of
-        [old, new] | not (T.null old), not (T.null new) -> Right (old, new)
+        [old, new] | not (T.null old), not (T.null new) -> Right (identifier old, identifier new)
         _ -> Left "expected OLD:NEW"
     dbOption name help =
         O.strOption
@@ -1198,9 +1255,9 @@ commandParser =
                 )
 
 
-report :: ObjectKey -> Change -> Set Address -> IO ()
+report :: ObjectKey -> Change -> Set ObjectId -> IO ()
 report key change dependents = do
-    let name = render key.address
+    let name = render key.object
     TIO.putStrLn [i|#{verb} #{name}#{suffix}|]
     case change of
         Changed old new ->
@@ -1211,7 +1268,7 @@ report key change dependents = do
         _ -> pure ()
     unless (Set.null dependents) do
         TIO.putStrLn "  depended on by:"
-        for_ (Set.toList dependents) \addr -> TIO.putStrLn [i|    #{render addr}|]
+        for_ (L.sortOn toAddress (Set.toList dependents)) \addr -> TIO.putStrLn [i|    #{render addr}|]
   where
     verb :: Text
     verb = case change of

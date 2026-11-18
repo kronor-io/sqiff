@@ -28,9 +28,9 @@ import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import Sqiff.Body (BodyCheck (..))
-import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..))
 import Sqiff.Diff (Change (..))
-import Sqiff.Object
+import Sqiff.Identifier
+import Sqiff.Model
 
 
 data Phase = DropPhase | CreatePhase
@@ -92,8 +92,7 @@ referencedTable def = do
 data Step = Step
     { phase :: Phase
     , rank :: Int
-    , address :: Address
-    , object :: Object
+    , object :: ObjectId
     , sql :: Text
     , txn :: Txn
     , hazards :: [Hazard]
@@ -107,20 +106,20 @@ data Context = Context
     { newTables :: Set QName
     , droppedTables :: Set QName
     , partitionedTables :: Set QName
-    , droppedColumns :: Set (QName, Text)
-    , retypedColumns :: Set (QName, Text)
-    , newTableColumns :: Map QName [(Text, ColumnDef)]
+    , droppedColumns :: Set (QName, Identifier)
+    , retypedColumns :: Set (QName, Identifier)
+    , newTableColumns :: Map QName [(Identifier, ColumnDef)]
     , bodyChecks :: Map ObjectKey (Text, BodyCheck)
     -- ^ Body checks, with the definition each was made for.
-    , withDependents :: Set Object
+    , withDependents :: Set ObjectId
     -- ^ Objects that something else depends on, in the database being changed.
     , recreatedViews :: Map QName ([Text], Maybe (ObjectKey, Text))
     -- ^ Materialized views dropped and created again, with the index definitions and
     -- privileges to restore on them.
-    , viewsAround :: Map (QName, Text) ([Text], [Text])
+    , viewsAround :: Map (QName, Identifier) ([Text], [Text])
     -- ^ For a column whose type changes, the statements that drop the views reading it
     -- and the ones that create them again, with their grants, indexes, triggers and comments.
-    , droppedObjects :: Set Address
+    , droppedObjects :: Set ObjectId
     }
 
 
@@ -130,11 +129,11 @@ recipe ctx key change = case key.aspect of
     Comment -> comment ctx key change
     Definition -> definition ctx key object change
   where
-    object = fromAddress key.address
+    object = key.object
 
 
 -- Ranks order steps within a phase; dependency order breaks ties.
-createRank :: Object -> Int
+createRank :: ObjectId -> Int
 createRank = \case
     Schema _ -> 0
     Extension _ -> 1
@@ -150,10 +149,11 @@ createRank = \case
     Index _ -> 11
     Trigger _ _ -> 12
     Policy _ _ -> 13
+    OtherColumn{} -> 20
     Unknown _ -> 20
 
 
-dropRank :: Object -> Int
+dropRank :: ObjectId -> Int
 dropRank = \case
     Policy _ _ -> 0
     Trigger _ _ -> 1
@@ -169,6 +169,7 @@ dropRank = \case
     Type _ -> 10
     Extension _ -> 11
     Schema _ -> 12
+    OtherColumn{} -> 20
     Unknown _ -> 20
 
 
@@ -178,11 +179,11 @@ tableSettingsRank = 14
 privilegesRank = 15
 
 
-definition :: Context -> ObjectKey -> Object -> Change -> [Step]
+definition :: Context -> ObjectKey -> ObjectId -> Change -> [Step]
 definition ctx key object change = case object of
     Schema s -> case change of
-        Added _ -> [create (Shared, []) ("create schema " <> quoteIdent s)]
-        Dropped _ -> [remove (Shared, []) ("drop schema " <> quoteIdent s)]
+        Added _ -> [create (Shared, []) ("create schema " <> quoted s)]
+        Dropped _ -> [remove (Shared, []) ("drop schema " <> quoted s)]
         Changed _ _ -> []
     Extension e -> extension e
     Table t -> table t
@@ -206,13 +207,14 @@ definition ctx key object change = case object of
     Policy t n
         | t `Set.member` ctx.droppedTables -> []
         | otherwise -> policy t n
-    Unknown _ -> [create (Shared, [Manual "no recipe for this kind of object"]) ("-- " <> T.pack (show change))]
+    OtherColumn{} -> noRecipe
+    Unknown _ -> noRecipe
   where
-    addr = key.address
-    create (txn, hazards) sql = Step CreatePhase (createRank object) addr object sql txn hazards key change
-    createAt rank (txn, hazards) sql = Step CreatePhase rank addr object sql txn hazards key change
-    remove (txn, hazards) sql = Step DropPhase (dropRank object) addr object sql txn hazards key change
+    create (txn, hazards) sql = Step CreatePhase (createRank object) object sql txn hazards key change
+    createAt rank (txn, hazards) sql = Step CreatePhase rank object sql txn hazards key change
+    remove (txn, hazards) sql = Step DropPhase (dropRank object) object sql txn hazards key change
     manual why = [create (Shared, [Manual why]) ("-- " <> why)]
+    noRecipe = [create (Shared, [Manual "no recipe for this kind of object"]) ("-- " <> T.pack (show change))]
     notValid = " NOT VALID" :: Text
     onEveryPartition s
         | any (`elem` [DeletesData, MayRewriteTable, LongLock]) s.hazards = s{hazards = s.hazards <> [EveryPartition]}
@@ -220,16 +222,16 @@ definition ctx key object change = case object of
     namesAlteredColumn t = namesAlteredColumnOf (== t)
     namesAlteredColumnOf onTable def =
         let names = Set.fromList (T.split (\ch -> not (isAlphaNum ch || ch == '_')) def)
-         in any (\(t', c) -> onTable t' && c `Set.member` names) (ctx.droppedColumns <> ctx.retypedColumns)
+         in any (\(t', c) -> onTable t' && nameText c `Set.member` names) (ctx.droppedColumns <> ctx.retypedColumns)
 
     extension e = case change of
         Added def ->
             let (version, schema) = extensionParts def
-             in [create (Shared, []) ("create extension if not exists " <> quoteIdent e <> " with schema " <> schema <> " version " <> literal version)]
-        Dropped _ -> [remove (Shared, []) ("drop extension " <> quoteIdent e)]
+             in [create (Shared, []) ("create extension if not exists " <> quoted e <> " with schema " <> schema <> " version " <> literal version)]
+        Dropped _ -> [remove (Shared, []) ("drop extension " <> quoted e)]
         Changed old new
             | snd (extensionParts old) /= snd (extensionParts new) -> manual "extension moved to another schema"
-            | otherwise -> [create (Own, []) ("alter extension " <> quoteIdent e <> " update to " <> literal (fst (extensionParts new)))]
+            | otherwise -> [create (Own, []) ("alter extension " <> quoted e <> " update to " <> literal (fst (extensionParts new)))]
 
     table t = case change of
         Added def -> createTable t (T.lines def)
@@ -255,7 +257,7 @@ definition ctx key object change = case object of
         columnList = case Map.findWithDefault [] t ctx.newTableColumns of
             [] -> ""
             cols -> [i|\n#{T.intercalate ",\n" (map columnLine cols)}\n|]
-        columnLine (c, def) = [i|    #{quoteIdent c} #{columnSql def}|]
+        columnLine (c, def) = [i|    #{quoted c} #{columnSql def}|]
         settings =
             [createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} enable row level security|] | "row level security" `elem` lines']
                 <> [createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} force row level security|] | "force row level security" `elem` lines']
@@ -296,12 +298,12 @@ definition ctx key object change = case object of
                     hazards =
                         [MayFail "a not null column without a default fails on a table with rows" | failsOnRows]
                             <> [h | rewrites, h <- [MayRewriteTable, LongLock]]
-                 in [create (Shared, hazards) (alter <> "add column " <> quoteIdent c <> " " <> columnSql parsed)]
-        Dropped _ -> [remove (Shared, [DeletesData]) (alter <> "drop column " <> quoteIdent c)]
+                 in [create (Shared, hazards) (alter <> "add column " <> quoted c <> " " <> columnSql parsed)]
+        Dropped _ -> [remove (Shared, [DeletesData]) (alter <> "drop column " <> quoted c)]
         Changed old new -> alterColumn (parseColumn old) (parseColumn new)
       where
         alter = [i|alter table #{qualified t} |]
-        col = [i|#{alter}alter column #{quoteIdent c} |]
+        col = [i|#{alter}alter column #{quoted c} |]
         alterColumn old new =
             let typeChanged = old.colType /= new.colType || old.collation /= new.collation
                 defaultChanged = old.defaultExpr /= new.defaultExpr
@@ -314,7 +316,7 @@ definition ctx key object change = case object of
                             , [MayRewriteTable, LongLock, MayFail "fails when an existing value does not convert to the new type"]
                                 <> [MayFail "recreating a view fails when its query relies on the old type; then edit the view" | Map.member (t, c) ctx.viewsAround]
                             )
-                            (aroundViews (col <> "type " <> new.colType <> maybe "" (" collate " <>) new.collation <> " using " <> quoteIdent c <> "::" <> new.colType))
+                            (aroundViews (col <> "type " <> new.colType <> maybe "" (" collate " <>) new.collation <> " using " <> quoted c <> "::" <> new.colType))
                        | typeChanged
                        ]
                     <> case new.defaultExpr of
@@ -343,8 +345,8 @@ definition ctx key object change = case object of
             _ -> statement
         serialSequence d = d.defaultExpr >>= T.stripPrefix "nextval('" >>= T.stripSuffix "'::regclass)"
         tableLit = literal (qualified t)
-        columnLit = literal c
-        serialName = let tableName = t.name in qualified (QName t.schema [i|#{tableName}_#{c}_seq|])
+        columnLit = literal (nameText c)
+        serialName = let tableName = nameText t.name in qualified (QName t.schema (identifier [i|#{tableName}_#{nameText c}_seq|]))
         toIdentity k =
             [i|do $$
 declare seq text := pg_get_serial_sequence(#{tableLit}, #{columnLit}); last bigint; called boolean; acl aclitem[];
@@ -364,7 +366,7 @@ begin
     execute format('select last_value, is_called from %s', pg_get_serial_sequence(#{tableLit}, #{columnLit})) into last, called;
     select relacl into acl from pg_class where oid = pg_get_serial_sequence(#{tableLit}, #{columnLit})::regclass;
     #{col}drop identity;
-    create sequence #{serialName} as #{colType} owned by #{qualified t}.#{quoteIdent c};
+    create sequence #{serialName} as #{colType} owned by #{qualified t}.#{quoted c};
     perform setval(#{literal serialName}, last, called);
     #{col}set default nextval(#{literal serialName}::regclass);
     #{grantAcl (literal serialName)}
@@ -375,13 +377,13 @@ end $$|]
             [i|execute coalesce((select string_agg(format('grant %s on sequence %s to %s', x.privilege_type, #{target}, case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end), '; ') from aclexplode(acl) x where x.grantee <> x.grantor), 'select');|]
         notNullSteps old new = case (old.notNull, new.notNull) of
             (False, True) ->
-                create (Shared, []) [i|#{alter}add #{named new}not null #{quoteIdent c} not valid|]
+                create (Shared, []) [i|#{alter}add #{named new}not null #{quoted c} not valid|]
                     : [create (Own, []) (onNotNull new.notNullName "validate constraint" "") | new.notNullValid]
             (True, False) -> [create (Shared, []) (col <> "drop not null")]
             (True, True) ->
                 [ create (Shared, []) (onNotNull old.notNullName "rename constraint" (" to " <> quoteIdent n))
                 | old.notNullName /= new.notNullName
-                , let n = fromMaybe (T.concat [t.name, "_", c, "_not_null"]) new.notNullName
+                , let n = fromMaybe (T.concat [nameText t.name, "_", nameText c, "_not_null"]) new.notNullName
                 ]
                     <> case (old.notNullValid, new.notNullValid) of
                         (False, True) -> [create (Own, []) (onNotNull new.notNullName "validate constraint" "")]
@@ -394,13 +396,13 @@ end $$|]
             Nothing ->
                 let command = literal [i|#{T.replace "%" "%%" (alter <> action)} %I#{T.replace "%" "%%" rest}|]
                     tableLiteral = literal (qualified t)
-                 in [i|do $$ begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal c})])); end $$|]
+                 in [i|do $$ begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal (nameText c)})])); end $$|]
 
     tableConstraint t c = case change of
         Added def -> addConstraint def
         Dropped old -> [dropConstraint old]
         Changed old new
-            | old == new <> notValid -> [create (Own, []) (alterT <> "validate constraint " <> quoteIdent c)]
+            | old == new <> notValid -> [create (Own, []) (alterT <> "validate constraint " <> quoted c)]
             | new == old <> notValid -> manual "a validated constraint cannot be made NOT VALID again"
             | otherwise -> dropConstraint old : addConstraint new
       where
@@ -408,21 +410,21 @@ end $$|]
         dropConstraint old =
             remove
                 (Shared, [MayFail "other objects depend on it, such as foreign keys; drop them first" | dependedOn] <> locksOther old)
-                (alterT <> "drop constraint " <> quoteIdent c)
+                (alterT <> "drop constraint " <> quoted c)
         dependedOn = any (`Set.member` ctx.withDependents) [TableConstraint t c, Index (QName t.schema c)]
         locksOther def = [LocksOther r | Just r <- [referencedTable def], r /= qualified t]
-        plain hazards def = create (Shared, hazards <> locksOther def) (alterT <> "add constraint " <> quoteIdent c <> " " <> def)
+        plain hazards def = create (Shared, hazards <> locksOther def) (alterT <> "add constraint " <> quoted c <> " " <> def)
         addConstraint def
             | t `Set.member` ctx.newTables = [plain [] def]
             | validatable def && notValid `T.isSuffixOf` def = [plain [] def]
             | validatable def =
                 [ plain [] (def <> notValid)
-                , create (Own, []) (alterT <> "validate constraint " <> quoteIdent c)
+                , create (Own, []) (alterT <> "validate constraint " <> quoted c)
                 ]
             | Just (kind, cols) <- simpleKey def
             , not (t `Set.member` ctx.partitionedTables) =
-                [ create (None, [IndexBuild]) (concurrentBuild (QName t.schema c) [i|create unique index concurrently #{quoteIdent c} on #{qualified t} (#{cols})|])
-                , create (Shared, []) (alterT <> "add constraint " <> quoteIdent c <> " " <> kind <> " using index " <> quoteIdent c)
+                [ create (None, [IndexBuild]) (concurrentBuild (QName t.schema c) [i|create unique index concurrently #{quoted c} on #{qualified t} (#{cols})|])
+                , create (Shared, []) (alterT <> "add constraint " <> quoted c <> " " <> kind <> " using index " <> quoted c)
                 ]
             | otherwise = [plain [LongLock, IndexBuild] def]
         validatable def = any (`T.isPrefixOf` def) ["CHECK ", "FOREIGN KEY "]
@@ -437,17 +439,17 @@ end $$|]
 
     domainConstraint d c = case change of
         Added def -> add def
-        Dropped _ -> [remove (Shared, []) (alterD <> "drop constraint " <> quoteIdent c)]
+        Dropped _ -> [remove (Shared, []) (alterD <> "drop constraint " <> quoted c)]
         Changed old new
             | old == new <> notValid -> [validate]
             | new == old <> notValid -> manual "a validated constraint cannot be made NOT VALID again"
-            | otherwise -> remove (Shared, []) (alterD <> "drop constraint " <> quoteIdent c) : add new
+            | otherwise -> remove (Shared, []) (alterD <> "drop constraint " <> quoted c) : add new
       where
-        alterD = [i|alter domain #{d} |]
-        validate = create (Own, []) (alterD <> "validate constraint " <> quoteIdent c)
+        alterD = [i|alter domain #{typeText d} |]
+        validate = create (Own, []) (alterD <> "validate constraint " <> quoted c)
         add def
-            | notValid `T.isSuffixOf` def = [create (Shared, []) [i|#{alterD}add constraint #{quoteIdent c} #{def}|]]
-            | otherwise = [create (Shared, []) [i|#{alterD}add constraint #{quoteIdent c} #{def}#{notValid}|], validate]
+            | notValid `T.isSuffixOf` def = [create (Shared, []) [i|#{alterD}add constraint #{quoted c} #{def}|]]
+            | otherwise = [create (Shared, []) [i|#{alterD}add constraint #{quoted c} #{def}#{notValid}|], validate]
 
     indexRecipe ix = case change of
         Added def -> addIndex def
@@ -460,11 +462,11 @@ end $$|]
             | namesAlteredColumnOf (\t -> indexTable old == Just (qualified t)) old ->
                 remove (None, []) ("drop index concurrently if exists " <> qualified ix) : addIndex new
             | otherwise ->
-                let tmp = takeBytes 59 ix.name <> "_new"
-                    oldName = quoteIdent ix.name
+                let tmp = identifier (takeBytes 59 (nameText ix.name) <> "_new")
+                    oldName = quoted ix.name
                  in [ create
                         (None, [IndexBuild])
-                        (concurrentBuild (QName ix.schema tmp) (T.replace [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoteIdent tmp} ON |] new))
+                        (concurrentBuild (QName ix.schema tmp) (T.replace [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoted tmp} ON |] new))
                     , create (None, []) ("drop index concurrently if exists " <> qualified ix)
                     , create (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
                     ]
@@ -497,28 +499,30 @@ end $$|]
       where
         ownedByDropped o =
             any (\t -> (qualified t <> ".") `T.isPrefixOf` o) ctx.droppedTables
-                || any (\(t, c) -> o == qualified t <> "." <> quoteIdent c) ctx.droppedColumns
+                || any (\(t, c) -> o == qualified t <> "." <> quoted c) ctx.droppedColumns
 
-    type' t = case change of
-        Added def
-            | Just rest <- T.stripPrefix "domain " def -> [create (Shared, []) ("create domain " <> t <> " as " <> rest)]
-            | Just rest <- T.stripPrefix "composite " def -> [create (Shared, []) ("create type " <> t <> " as " <> rest)]
-            | otherwise -> [create (Shared, []) ("create type " <> t <> " as " <> def)]
-        Dropped def
-            | "domain " `T.isPrefixOf` def -> [remove (Shared, []) ("drop domain " <> t)]
-            | otherwise -> [remove (Shared, []) ("drop type " <> t)]
-        Changed old new
-            | Just oldLabels <- enumLabels old
-            , Just newLabels <- enumLabels new
-            , oldLabels `L.isSubsequenceOf` newLabels ->
-                [ create (Own, []) ("alter type " <> t <> " add value " <> label <> placement)
-                | (label, position) <- zip newLabels [0 :: Int ..]
-                , label `notElem` oldLabels
-                , let placement = case drop' position newLabels of
-                        Just previous -> " after " <> previous
-                        Nothing -> maybe "" (" before " <>) (L.headMaybe (filter (`elem` oldLabels) newLabels))
-                ]
-            | otherwise -> manual "only adding enum values is automated"
+    type' typ =
+        let t = typeText typ
+         in case change of
+                Added def
+                    | Just rest <- T.stripPrefix "domain " def -> [create (Shared, []) ("create domain " <> t <> " as " <> rest)]
+                    | Just rest <- T.stripPrefix "composite " def -> [create (Shared, []) ("create type " <> t <> " as " <> rest)]
+                    | otherwise -> [create (Shared, []) ("create type " <> t <> " as " <> def)]
+                Dropped def
+                    | "domain " `T.isPrefixOf` def -> [remove (Shared, []) ("drop domain " <> t)]
+                    | otherwise -> [remove (Shared, []) ("drop type " <> t)]
+                Changed old new
+                    | Just oldLabels <- enumLabels old
+                    , Just newLabels <- enumLabels new
+                    , oldLabels `L.isSubsequenceOf` newLabels ->
+                        [ create (Own, []) ("alter type " <> t <> " add value " <> label <> placement)
+                        | (label, position) <- zip newLabels [0 :: Int ..]
+                        , label `notElem` oldLabels
+                        , let placement = case drop' position newLabels of
+                                Just previous -> " after " <> previous
+                                Nothing -> maybe "" (" before " <>) (L.headMaybe (filter (`elem` oldLabels) newLabels))
+                        ]
+                    | otherwise -> manual "only adding enum values is automated"
       where
         drop' position labels = if position == 0 then Nothing else L.headMaybe (L.drop (position - 1) labels)
 
@@ -527,7 +531,7 @@ end $$|]
         Changed old new
             | take 2 (T.lines old) == take 2 (T.lines new) -> replaceRoutine new []
             | otherwise -> replaceRoutine new [MayFail "fails when the return type or argument names change; then drop and create it"]
-        Dropped _ -> [remove (Shared, []) [i|drop #{keyword} #{qualified q}(#{T.intercalate ", " args})|]]
+        Dropped _ -> [remove (Shared, []) [i|drop #{keyword} #{qualified q}(#{argList args})|]]
       where
         keyword :: Text
         keyword = case kind of
@@ -569,7 +573,7 @@ end $$|]
         Just (indexes, grants) ->
             [create (Shared, [IndexBuild]) def | def <- indexes]
                 <> [createAt privilegesRank (Shared, []) (revokeGranted (qualified v)) | isJust grants]
-                <> maybe [] (\(k, def) -> privileges k (fromAddress k.address) (Added def)) grants
+                <> maybe [] (\(k, def) -> privileges k k.object (Added def)) grants
 
     trigger t n = case change of
         Added def -> [create (Shared, []) def]
@@ -580,7 +584,7 @@ end $$|]
         Dropped _ -> [dropTrigger DropPhase]
       where
         dropTrigger phase =
-            Step phase (if phase == DropPhase then dropRank object else createRank object) addr object ("drop trigger " <> quoteIdent n <> " on " <> qualified t) Shared [] key change
+            Step phase (if phase == DropPhase then dropRank object else createRank object) object ("drop trigger " <> quoted n <> " on " <> qualified t) Shared [] key change
 
     policy t n = case change of
         Added def -> [createPolicy def]
@@ -589,11 +593,11 @@ end $$|]
             | otherwise -> [create (Shared, []) dropPolicy, createPolicy new]
         Dropped _ -> [remove (Shared, []) dropPolicy]
       where
-        dropPolicy = "drop policy " <> quoteIdent n <> " on " <> qualified t
-        createPolicy def = create (Shared, []) ("create policy " <> quoteIdent n <> " on " <> qualified t <> "\n" <> def)
+        dropPolicy = "drop policy " <> quoted n <> " on " <> qualified t
+        createPolicy def = create (Shared, []) ("create policy " <> quoted n <> " on " <> qualified t <> "\n" <> def)
 
 
-privileges :: ObjectKey -> Object -> Change -> [Step]
+privileges :: ObjectKey -> ObjectId -> Change -> [Step]
 privileges key object change = case (target, change) of
     (Nothing, _) -> []
     (_, Dropped _) -> []
@@ -602,15 +606,15 @@ privileges key object change = case (target, change) of
         | new == "default" -> [step [Manual "privileges reset to the defaults"] ("-- reset privileges on " <> onObject)]
         | otherwise -> grants onObject (aclLines old) (aclLines new)
   where
-    step hazards sql = Step CreatePhase privilegesRank key.address object sql Shared hazards key change
+    step hazards sql = Step CreatePhase privilegesRank object sql Shared hazards key change
     target = case object of
         Table t -> Just ("table " <> qualified t)
         View t -> Just ("table " <> qualified t)
         MaterializedView t -> Just ("table " <> qualified t)
         Sequence s -> Just ("sequence " <> qualified s)
-        Routine Function q args -> Just [i|function #{qualified q}(#{T.intercalate ", " args})|]
-        Routine Procedure q args -> Just [i|procedure #{qualified q}(#{T.intercalate ", " args})|]
-        Schema s -> Just ("schema " <> quoteIdent s)
+        Routine Function q args -> Just [i|function #{qualified q}(#{argList args})|]
+        Routine Procedure q args -> Just [i|procedure #{qualified q}(#{argList args})|]
+        Schema s -> Just ("schema " <> quoted s)
         _ -> Nothing
     aclLines def = if def == "default" then Set.empty else Set.fromList (T.lines def)
     grants onObject old new =
@@ -628,33 +632,37 @@ privileges key object change = case (target, change) of
 comment :: Context -> ObjectKey -> Change -> [Step]
 comment ctx key change = case (target, change) of
     (Nothing, _) -> []
-    (Just _, Dropped _) | key.address `Set.member` ctx.droppedObjects -> []
+    (Just _, Dropped _) | key.object `Set.member` ctx.droppedObjects -> []
     (Just subject, Dropped _) -> [step (subject <> " is null")]
     (Just subject, Added new) -> [step (subject <> " is " <> literal new)]
     (Just subject, Changed _ new) -> [step (subject <> " is " <> literal new)]
   where
-    addr = key.address
-    step sql = Step CreatePhase commentRank addr object ("comment on " <> sql) Shared [] key change
-    object = fromAddress addr
-    target = case (object, addr.objectType, addr.objectNames) of
-        (Table t, _, _) -> Just ("table " <> qualified t)
-        (View t, _, _) -> Just ("view " <> qualified t)
-        (MaterializedView t, _, _) -> Just ("materialized view " <> qualified t)
-        (Column t c, _, _) -> Just ("column " <> qualified t <> "." <> quoteIdent c)
-        (_, kind, [s, t, c]) | kind `elem` ["view column", "materialized view column"] -> Just ("column " <> qualified (QName s t) <> "." <> quoteIdent c)
-        (Index ix, _, _) -> Just ("index " <> qualified ix)
-        (Sequence s, _, _) -> Just ("sequence " <> qualified s)
-        (TableConstraint t c, _, _) -> Just ("constraint " <> quoteIdent c <> " on " <> qualified t)
-        (DomainConstraint d c, _, _) -> Just ("constraint " <> quoteIdent c <> " on domain " <> d)
-        (Trigger t n, _, _) -> Just ("trigger " <> quoteIdent n <> " on " <> qualified t)
-        (Policy t n, _, _) -> Just ("policy " <> quoteIdent n <> " on " <> qualified t)
-        (Routine Function q args, _, _) -> Just [i|function #{qualified q}(#{T.intercalate ", " args})|]
-        (Routine Procedure q args, _, _) -> Just [i|procedure #{qualified q}(#{T.intercalate ", " args})|]
-        (Routine Aggregate q args, _, _) -> Just [i|aggregate #{qualified q}(#{T.intercalate ", " args})|]
-        (Type t, _, _) -> Just ("type " <> t)
-        (Schema s, _, _) -> Just ("schema " <> quoteIdent s)
-        (Extension e, _, _) -> Just ("extension " <> quoteIdent e)
+    step sql = Step CreatePhase commentRank key.object ("comment on " <> sql) Shared [] key change
+    target = case key.object of
+        Table t -> Just ("table " <> qualified t)
+        View t -> Just ("view " <> qualified t)
+        MaterializedView t -> Just ("materialized view " <> qualified t)
+        Column t c -> Just ("column " <> qualified t <> "." <> quoted c)
+        OtherColumn OfView t c -> Just ("column " <> qualified t <> "." <> quoted c)
+        OtherColumn OfMaterializedView t c -> Just ("column " <> qualified t <> "." <> quoted c)
+        Index ix -> Just ("index " <> qualified ix)
+        Sequence s -> Just ("sequence " <> qualified s)
+        TableConstraint t c -> Just ("constraint " <> quoted c <> " on " <> qualified t)
+        DomainConstraint d c -> Just ("constraint " <> quoted c <> " on domain " <> typeText d)
+        Trigger t n -> Just ("trigger " <> quoted n <> " on " <> qualified t)
+        Policy t n -> Just ("policy " <> quoted n <> " on " <> qualified t)
+        Routine Function q args -> Just [i|function #{qualified q}(#{argList args})|]
+        Routine Procedure q args -> Just [i|procedure #{qualified q}(#{argList args})|]
+        Routine Aggregate q args -> Just [i|aggregate #{qualified q}(#{argList args})|]
+        Type t -> Just ("type " <> typeText t)
+        Schema s -> Just ("schema " <> quoted s)
+        Extension e -> Just ("extension " <> quoted e)
         _ -> Nothing
+
+
+-- | A routine's argument types, as its signature lists them.
+argList :: [TypeName] -> Text
+argList = T.intercalate ", " . map typeText
 
 
 commentRank :: Int

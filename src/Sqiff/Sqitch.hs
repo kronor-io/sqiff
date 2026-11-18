@@ -37,10 +37,11 @@ import RIO.FilePath ((<.>), (</>))
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
-import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), errorText, failWith, render)
+import Sqiff.Catalog (errorText, failWith)
 import Sqiff.Config (Names (..), fill)
 import Sqiff.Diff (Change (..))
-import Sqiff.Object
+import Sqiff.Identifier
+import Sqiff.Model
 import Sqiff.Plan (invert)
 import Sqiff.Recipe
 import Sqiff.Timing (timed)
@@ -146,7 +147,7 @@ units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: 
         _ -> Unit AddChange (groupKey s) (note (verb s) s) Migration [s] []
 
     createNote s = case (s.object, s.change) of
-        (Index ix, Added def) | Just t <- indexTableName def -> let table = dotted (QName ix.schema t); name = ix.name in [S.i|add_index: add index #{table}.#{name}|]
+        (Index ix, Added def) | Just t <- indexTableName def -> let table = dotted (QName ix.schema (identifier t)); name = nameText ix.name in [S.i|add_index: add index #{table}.#{name}|]
         _ -> note "create" s
 
     merge u (next : rest)
@@ -169,7 +170,7 @@ units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: 
         , let p = parseColumn def
         , p.notNull && isNothing p.defaultExpr && isNothing p.identity && isNothing p.generated =
             let table = qualified t
-                column = quoteIdent c
+                column = quoted c
                 definition = columnSql p{notNull = False}
              in s
                     { sql = [S.i|alter table #{table} add column #{column} #{definition}|]
@@ -187,10 +188,10 @@ units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: 
         | otherwise = u : nameMigrations i rest
 
     describe u = case shapeOf u of
-        AddColumnShape t c _ -> let table = dotted t in [S.i|add column #{table}.#{c}|]
-        ValidateShape t c -> let table = dotted t in [S.i|validate constraint #{table}.#{c}|]
+        AddColumnShape t c _ -> let table = dotted t; column = nameText c in [S.i|add column #{table}.#{column}|]
+        ValidateShape t c -> let table = dotted t; constraint = nameText c in [S.i|validate constraint #{table}.#{constraint}|]
         _ ->
-            let objects = nubOrd [fromMaybe (render s.address) (L.lastMaybe s.address.objectNames) | s <- u.deploy]
+            let objects = nubOrd [fromMaybe (render s.object) (L.lastMaybe (toAddress s.object).objectNames) | s <- u.deploy]
                 joined = T.intercalate "-" objects
                 suffix = if objects == maybeToList (L.lastMaybe (T.split (== '.') u.changeName)) then "" else [S.i|.#{joined}|] :: Text
                 v = verbOf u
@@ -210,13 +211,13 @@ units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: 
         | otherwise = "alter"
 
     note :: Text -> Step -> Text
-    note v s = let what = render s.address in [S.i|sqiff: #{v} #{what}|]
+    note v s = let what = render s.object in [S.i|sqiff: #{v} #{what}|]
 
     isAdded = \case Added _ -> True; _ -> False
 
     groupKey s = case owningTable s.object of
         Just t -> dotted t
-        Nothing -> T.intercalate "." s.address.objectNames
+        Nothing -> T.intercalate "." (toAddress s.object).objectNames
 
 
 -- | Where the project keeps a new object of this kind, for the steps that create or replace one.
@@ -233,12 +234,12 @@ conventionalName names s
         (MaterializedView v, Added _) | s.phase == CreatePhase -> Just (path names.view v)
         (Trigger t n, Added _) -> Just (triggerPath t n)
         (Trigger t n, Changed _ _) | "CREATE OR REPLACE TRIGGER" `T.isPrefixOf` s.sql -> Just (triggerPath t n)
-        (Index ix, Added def) | Just t <- indexTableName def -> Just (fill names.index [("schema", ix.schema), ("table", t), ("name", ix.name)])
-        (Type t, Added _) | [schema, name] <- T.splitOn "." t -> Just (fill names.type_ [("schema", schema), ("name", name)])
+        (Index ix, Added def) | Just t <- indexTableName def -> Just (fill names.index [("schema", nameText ix.schema), ("table", t), ("name", nameText ix.name)])
+        (Type t, Added _) | [schema, name] <- T.splitOn "." (typeText t) -> Just (fill names.type_ [("schema", schema), ("name", name)])
         _ -> Nothing
   where
-    path pattern q = fill pattern [("schema", q.schema), ("name", q.name)]
-    triggerPath t n = fill names.trigger [("schema", t.schema), ("table", t.name), ("name", n)]
+    path pattern q = fill pattern [("schema", nameText q.schema), ("name", nameText q.name)]
+    triggerPath t n = fill names.trigger [("schema", nameText t.schema), ("table", nameText t.name), ("name", nameText n)]
 
 
 -- | The unquoted name of the table an index definition is on.
@@ -254,9 +255,9 @@ indexTableName def =
 -- | The changes create-migration's templates cover.
 data Shape
     = -- | The table, the column, and the column's type and options.
-      AddColumnShape QName Text Text
-    | ValidateShape QName Text
-    | AddIndexShape QName Text
+      AddColumnShape QName Identifier Text
+    | ValidateShape QName Identifier
+    | AddIndexShape QName Identifier
     | OtherShape
 
 
@@ -267,13 +268,13 @@ shapeOf u = case u.deploy of
         , Index ix <- s.object
         , Added def <- s.change
         , Just t <- indexTableName def ->
-            AddIndexShape (QName ix.schema t) ix.name
+            AddIndexShape (QName ix.schema (identifier t)) ix.name
         | u.placement == Migration
         , Column t c <- s.object
         , Added _ <- s.change
         , plain t
-        , quoteIdent c == c
-        , Just options <- T.stripPrefix [S.i|alter table #{qualified t} add column #{c} |] s.sql
+        , quoted c == nameText c
+        , Just options <- T.stripPrefix [S.i|alter table #{qualified t} add column #{quoted c} |] s.sql
         , not (any (`elem` [MayRewriteTable, RewritesTable, LongLock]) s.hazards) ->
             AddColumnShape t c options
         | u.placement == Migration
@@ -281,27 +282,23 @@ shapeOf u = case u.deploy of
         , plain t
         , Just c <- T.stripPrefix [S.i|alter table #{qualified t} validate constraint |] s.sql
         , quoteIdent c == c ->
-            ValidateShape t c
+            ValidateShape t (identifier c)
     _ -> OtherShape
   where
     plain t = qualified t == dotted t
 
 
-dotted :: QName -> Text
-dotted t = let (schema, name) = (t.schema, t.name) in [S.i|#{schema}.#{name}|]
-
-
 -- | The add_index template names an index idx_<table>_<index_name>.
 indexPrefix :: QName -> Text
-indexPrefix t = let name = t.name in [S.i|idx_#{name}_|]
+indexPrefix t = let name = nameText t.name in [S.i|idx_#{name}_|]
 
 
 -- | The template and its variables, as create-migration would pass them.
 templateOf :: Unit -> Maybe (Text, [(Text, Text)])
 templateOf u = case shapeOf u of
-    AddColumnShape t c _ -> Just ("add_column", [("schema", t.schema), ("table_name", t.name), ("column_name", c)])
-    ValidateShape t c -> Just ("validate_constraint", [("schema", t.schema), ("table_name", t.name), ("constraint_name", c)])
-    AddIndexShape t ix -> Just ("add_index", [("schema", t.schema), ("table_name", t.name), ("index_name", fromMaybe ix (T.stripPrefix (indexPrefix t) ix))])
+    AddColumnShape t c _ -> Just ("add_column", [("schema", nameText t.schema), ("table_name", nameText t.name), ("column_name", nameText c)])
+    ValidateShape t c -> Just ("validate_constraint", [("schema", nameText t.schema), ("table_name", nameText t.name), ("constraint_name", nameText c)])
+    AddIndexShape t ix -> Just ("add_index", [("schema", nameText t.schema), ("table_name", nameText t.name), ("index_name", fromMaybe (nameText ix) (T.stripPrefix (indexPrefix t) (nameText ix)))])
     OtherShape | u.placement == Migration -> Just ("migration", [])
     OtherShape -> Nothing
 
@@ -427,13 +424,13 @@ verifyScript header steps =
     selects =
         [ [S.i|select #{columns} from #{table} where false;|]
         | (t, cs) <- Map.toList (Map.fromListWith (flip (<>)) [(t, [c]) | s <- final, not (gone s), Column t c <- [s.object]])
-        , let columns = T.intercalate ", " (map quoteIdent cs)
+        , let columns = T.intercalate ", " (map quoted cs)
               table = qualified t
         ]
     asserts = concatMap check final
     check :: Step -> [Text]
     check s = case s.object of
-        Column t c
+        Column t col
             | gone s -> [notExists [S.i|select from pg_attribute where attrelid = #{reg t} and attname = #{sqlLiteral c} and not attisdropped|] [S.i|column #{c} is still on #{qualified t}|]]
             | Changed old new <- s.change
             , let ty = (parseColumn new).colType
@@ -441,10 +438,12 @@ verifyScript header steps =
                 [ let message = sqlLiteral [S.i|#{c} is not #{ty}|]
                    in [S.i|assert (select atttypid from pg_attribute where attrelid = #{reg t} and attname = #{sqlLiteral c}) = #{sqlLiteral ty}::regtype, #{message};|]
                 ]
-        TableConstraint t c | "create unique index " `T.isInfixOf` T.toLower s.sql -> [relation s (QName t.schema c)]
-        TableConstraint t c -> [presence s [S.i|select from pg_constraint where conrelid = #{reg t} and conname = #{sqlLiteral c}|] [S.i|constraint #{c} on #{qualified t}|]]
-        Policy t n -> [presence s [S.i|select from pg_policy where polrelid = #{reg t} and polname = #{sqlLiteral n}|] [S.i|policy #{n} on #{qualified t}|]]
-        Trigger t n -> [presence s [S.i|select from pg_trigger where tgrelid = #{reg t} and tgname = #{sqlLiteral n} and not tgisinternal|] [S.i|trigger #{n} on #{qualified t}|]]
+          where
+            c = nameText col
+        TableConstraint t con | "create unique index " `T.isInfixOf` T.toLower s.sql -> [relation s (QName t.schema con)]
+        TableConstraint t con -> let c = nameText con in [presence s [S.i|select from pg_constraint where conrelid = #{reg t} and conname = #{sqlLiteral c}|] [S.i|constraint #{c} on #{qualified t}|]]
+        Policy t name -> let n = nameText name in [presence s [S.i|select from pg_policy where polrelid = #{reg t} and polname = #{sqlLiteral n}|] [S.i|policy #{n} on #{qualified t}|]]
+        Trigger t name -> let n = nameText name in [presence s [S.i|select from pg_trigger where tgrelid = #{reg t} and tgname = #{sqlLiteral n} and not tgisinternal|] [S.i|trigger #{n} on #{qualified t}|]]
         Index q -> [relation s q]
         View q -> [relation s q]
         MaterializedView q -> [relation s q]
@@ -519,13 +518,14 @@ writeUnits templateDir' root topDir sqitchPlan tag us = do
                     . T.replace "__your_type_here__ null" options
                     . T.replace "\nalter table " [S.i|\n#{hazards}alter table |]
                     $ rendered
-            (Just (_, vars), AddIndexShape t ix)
+            (Just (_, vars), AddIndexShape t index)
                 | any (\s -> EveryPartition `elem` s.hazards) u.deploy -> do
                     deploy >> revert
                     writeFileUtf8 (scriptPath "verify" u) (verifyScript [S.i|-- Verify #{project}:#{name} on pg|] u.deploy)
                 | otherwise -> do
                     deploy
-                    let templated = indexPrefix t <> fromMaybe ix (lookup "index_name" vars)
+                    let ix = nameText index
+                        templated = indexPrefix t <> fromMaybe ix (lookup "index_name" vars)
                     for_ ["revert", "verify"] \dir -> do
                         rendered <- readFileUtf8 (scriptPath dir u)
                         writeFileUtf8 (scriptPath dir u) (T.replace templated ix rendered)

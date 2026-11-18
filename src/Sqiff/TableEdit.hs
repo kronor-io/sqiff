@@ -32,9 +32,10 @@ import Hasql.Session qualified as Session
 import Hasql.TH (singletonStatement, vectorStatement)
 import RIO
 import RIO.Map qualified as Map
-import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Partitions (..), Schema, describeOn, errorText, failWith, serverError)
+import Sqiff.Catalog (Partitions (..), describeOn, errorText, failWith, serverError)
 import Sqiff.Diff (Change (..), diff)
-import Sqiff.Object
+import Sqiff.Identifier
+import Sqiff.Model
 import Sqiff.Timing (timed)
 
 
@@ -123,10 +124,10 @@ rolledBack conn label action = do
 
 
 -- | The table's column names in the table's order.
-columnOrder :: Connection.Connection -> QName -> IO [Text]
+columnOrder :: Connection.Connection -> QName -> IO [Identifier]
 columnOrder conn table =
     Connection.use conn (Session.statement (qualified table) query)
-        >>= either (\e -> failWith [i|could not read the columns of #{qualified table}: #{errorText e}|]) (pure . toList)
+        >>= either (\e -> failWith [i|could not read the columns of #{qualified table}: #{errorText e}|]) (pure . map identifier . toList)
   where
     query =
         [vectorStatement|
@@ -161,8 +162,9 @@ data TableEdit = TableEdit
     }
 
 
-aside :: Text
-aside = "sqiff_aside"
+-- | The schema the table moves to while the file builds it again.
+aside :: Identifier
+aside = identifier "sqiff_aside"
 
 
 -- | What the edited file is compared with.
@@ -224,8 +226,8 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
                     >>= either setupFailed (pure . toList)
             for_ (filter (\s -> any ((s `T.isInfixOf`) . withoutLineComments) (statements <> baseStatements)) owned) \s ->
                 script [i|alter sequence #{tableSchemaRef}#{quoteIdent s} owned by none|]
-            script [i|create schema #{aside}|]
-            script [i|alter table #{qualified table} set schema #{aside}|]
+            script [i|create schema #{quoted aside}|]
+            script [i|alter table #{qualified table} set schema #{quoted aside}|]
             current <- timed "tableEdit.current" case baseline of
                 _ | describing == SkipDescribe -> pure Map.empty
                 BaseFile base -> do
@@ -303,22 +305,20 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
 
     withoutLineComments = T.unlines . map (fst . T.breakOn "--") . T.lines
 
-    asideRef = [i|#{quoteIdent aside}.|] :: Text
-    tableSchemaRef = let schema = quoteIdent table.schema in [i|#{schema}.|] :: Text
+    asideRef = quoted aside <> "."
+    tableSchemaRef = quoted table.schema <> "."
 
-    moveBack k = case k.address.objectNames of
-        s : rest | s == aside -> k{address = k.address{objectNames = table.schema : rest}}
-        _ -> k
+    moveBack k = k{object = mapQNames (\q -> if q.schema == aside then q{schema = table.schema} else q) k.object}
 
     restore = T.replace asideRef tableSchemaRef
 
-    belongsTo q k def = case fromAddress k.address of
+    belongsTo q k def = case k.object of
         Table t -> t == q
         Index _ -> any (`T.isInfixOf` def) [[i| ON #{qualified q} |], [i| ON ONLY #{qualified q} |]]
         Sequence _ -> False
         o -> owningTable o == Just q
 
-    keepSettings current k def = case (fromAddress k.address, k.aspect, Map.lookup k current) of
+    keepSettings current k def = case (k.object, k.aspect, Map.lookup k current) of
         (Table _, Definition, Just old) ->
             let settings = filter (\l -> l `elem` ["row level security", "force row level security"] || "with (" `T.isPrefixOf` l) (T.lines old)
                 missing = filter (`notElem` T.lines def) settings
@@ -329,7 +329,7 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
     leftOut k c
         | BaseFile _ <- baseline = Nothing
         | k.aspect == Privileges = Just "grants are kept outside table files"
-        | otherwise = case (fromAddress k.address, c) of
+        | otherwise = case (k.object, c) of
             (Index _, Dropped _) -> Just "not in the file; indexes are often kept in their own files"
             (Trigger _ _, Dropped _) -> Just "not in the file; triggers are kept in their own files"
             (Policy _ _, Dropped _) -> Just "not in the file; policies may be kept in other files"

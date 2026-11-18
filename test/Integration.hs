@@ -15,6 +15,7 @@
 module Integration (tests) where
 
 import Data.String.Interpolate (i)
+import Postgres
 import RIO
 import RIO.ByteString.Lazy qualified as BL
 import RIO.Char (isAlphaNum)
@@ -22,7 +23,6 @@ import RIO.Directory (doesFileExist, listDirectory)
 import RIO.FilePath ((<.>), (</>))
 import RIO.List (sort)
 import RIO.Text qualified as T
-import Postgres
 import Sqiff.Script (splitStatements)
 import System.Environment (lookupEnv)
 import System.Process.Typed (proc, readProcess, setWorkingDir)
@@ -98,8 +98,11 @@ fixture getCluster name bug = withResource prepare (const (pure ())) \getBefore 
     decode = decodeUtf8Lenient . BL.toStrict
 
     golden label field getBefore =
-        goldenVsStringDiff label (\ref new -> ["diff", "-u", ref, new]) (dir </> label <.> "golden") $
-            BL.fromStrict . encodeUtf8 . field <$> getBefore
+        goldenVsStringDiff label (\ref new -> ["diff", "-u", ref, new]) (dir </> label <.> "golden")
+            $ BL.fromStrict
+            . encodeUtf8
+            . field
+            <$> getBefore
 
     roundTrip getBefore = withKnownBug $ testCase "round trip" do
         before <- getBefore
@@ -107,12 +110,10 @@ fixture getCluster name bug = withResource prepare (const (pure ())) \getBefore 
         statements <- either (assertFailure . T.unpack) pure (splitStatements before.planOut)
         failures <- fmap catMaybes . for statements $ \s ->
             runScript cluster fromDb s <&> either (\e -> Just [i|#{T.strip s}\n  => #{e}|]) (const Nothing)
-        unless (null failures) $
-            assertFailure (T.unpack (T.unlines ("the plan did not apply:" : failures)))
+        unless (null failures)
+            $ assertFailure (T.unpack (T.unlines ("the plan did not apply:" : failures)))
         (code, out, err) <- sqiff cluster ["diff"]
-        unless (code == ExitSuccess) $
-            assertFailure (T.unpack [i|after the plan, diff still finds:\n#{out}#{err}|])
+        unless (code == ExitSuccess)
+            $ assertFailure (T.unpack [i|after the plan, diff still finds:\n#{out}#{err}|])
 
     withKnownBug test = maybe test (\why -> expectFailBecause (T.unpack why) test) bug
-
-

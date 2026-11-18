@@ -19,9 +19,9 @@ import RIO
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
-import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Schema, render)
 import Sqiff.Diff (Change (..), diff)
-import Sqiff.Object (Object (..), QName (..), fromAddress, qualified, quoteIdent)
+import Sqiff.Identifier
+import Sqiff.Model
 import Sqiff.Recipe (ColumnDef (..), columnSql, parseColumn)
 import Sqiff.Script (splitStatements)
 import Sqiff.Sqitch (tidyConstraint, tidyIndex)
@@ -36,7 +36,7 @@ data Rewrite = Rewrite
 
 -- | What differs between the table the file creates and the one in the database, without
 -- grants, validity, and the triggers, policies and indexes that live in files of their own.
-fileDrift :: Set Text -> Schema -> Schema -> Map ObjectKey Change
+fileDrift :: Set Identifier -> Schema -> Schema -> Map ObjectKey Change
 fileDrift ownFiles fromFile live = Map.filterWithKey kept (diff same fromFile live)
   where
     same _ a b = a == b || plain a == plain b
@@ -47,7 +47,7 @@ fileDrift ownFiles fromFile live = Map.filterWithKey kept (diff same fromFile li
             , "_not_null" `T.isSuffixOf` T.dropWhileEnd isDigit (T.drop (T.length " constraint ") name) ->
                 front
         _ -> l
-    kept k c = k.aspect /= Privileges && not (elsewhere (fromAddress k.address) c)
+    kept k c = k.aspect /= Privileges && not (elsewhere k.object c)
     elsewhere o = \case
         Added _ -> case o of
             Trigger _ _ -> True
@@ -60,12 +60,12 @@ fileDrift ownFiles fromFile live = Map.filterWithKey kept (diff same fromFile li
 -- | The file's text changed so that it creates the table as @live@ has it. @fromFile@ is
 -- what the file creates now, @order@ the live column order, @ownFiles@ the indexes with
 -- deploy files of their own.
-rewriteFile :: QName -> Set Text -> [Text] -> Schema -> Schema -> Text -> Either Text Rewrite
+rewriteFile :: QName -> Set Identifier -> [Identifier] -> Schema -> Schema -> Text -> Either Text Rewrite
 rewriteFile table ownFiles order live fromFile original = do
     parts <- pieces original
     let changes = fileDrift ownFiles fromFile live
-        definitions = [(fromAddress k.address, c) | (k, c) <- Map.toList changes, k.aspect == Definition]
-        comments = Map.fromList [(k.address, c) | (k, c) <- Map.toList changes, k.aspect == Comment]
+        definitions = [(k.object, c) | (k, c) <- Map.toList changes, k.aspect == Definition]
+        comments = Map.fromList [(k.object, c) | (k, c) <- Map.toList changes, k.aspect == Comment]
         statements = [(n, s, classify table (snd (splitLead s))) | (n, Stmt s) <- zip [0 :: Int ..] parts]
         indentOf n = statementIndent parts n
         settings = case lookup (Table table) definitions of
@@ -116,12 +116,12 @@ rewriteFile table ownFiles order live fromFile original = do
                 )
         handled =
             Set.unions
-                [ maybe Set.empty (\(_, _, h) -> Set.map (ObjectKey Definition . objectAddress) h) tableEdit
-                , Set.fromList [ObjectKey Definition (objectAddress o) | (_, _, o) <- indexEdits]
+                [ maybe Set.empty (\(_, _, h) -> Set.map definitionKey (Set.filter (not . isTable) h)) tableEdit
+                , Set.fromList [definitionKey o | (_, _, o) <- indexEdits]
                 , Set.fromList [ObjectKey Comment a | (_, _, a) <- commentEdits]
-                , if isJust indexAnchor then Set.fromList [ObjectKey Definition (objectAddress (Index q)) | (q, _) <- newIndexes] else Set.empty
+                , if isJust indexAnchor then Set.fromList [definitionKey (Index q) | (q, _) <- newIndexes] else Set.empty
                 , if isJust commentAnchor then Set.fromList [ObjectKey Comment a | (a, _) <- newComments] else Set.empty
-                , if settingsPlaced then Set.singleton (ObjectKey Definition (Address "table" [table.schema, table.name] [])) else Set.empty
+                , if settingsPlaced then Set.singleton (definitionKey (Table table)) else Set.empty
                 ]
         replaced = Map.fromList ([(n, t) | Just (n, t, _) <- [tableEdit]] <> [(n, t) | (n, Just t, _) <- indexEdits] <> [(n, t) | (n, Just t, _) <- commentEdits])
         removed = Set.fromList [n | (n, Nothing, _) <- indexEdits] <> Set.fromList [n | (n, Nothing, _) <- commentEdits]
@@ -137,11 +137,10 @@ rewriteFile table ownFiles order live fromFile original = do
         unplaced = [describeChange k c | (k, c) <- Map.toList changes, k `Set.notMember` handled]
     pure Rewrite{text = renderOut out, unplaced}
   where
-    objectAddress = \case
-        Index q -> Address "index" [q.schema, q.name] []
-        Column t c -> Address "table column" [t.schema, t.name, c] []
-        TableConstraint t c -> Address "table constraint" [t.schema, t.name, c] []
-        _ -> Address "" [] []
+    -- The table counts as handled only when its settings are placed, above.
+    isTable = \case
+        Table _ -> True
+        _ -> False
 
 
 -- | For a table whose settings the file lacks, the statements that turn them on and the
@@ -162,7 +161,7 @@ tableSettings table file live = do
 
 describeChange :: ObjectKey -> Change -> Text
 describeChange k c =
-    let name = render k.address <> if k.aspect == Comment then " (comment)" else ""
+    let name = render k.object <> if k.aspect == Comment then " (comment)" else ""
         what = case c of
             Added _ -> "in the database, not in the file" :: Text
             Dropped _ -> "in the file, not in the database"
@@ -226,7 +225,7 @@ splitLead = go ""
                 else (acc <> ws, rest)
 
 
-data Kind = CreatesTable | CreatesIndex Text | Comments Address | OtherStatement
+data Kind = CreatesTable | CreatesIndex Identifier | Comments ObjectId | OtherStatement
     deriving stock (Eq)
 
 
@@ -242,27 +241,30 @@ classify table code = case dropWords ["unlogged"] (drop 1 lower) of
     ws = T.words (codeOnly code)
     lower = map T.toLower ws
     tableName = \case
-        t : _ -> qname (T.takeWhile (/= '(') t)
+        t : _ -> parseQName (T.takeWhile (/= '(') t)
         [] -> Nothing
     indexOf ts = do
         rest <- stripWord "index" (dropWords ["unique"] ts)
         name : more <- Just (dropWords ["if", "not", "exists"] (dropWords ["concurrently"] rest))
         guard (T.toLower name /= "on")
         target : _ <- dropWords ["only"] <$> stripWord "on" more
-        pure (unquote name, qname (T.takeWhile (/= '(') target))
+        pure (identifier (unquote name), parseQName (T.takeWhile (/= '(') target))
     commentOn ts = do
         kind : rest <- Just ts
         let target = takeWhile ((/= "is") . T.toLower) rest
         case (T.toLower kind, map unquote . nameParts <$> target) of
-            ("table", [[s, t]]) -> Just (Address "table" [s, t] [])
-            ("column", [[s, t, c]]) -> Just (Address "table column" [s, t, c] [])
-            ("index", [[s, n]]) -> Just (Address "index" [s, n] [])
-            ("constraint", [[n], ["on"], [s, t]]) -> Just (Address "table constraint" [s, t, n] [])
+            ("table", [[s, t]]) -> Just (Table (qname s t))
+            ("column", [[s, t, c]]) -> Just (Column (qname s t) (identifier c))
+            ("index", [[s, n]]) -> Just (Index (qname s n))
+            ("constraint", [[n], ["on"], [s, t]]) -> Just (TableConstraint (qname s t) (identifier n))
             _ -> Nothing
-    belongs addr = take 2 addr.objectNames == [table.schema, table.name] || addr.objectType == "index"
-    qname t = case map unquote (nameParts t) of
-        [s, n] -> Just (QName s n)
-        [n] -> Just (QName "public" n)
+    belongs = \case
+        Index _ -> True
+        Table q -> q == table
+        object -> owningTable object == Just table
+    parseQName t = case map unquote (nameParts t) of
+        [s, n] -> Just (qname s n)
+        [n] -> Just (qname "public" n)
         _ -> Nothing
 
 
@@ -283,10 +285,10 @@ nameParts :: Text -> [Text]
 nameParts = map T.pack . go [] False . T.unpack
   where
     go acc _ [] = [reverse acc]
-    go acc quoted (c : rest)
-        | c == '"' = go (c : acc) (not quoted) rest
-        | c == '.' && not quoted = reverse acc : go [] False rest
-        | otherwise = go (c : acc) quoted rest
+    go acc inQuotes (c : rest)
+        | c == '"' = go (c : acc) (not inQuotes) rest
+        | c == '.' && not inQuotes = reverse acc : go [] False rest
+        | otherwise = go (c : acc) inQuotes rest
 
 
 unquote :: Text -> Text
@@ -312,13 +314,13 @@ regions = code ' ' . T.unpack
             | not (wordChar prev)
             , Just tag <- dollarTag rest ->
                 map (,Quoted) ('$' : tag) <> dollar ('$' : tag) (drop (length tag) rest)
-        q : rest | q == '\'' || q == '"' -> (q, Quoted) : quoted q rest
+        q : rest | q == '\'' || q == '"' -> (q, Quoted) : inQuote q rest
         c : rest -> (c, Code) : code c rest
-    quoted q = \case
+    inQuote q = \case
         [] -> []
-        c : d : more | c == q && d == q -> (c, Quoted) : (d, Quoted) : quoted q more
+        c : d : more | c == q && d == q -> (c, Quoted) : (d, Quoted) : inQuote q more
         c : more | c == q -> (c, Quoted) : code c more
-        c : more -> (c, Quoted) : quoted q more
+        c : more -> (c, Quoted) : inQuote q more
     escaped = \case
         [] -> []
         '\\' : x : more -> ('\\', Quoted) : (x, Quoted) : escaped more
@@ -381,16 +383,16 @@ literal tag t = case tag of
     fits q = not (q `T.isInfixOf` (t <> "$"))
 
 
-commentTarget :: Address -> Maybe Text
-commentTarget addr = case (addr.objectType, addr.objectNames) of
-    ("table", [s, t]) -> Just ("table " <> qualified (QName s t))
-    ("table column", [s, t, c]) -> Just ("column " <> qualified (QName s t) <> "." <> quoteIdent c)
-    ("index", [s, n]) -> Just ("index " <> qualified (QName s n))
-    ("table constraint", [s, t, n]) -> Just ("constraint " <> quoteIdent n <> " on " <> qualified (QName s t))
+commentTarget :: ObjectId -> Maybe Text
+commentTarget = \case
+    Table t -> Just ("table " <> qualified t)
+    Column t c -> Just ("column " <> qualified t <> "." <> quoted c)
+    Index ix -> Just ("index " <> qualified ix)
+    TableConstraint t n -> Just ("constraint " <> quoted n <> " on " <> qualified t)
     _ -> Nothing
 
 
-commentCode :: Text -> Address -> Text -> Text
+commentCode :: Text -> ObjectId -> Text -> Text
 commentCode indent addr t =
     let target = fromMaybe "" (commentTarget addr)
      in [i|comment on #{target} is\n#{indent}    #{literal Nothing t}|]
@@ -471,12 +473,12 @@ renderTable tt = tt.opening <> T.concat (zipWith piece [1 :: Int ..] tt.elements
     piece k e = e.lead <> e.body <> (if k == count then "" else ",") <> e.trail
 
 
-data ElementKind = ColumnElement Text [Text] | ConstraintElement (Maybe Text) | OtherElement
+data ElementKind = ColumnElement Identifier [Identifier] | ConstraintElement (Maybe Identifier) | OtherElement
 
 
 elementKind :: QName -> Text -> ElementKind
 elementKind table body = case ws of
-    w : n : _ | T.toLower w == "constraint" -> ConstraintElement (Just (unquote n))
+    w : n : _ | T.toLower w == "constraint" -> ConstraintElement (Just (identifier (unquote n)))
     w : _ | T.toLower w == "primary" -> ConstraintElement (Just pkey)
     w : _ | T.toLower w == "unique" -> ConstraintElement (named "key" <$> columnList)
     w : _ | T.toLower w == "foreign" -> ConstraintElement (named "fkey" <$> columnList)
@@ -486,8 +488,8 @@ elementKind table body = case ws of
         let c = unquote w
             lower = map T.toLower rest
          in ColumnElement
-                c
-                ( [unquote n | (l, n) <- zip lower (drop 1 rest), l == "constraint"]
+                (identifier c)
+                ( [identifier (unquote n) | (l, n) <- zip lower (drop 1 rest), l == "constraint"]
                     <> [pkey | "primary" `elem` lower]
                     <> [named "key" [c] | "unique" `elem` lower]
                     <> [named "fkey" [c] | "references" `elem` lower]
@@ -495,19 +497,20 @@ elementKind table body = case ws of
                 )
     [] -> OtherElement
   where
-    pkey = T.intercalate "_" [table.name, "pkey"]
+    -- The names PostgreSQL gives constraints declared without one.
+    pkey = identifier (T.intercalate "_" [nameText table.name, "pkey"])
     plain = codeOnly body
     ws = T.words (T.map (\ch -> if ch == '(' || ch == ')' || ch == ',' then ' ' else ch) plain)
     columnList = case T.splitOn "," (T.takeWhile (/= ')') (T.drop 1 (T.dropWhile (/= '(') plain))) of
         [""] -> Nothing
         cs -> Just (map (unquote . T.strip) cs)
-    named suffix cs = T.intercalate "_" (table.name : cs) <> "_" <> suffix
+    named suffix cs = identifier (T.intercalate "_" (nameText table.name : cs) <> "_" <> suffix)
 
 
 -- | Applies the column and constraint differences to a @create table@ statement, with the
 -- objects it placed; the column list keeps the file's order and gets new columns after it.
 -- @options@ is a @with (...)@ clause to add.
-editCreateTable :: QName -> [Text] -> [(Text, Change)] -> [(Text, Change)] -> Maybe Text -> Text -> Maybe (Text, Set Object)
+editCreateTable :: QName -> [Identifier] -> [(Identifier, Change)] -> [(Identifier, Change)] -> Maybe Text -> Text -> Maybe (Text, Set ObjectId)
 editCreateTable table order columns constraints options code = do
     tt <- tableText code
     let indent = maybe "        " (T.takeWhileEnd (== ' ') . (.lead)) (listToMaybe tt.elements)
@@ -557,10 +560,10 @@ editCreateTable table order columns constraints options code = do
     pure (if Set.null placed then code else renderTable tt{elements, closing = fromMaybe tt.closing closing}, placed)
 
 
-columnLine :: Text -> Text -> Text
+columnLine :: Identifier -> Text -> Text
 columnLine c def =
     let parsed = parseColumn def
-     in quoteIdent c <> " " <> columnSql parsed{colType = fromMaybe parsed.colType (T.stripPrefix "public." parsed.colType)}
+     in quoted c <> " " <> columnSql parsed{colType = fromMaybe parsed.colType (T.stripPrefix "public." parsed.colType)}
 
 
 -- | The inline constraints written after a column's type and options.
@@ -570,8 +573,8 @@ inlineSuffix body = case [k | (k, w) <- drop 1 (topWords body), w `elem` ["const
     [] -> ""
 
 
-constraintLine :: Text -> Text -> Text -> Text
+constraintLine :: Text -> Identifier -> Text -> Text
 constraintLine indent n def =
-    let tidied = fromMaybe def (T.stripPrefix "add constraint " (tidyConstraint [i|add constraint #{quoteIdent n} #{def}|]))
+    let tidied = fromMaybe def (T.stripPrefix "add constraint " (tidyConstraint [i|add constraint #{quoted n} #{def}|]))
         broken = foldl' (\acc kw -> T.replace (" " <> kw <> " ") ("\n" <> indent <> "    " <> kw <> " ") acc) tidied ["foreign key", "references", "on delete", "on update"]
      in "constraint " <> if "foreign key" `T.isInfixOf` tidied then broken else tidied

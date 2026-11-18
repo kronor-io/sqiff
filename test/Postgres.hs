@@ -80,8 +80,8 @@ stopCluster cluster = do
 run :: Cluster -> FilePath -> [String] -> IO ()
 run cluster program args = do
     (code, out, err) <- readProcess (proc (binDir cluster </> program) args)
-    unless (code == ExitSuccess) $
-        throwString [i|#{program} failed: #{decodeUtf8Lenient (toStrictBytes out)}#{decodeUtf8Lenient (toStrictBytes err)}|]
+    unless (code == ExitSuccess)
+        $ throwString [i|#{program} failed: #{decodeUtf8Lenient (toStrictBytes out)}#{decodeUtf8Lenient (toStrictBytes err)}|]
 
 
 -- | The connection string for one of the cluster's databases.

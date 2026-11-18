@@ -30,7 +30,8 @@ library
     Sqiff.Diff
     Sqiff.Folder
     Sqiff.Git
-    Sqiff.Object
+    Sqiff.Identifier
+    Sqiff.Model
     Sqiff.Plan
     Sqiff.Recipe
     Sqiff.Rewrite

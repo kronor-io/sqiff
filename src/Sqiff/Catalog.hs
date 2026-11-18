@@ -9,11 +9,10 @@
 -- | Reads a database's schema from its catalog: one definition per object, keyed by
 -- @pg_identify_object_as_address@ so the same object matches across databases.
 module Sqiff.Catalog (
-    Aspect (..),
-    Address (..),
-    ObjectKey (..),
-    Schema,
-    Edge (..),
+    CatalogId (..),
+    ClassOid (..),
+    pgClass,
+    pgProc,
     UserError (..),
     failWith,
     connect,
@@ -39,7 +38,6 @@ module Sqiff.Catalog (
     notChecked,
     serverError,
     tempTableStatements,
-    render,
 ) where
 
 import Data.FileEmbed (embedDir, embedFile, makeRelativeToProject)
@@ -56,48 +54,15 @@ import Hasql.TH (maybeStatement, singletonStatement, vectorStatement)
 import Pqi.Ffi qualified
 import RIO
 import RIO.FilePath (takeBaseName)
-import RIO.List (unzip3, zip3)
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import RIO.Text.Partial qualified as TP
 import RIO.Vector qualified as V
+import Sqiff.Identifier (Identifier, QName (..), identifier, nameText, qname)
+import Sqiff.Model
 import Sqiff.Timing (timed)
-
-
-data Aspect = Definition | Privileges | Comment
-    deriving stock (Eq, Ord, Show, Generic)
-    deriving anyclass (NFData)
-
-
-data Address = Address
-    { objectType :: Text
-    , objectNames :: [Text]
-    , objectArgs :: [Text]
-    }
-    deriving stock (Eq, Ord, Show, Generic)
-    deriving anyclass (NFData)
-
-
-data ObjectKey = ObjectKey
-    { aspect :: Aspect
-    , address :: Address
-    }
-    deriving stock (Eq, Ord, Show, Generic)
-    deriving anyclass (NFData)
-
-
-type Schema = Map ObjectKey Text
-
-
--- | @dependent@ needs @referenced@ to exist, as recorded in @pg_depend@ or seen in a
--- PL/pgSQL body by plpgsql_check.
-data Edge = Edge
-    { dependent :: Address
-    , referenced :: Address
-    }
-    deriving stock (Eq, Ord, Show)
 
 
 describeQueries :: [(FilePath, ByteString)]
@@ -145,12 +110,28 @@ connect conninfo =
     firstLine = T.takeWhile (/= '\n')
 
 
+-- | The oid of a system catalog, such as @pg_class@.
+newtype ClassOid = ClassOid Int64
+    deriving newtype (Eq, Ord, Show, NFData)
+
+
+pgClass, pgProc :: ClassOid
+pgClass = ClassOid 1259
+pgProc = ClassOid 1255
+
+
 -- | An object's class, object and sub-object id, as in @pg_depend@.
-type CatalogId = (Int64, Int64, Int32)
+data CatalogId = CatalogId
+    { classId :: ClassOid
+    , objectOid :: Int64
+    , subId :: Int32
+    }
+    deriving stock (Eq, Ord, Show, Generic)
+    deriving anyclass (NFData)
 
 
--- | The address of each described object, by its catalog ids.
-type Addresses = Map CatalogId Address
+-- | Each described object, by its catalog ids.
+type Addresses = Map CatalogId ObjectId
 
 
 -- | Whether partitions and their objects are described.
@@ -187,15 +168,15 @@ describeOn conns excluded partitions onlyTable = do
             rows <- run conn (excluded, partitions == IncludePartitions, onlyTable, parity) (describeStatement body)
             evaluate
                 $ force
-                    ( Map.fromList [(ObjectKey (aspectOf name) address, definition) | (_, address, definition) <- rows]
-                    , Map.fromList [(ids, address) | (ids, address, _) <- rows]
+                    ( Map.fromList [(ObjectKey (aspectOf name) object, definition) | (_, object, definition) <- rows]
+                    , Map.fromList [(ids, object) | (ids, object, _) <- rows]
                     )
       where
         name = takeBaseName file
 
     describeStatement body =
         Statement.unpreparable (wrap (decodeUtf8Lenient body)) describeParams
-            $ D.rowList ((,,) <$> catalogIdRow <*> addressRow <*> textColumn)
+            $ D.rowList ((,,) <$> catalogIdRow <*> objectRow <*> textColumn)
 
     aspectOf = \case
         "privileges" -> Privileges
@@ -238,27 +219,20 @@ describeOn conns excluded partitions onlyTable = do
 
 -- | Edges from @pg_depend@ between described objects.
 dependencies :: Connection.Connection -> Addresses -> IO [Edge]
-dependencies conn addresses = do
-    (c1, o1, s1, c2, o2, s2) <-
-        run conn (unzip3 (Map.keys addresses))
-            $ Statement.unpreparable
-                (decodeUtf8Lenient dependQuery)
-                catalogIdsParams
-                (D.singleRow ((,,,,,) <$> int8Array <*> int8Array <*> int4Array <*> int8Array <*> int8Array <*> int4Array))
-    pure (edgesBetween addresses (zip (zip3 c1 o1 s1) (zip3 c2 o2 s2)))
+dependencies conn addresses =
+    edgesBetween addresses <$> run conn (Map.keys addresses) (Statement.unpreparable (decodeUtf8Lenient dependQuery) catalogIdsParams edgeRows)
 
 
 -- | 'dependencies' limited to the edges whose referenced end is one of @targets@.
 dependenciesOn :: Connection.Connection -> Addresses -> [CatalogId] -> IO [Edge]
 dependenciesOn _ _ [] = pure []
-dependenciesOn conn addresses targets = timed [i|dependenciesOn n=#{length targets}|] do
-    (c1, o1, s1, c2, o2, s2) <-
-        run conn (unzip3 (Map.keys addresses), unzip3 targets)
-            $ Statement.unpreparable
-                (decodeUtf8Lenient dependOnQuery)
-                (contramap fst catalogIdsParams <> contramap snd catalogIdsParams)
-                (D.singleRow ((,,,,,) <$> int8Array <*> int8Array <*> int4Array <*> int8Array <*> int8Array <*> int4Array))
-    pure (edgesBetween addresses (zip (zip3 c1 o1 s1) (zip3 c2 o2 s2)))
+dependenciesOn conn addresses targets =
+    timed [i|dependenciesOn n=#{length targets}|]
+        $ edgesBetween addresses
+        <$> run
+            conn
+            (Map.keys addresses, targets)
+            (Statement.unpreparable (decodeUtf8Lenient dependOnQuery) (contramap fst catalogIdsParams <> contramap snd catalogIdsParams) edgeRows)
 
 
 dependOnQuery :: ByteString
@@ -268,18 +242,21 @@ dependOnQuery = $(makeRelativeToProject "sql/depend_on.sql" >>= embedFile)
 -- | 'dependencies' limited to the edges reachable from @starts@ through dependents.
 dependenciesFrom :: Connection.Connection -> Addresses -> [CatalogId] -> IO [Edge]
 dependenciesFrom _ _ [] = pure []
-dependenciesFrom conn addresses starts = timed [i|dependenciesFrom n=#{length starts}|] do
-    (c1, o1, s1, c2, o2, s2) <-
-        run conn (unzip3 starts)
-            $ Statement.unpreparable
-                (decodeUtf8Lenient dependFromQuery)
-                catalogIdsParams
-                (D.singleRow ((,,,,,) <$> int8Array <*> int8Array <*> int4Array <*> int8Array <*> int8Array <*> int4Array))
-    pure (edgesBetween addresses (zip (zip3 c1 o1 s1) (zip3 c2 o2 s2)))
+dependenciesFrom conn addresses starts =
+    timed [i|dependenciesFrom n=#{length starts}|]
+        $ edgesBetween addresses
+        <$> run conn starts (Statement.unpreparable (decodeUtf8Lenient dependFromQuery) catalogIdsParams edgeRows)
 
 
 dependFromQuery :: ByteString
 dependFromQuery = $(makeRelativeToProject "sql/depend_from.sql" >>= embedFile)
+
+
+-- | The dependency queries' one row: dependents and referenced objects as six parallel arrays.
+edgeRows :: D.Result [(CatalogId, CatalogId)]
+edgeRows = D.singleRow (zip <$> catalogIdArrays <*> catalogIdArrays)
+  where
+    catalogIdArrays = L.zipWith3 CatalogId <$> (map ClassOid <$> int8Array) <*> int8Array <*> int4Array
 
 
 -- | The edges whose ends are both described.
@@ -419,7 +396,7 @@ analyseBodies conns fs functions = do
     inBatches c query batch =
         Connection.use c (Session.statement batch (Statement.unpreparable query dependParams (D.rowList useRow)))
             >>= \case
-                Right uses -> pure ([((pgProc, f, 0), (k, o, 0)) | (f, k, o) <- uses], [])
+                Right uses -> pure ([(CatalogId pgProc f 0, CatalogId (ClassOid k) o 0) | (f, k, o) <- uses], [])
                 Left (Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message _ _ _)))
                     | [f] <- batch -> pure ([], [(f.name, message)])
                     | otherwise -> do
@@ -434,16 +411,6 @@ analyseBodies conns fs functions = do
             <> contramap (map (.relid)) (E.param (E.nonNullable (E.foldableArray (E.nullable E.int8))))
 
     useRow = (,,) <$> int8Column <*> int8Column <*> int8Column
-
-    pgProc = 1255
-
-
-render :: Address -> Text
-render addr = addr.objectType <> " " <> T.intercalate "." addr.objectNames <> args
-  where
-    args
-        | null addr.objectArgs = ""
-        | otherwise = let list = T.intercalate ", " addr.objectArgs in [i|(#{list})|]
 
 
 -- | plpgsql_check's errors, as (function, line, message), for these signatures in the
@@ -547,12 +514,12 @@ errorText = \case
 
 
 -- | The column names of the given relations, by schema and name.
-relationColumns :: Connection.Connection -> [(Text, Text)] -> IO (Map (Text, Text) (Set Text))
+relationColumns :: Connection.Connection -> [QName] -> IO (Map QName (Set Identifier))
 relationColumns conn relations =
     Map.fromListWith (<>)
-        . map (\(s, r, c) -> ((s, r), Set.singleton c))
+        . map (\(s, r, c) -> (qname s r, Set.singleton (identifier c)))
         . toList
-        <$> run conn (V.fromList (map fst relations), V.fromList (map snd relations)) query
+        <$> run conn (V.fromList (map (nameText . (.schema)) relations), V.fromList (map (nameText . (.name)) relations)) query
   where
     query :: Statement.Statement (Vector Text, Vector Text) (Vector (Text, Text, Text))
     query =
@@ -602,15 +569,16 @@ describeParams =
         <> contramap (\(_, _, _, half) -> half) (E.param (E.nullable E.int4))
 
 
-catalogIdsParams :: E.Params ([Int64], [Int64], [Int32])
+-- | Catalog ids as three parallel arrays: classes, objects and sub-objects.
+catalogIdsParams :: E.Params [CatalogId]
 catalogIdsParams =
-    contramap (\(c, _, _) -> c) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int8))))
-        <> contramap (\(_, o, _) -> o) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int8))))
-        <> contramap (\(_, _, s) -> s) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int4))))
+    contramap (map (\c -> let ClassOid oid = c.classId in oid)) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int8))))
+        <> contramap (map (.objectOid)) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int8))))
+        <> contramap (map (.subId)) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int4))))
 
 
 catalogIdRow :: D.Row CatalogId
-catalogIdRow = (,,) <$> int8Column <*> int8Column <*> D.column (D.nonNullable D.int4)
+catalogIdRow = CatalogId <$> (ClassOid <$> int8Column) <*> int8Column <*> D.column (D.nonNullable D.int4)
 
 
 int8Column :: D.Row Int64
@@ -625,8 +593,9 @@ int4Array :: D.Row [Int32]
 int4Array = D.column (D.nonNullable (D.listArray (D.nonNullable D.int4)))
 
 
-addressRow :: D.Row Address
-addressRow = Address <$> textColumn <*> textArrayColumn <*> textArrayColumn
+-- | An object as @pg_identify_object_as_address@ names it, parsed.
+objectRow :: D.Row ObjectId
+objectRow = fmap fromAddress (Address <$> textColumn <*> textArrayColumn <*> textArrayColumn)
 
 
 textColumn :: D.Row Text
