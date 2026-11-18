@@ -222,14 +222,12 @@ definition ctx key object change = case object of
         let names = Set.fromList (T.split (\ch -> not (isAlphaNum ch || ch == '_')) def)
          in any (\(t', c) -> onTable t' && nameText c `Set.member` names) (ctx.droppedColumns <> ctx.retypedColumns)
 
-    extension e = case textual of
-        Added def ->
-            let (version, schema) = extensionParts def
-             in [create (Shared, []) ("create extension if not exists " <> quoted e <> " with schema " <> schema <> " version " <> literal version)]
+    extension e = typed asExtension \case
+        Added def -> [create (Shared, []) ("create extension if not exists " <> quoted e <> " with schema " <> quoted def.schema <> " version " <> literal def.version)]
         Dropped _ -> [remove (Shared, []) ("drop extension " <> quoted e)]
         Changed old new
-            | snd (extensionParts old) /= snd (extensionParts new) -> manual "extension moved to another schema"
-            | otherwise -> [create (Own, []) ("alter extension " <> quoted e <> " update to " <> literal (fst (extensionParts new)))]
+            | old.schema /= new.schema -> manual "extension moved to another schema"
+            | otherwise -> [create (Own, []) ("alter extension " <> quoted e <> " update to " <> literal new.version)]
 
     table t = typed asTable \case
         Added def -> createTable t def
@@ -478,46 +476,41 @@ end $$|]
             | def.table `Set.member` ctx.newTables = [create (Shared, []) def.statement]
             | otherwise = [create (None, [IndexBuild]) (concurrentBuild ix (T.replace " INDEX " " INDEX CONCURRENTLY " def.statement))]
 
-    sequenceRecipe s = case textual of
+    sequenceRecipe s = typed asSequence \case
         Added def ->
-            let (base, owner) = sequenceParts def
-             in create (Shared, []) ("create sequence " <> qualified s <> " " <> base)
-                    : [createAt sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " owned by " <> o) | Just o <- [owner]]
+            create (Shared, []) ("create sequence " <> qualified s <> " " <> sequenceOptions def)
+                : [createAt sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " owned by " <> ownerSql o) | Just o <- [def.ownedBy]]
         Dropped def
-            | Just o <- snd (sequenceParts def), ownedByDropped o -> []
+            | Just o <- def.ownedBy, ownedByDropped o -> []
             | otherwise -> [remove (Shared, []) ("drop sequence " <> qualified s)]
-        Changed _ new ->
-            let (base, owner) = sequenceParts new
-             in [createAt sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " " <> base <> " owned by " <> fromMaybe "none" owner)]
+        Changed _ new -> [createAt sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions new <> " owned by " <> maybe "none" ownerSql new.ownedBy)]
       where
-        ownedByDropped o =
-            any (\t -> (qualified t <> ".") `T.isPrefixOf` o) ctx.droppedTables
-                || any (\(t, c) -> o == qualified t <> "." <> quoted c) ctx.droppedColumns
+        ownerSql (t, c) = qualified t <> "." <> quoted c
+        -- Dropping the column, or its table, drops the sequence with it.
+        ownedByDropped (t, c) = t `Set.member` ctx.droppedTables || (t, c) `Set.member` ctx.droppedColumns
 
-    type' typ =
-        let t = typeText typ
-         in case textual of
-                Added def
-                    | Just rest <- T.stripPrefix "domain " def -> [create (Shared, []) ("create domain " <> t <> " as " <> rest)]
-                    | Just rest <- T.stripPrefix "composite " def -> [create (Shared, []) ("create type " <> t <> " as " <> rest)]
-                    | otherwise -> [create (Shared, []) ("create type " <> t <> " as " <> def)]
-                Dropped def
-                    | "domain " `T.isPrefixOf` def -> [remove (Shared, []) ("drop domain " <> t)]
-                    | otherwise -> [remove (Shared, []) ("drop type " <> t)]
-                Changed old new
-                    | Just oldLabels <- enumLabels old
-                    , Just newLabels <- enumLabels new
-                    , oldLabels `L.isSubsequenceOf` newLabels ->
-                        [ create (Own, []) ("alter type " <> t <> " add value " <> label <> placement)
-                        | (label, position) <- zip newLabels [0 :: Int ..]
-                        , label `notElem` oldLabels
-                        , let placement = case drop' position newLabels of
-                                Just previous -> " after " <> previous
-                                Nothing -> maybe "" (" before " <>) (L.headMaybe (filter (`elem` oldLabels) newLabels))
-                        ]
-                    | otherwise -> manual "only adding enum values is automated"
+    type' typ = typed asType \case
+        Added def -> [create (Shared, []) (createType def)]
+        Dropped (DomainType{}) -> [remove (Shared, []) ("drop domain " <> t)]
+        Dropped _ -> [remove (Shared, []) ("drop type " <> t)]
+        Changed (EnumType oldLabels) (EnumType newLabels)
+            | oldLabels `L.isSubsequenceOf` newLabels ->
+                [ create (Own, []) ("alter type " <> t <> " add value " <> quoteLiteral label <> placement)
+                | (label, position) <- zip newLabels [0 :: Int ..]
+                , label `notElem` oldLabels
+                , let placement = case previous position newLabels of
+                        Just before -> " after " <> quoteLiteral before
+                        Nothing -> maybe "" ((" before " <>) . quoteLiteral) (L.headMaybe (filter (`elem` oldLabels) newLabels))
+                ]
+        Changed _ _ -> manual "only adding enum values is automated"
       where
-        drop' position labels = if position == 0 then Nothing else L.headMaybe (L.drop (position - 1) labels)
+        t = typeText typ
+        createType = \case
+            DomainType base notNull dflt -> T.unwords (["create domain " <> t <> " as " <> typeText base] <> ["not null" | notNull] <> ["default " <> d | Just d <- [dflt]])
+            def@(CompositeType _) -> "create type " <> t <> " as " <> fromMaybe "" (T.stripPrefix "composite " (printed (TypeDefinition def)))
+            def -> "create type " <> t <> " as " <> printed (TypeDefinition def)
+        -- The label before the one at @position@, if any.
+        previous position labels = if position == 0 then Nothing else L.headMaybe (L.drop (position - 1) labels)
 
     routine kind q args = case textual of
         Added def -> replaceRoutine def []
@@ -714,38 +707,6 @@ identityOptionChanges old new =
         "cache" -> "cache 1"
         "cycle" -> "no cycle"
         k -> k
-
-
-extensionParts :: Text -> (Text, Text)
-extensionParts def =
-    let (version, schema) = T.breakOn " schema " (fromMaybe def (T.stripPrefix "version " def))
-     in (version, T.drop (T.length " schema ") schema)
-
-
-sequenceParts :: Text -> (Text, Maybe Text)
-sequenceParts def =
-    let (base, owner) = T.breakOn " owned by " def
-     in (base, T.stripPrefix " owned by " owner)
-
-
--- | The quoted labels of @enum ('a', 'b')@, as written.
-enumLabels :: Text -> Maybe [Text]
-enumLabels def = do
-    inner <- T.stripPrefix "enum (" def >>= T.stripSuffix ")"
-    pure (go inner)
-  where
-    go t
-        | T.null t = []
-        | otherwise =
-            let (label, rest) = literalPrefix t
-             in label : go (fromMaybe rest (T.stripPrefix ", " rest))
-    literalPrefix t = case T.uncons t of
-        Just ('\'', rest) -> let (body, after) = closing rest in ("'" <> body, after)
-        _ -> T.breakOn ", " t
-    closing t = case T.breakOn "'" t of
-        (body, after)
-            | "''" `T.isPrefixOf` after -> let (more, rest) = closing (T.drop 2 after) in (body <> "''" <> more, rest)
-            | otherwise -> (body <> "'", T.drop 1 after)
 
 
 -- | A view's name, options and query, as @create view@ takes them after its keywords.

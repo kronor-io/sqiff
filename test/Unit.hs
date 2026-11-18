@@ -332,6 +332,9 @@ columns =
         , testCase "a table's settings print one per line" do
             t <- decode @TableDef "{\"unlogged\": true, \"partition_by\": \"RANGE (at)\", \"row_security\": true, \"force_row_security\": false, \"options\": [\"fillfactor=70\", \"toast.autovacuum_enabled=false\"]}"
             tableText t @?= "unlogged\npartition by RANGE (at)\nrow level security\nwith (fillfactor=70, toast.autovacuum_enabled=false)"
+        , testCase "quoteLiteral matches quote_literal" do
+            quoteLiteral "it's" @?= "'it''s'"
+            quoteLiteral "a\\, b" @?= "E'a\\\\, b'"
         , testCase "no ACL is the default, an empty one is not" do
             decode "null" >>= (@?= DefaultAcl)
             decode "[]" >>= (@?= ExplicitAcl Set.empty)

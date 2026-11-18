@@ -189,8 +189,8 @@ describeOn conns excluded partitions onlyTable = do
         "comment" -> Comment
         _ -> Definition
 
-    -- The column, privilege, index, constraint and relation queries describe their
-    -- objects as JSON; the others print them.
+    -- Most queries describe their objects as JSON; routines, triggers, policies,
+    -- schemas and comments are kept as the catalog prints them.
     decodeDefinition :: String -> Text -> Either String Definition
     decodeDefinition = \case
         "column" -> fmap ColumnDefinition . Aeson.eitherDecodeStrict . encodeUtf8
@@ -198,6 +198,9 @@ describeOn conns excluded partitions onlyTable = do
         "index" -> fmap IndexDefinition . Aeson.eitherDecodeStrict . encodeUtf8
         "constraint" -> fmap ConstraintDefinition . Aeson.eitherDecodeStrict . encodeUtf8
         "relation" -> Aeson.eitherDecodeStrict . encodeUtf8 >=> relation
+        "sequence" -> fmap SequenceDefinition . Aeson.eitherDecodeStrict . encodeUtf8
+        "extension" -> fmap ExtensionDefinition . Aeson.eitherDecodeStrict . encodeUtf8
+        "type" -> fmap TypeDefinition . Aeson.eitherDecodeStrict . encodeUtf8
         _ -> Right . Printed
     relation = Aeson.parseEither \v -> flip (Aeson.withObject "relation") v \o ->
         o Aeson..: "kind" >>= \case

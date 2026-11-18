@@ -3,17 +3,17 @@ select
     s.seqrelid as objid,
     0 as objsubid,
     s.seqrelid as relid,
-    concat_ws(
-        ' ',
-        'as ' || format_type(s.seqtypid, null),
-        'increment by ' || s.seqincrement,
-        'minvalue ' || s.seqmin,
-        'maxvalue ' || s.seqmax,
-        'start with ' || s.seqstart,
-        'cache ' || s.seqcache,
-        case when s.seqcycle then 'cycle' else 'no cycle' end,
-        'owned by ' || (
-            select quote_ident(rn.nspname) || '.' || quote_ident(rc.relname) || '.' || quote_ident(ra.attname)
+    jsonb_build_object(
+        'type', format_type(s.seqtypid, null),
+        'increment', s.seqincrement,
+        'min', s.seqmin,
+        'max', s.seqmax,
+        'start', s.seqstart,
+        'cache', s.seqcache,
+        'cycle', s.seqcycle,
+        -- The column whose drop takes the sequence with it.
+        'owned_by', (
+            select jsonb_build_object('schema', rn.nspname, 'table', rc.relname, 'column', ra.attname)
             from pg_depend d
             join pg_class rc on rc.oid = d.refobjid
             join pg_namespace rn on rn.oid = rc.relnamespace
@@ -23,7 +23,7 @@ select
                 and d.refclassid = 'pg_class'::regclass
                 and d.deptype = 'a'
         )
-    ) as definition
+    )::text as definition
 from pg_sequence s
 join pg_class c on c.oid = s.seqrelid
 join pg_namespace n on n.oid = c.relnamespace

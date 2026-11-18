@@ -1,0 +1,4 @@
+-- type public.path
+-- own transaction
+alter type public.path add value 'm' after E'a\\, b';
+

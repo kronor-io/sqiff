@@ -100,10 +100,13 @@ Guiding rules:
   gone. Output is unchanged: all golden files match, and five new fixtures (partitions,
   table settings, unique constraints, validation, materialized views) give the same
   output before and after.
-  - Still printed text: routines, types, sequences, extensions, triggers, policies and
-    comments. Sequences (`" owned by "`), extensions (`"version … schema …"`) and enum
-    labels are the remaining recipes that parse text. They are small and good candidates
-    to type next. Routine bodies stay text by nature.
+- [x] **Phase 2 (part 3):** typed sequences (`SequenceDef`), extensions (`ExtensionDef`)
+  and types (`TypeDef`: enum, domain, composite, range). No recipe parses catalog text any
+  more. Fixed: enum labels written as `E'...'` with ", " inside
+  (`test/fixtures/enum-tricky-label`).
+  - Still printed text: routines, triggers, policies, schemas and comments. Their
+    recipes mostly emit the text as it is. They still read routine headers and bodies
+    (`BEGIN ATOMIC`, `RETURN`) and rewrite `CREATE TRIGGER` to `CREATE OR REPLACE TRIGGER`.
 
 ## Phases (each one builds, passes tests, and ships on its own)
 

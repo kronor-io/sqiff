@@ -20,6 +20,9 @@ module Sqiff.Definition (
     asView,
     asIndex,
     asConstraint,
+    asSequence,
+    asExtension,
+    asType,
     asAcl,
 
     -- * Columns
@@ -56,6 +59,13 @@ module Sqiff.Definition (
     ForeignKeyTarget (..),
     withoutValidity,
 
+    -- * Sequences, extensions and types
+    SequenceDef (..),
+    sequenceOptions,
+    ExtensionDef (..),
+    TypeDef (..),
+    quoteLiteral,
+
     -- * Privileges
     Acl (..),
     Grant (..),
@@ -81,6 +91,9 @@ data Definition
     | ViewDefinition ViewDef
     | IndexDefinition IndexDef
     | ConstraintDefinition ConstraintDef
+    | SequenceDefinition SequenceDef
+    | ExtensionDefinition ExtensionDef
+    | TypeDefinition TypeDef
     | -- | As the catalog prints it: a @create@ statement, an expression, a comment.
       Printed Text
     deriving stock (Eq, Show, Generic)
@@ -96,6 +109,9 @@ printed = \case
     ViewDefinition v -> viewText v
     IndexDefinition ix -> ix.statement
     ConstraintDefinition c -> c.clause
+    SequenceDefinition q -> sequenceText q
+    ExtensionDefinition e -> "version " <> e.version <> " schema " <> quoted e.schema
+    TypeDefinition t -> typeDefText t
     Printed t -> t
 
 
@@ -122,6 +138,10 @@ mapText f = \case
     ViewDefinition v -> ViewDefinition v{query = f v.query}
     IndexDefinition ix -> IndexDefinition ix{statement = f ix.statement}
     ConstraintDefinition c -> ConstraintDefinition c{clause = f c.clause}
+    TypeDefinition (DomainType base notNull dflt) -> TypeDefinition (DomainType (typeName (f (typeText base))) notNull (f <$> dflt))
+    def@(SequenceDefinition _) -> def
+    def@(ExtensionDefinition _) -> def
+    def@(TypeDefinition _) -> def
     Printed t -> Printed (f t)
 
 
@@ -132,6 +152,7 @@ mapNames f = \case
     TableDefinition t -> TableDefinition t{partitionOf = (\p -> p{parent = f p.parent}) <$> t.partitionOf}
     IndexDefinition (IndexDef table unique partitioned statement) -> IndexDefinition (IndexDef (f table) unique partitioned statement)
     ConstraintDefinition c -> ConstraintDefinition c{references = (\(ForeignKeyTarget table columns) -> ForeignKeyTarget (f table) columns) <$> c.references}
+    SequenceDefinition q -> SequenceDefinition q{ownedBy = (\(table, column) -> (f table, column)) <$> q.ownedBy}
     def -> def
 
 
@@ -162,6 +183,24 @@ asIndex = \case
 asConstraint :: Definition -> Maybe ConstraintDef
 asConstraint = \case
     ConstraintDefinition c -> Just c
+    _ -> Nothing
+
+
+asSequence :: Definition -> Maybe SequenceDef
+asSequence = \case
+    SequenceDefinition q -> Just q
+    _ -> Nothing
+
+
+asExtension :: Definition -> Maybe ExtensionDef
+asExtension = \case
+    ExtensionDefinition e -> Just e
+    _ -> Nothing
+
+
+asType :: Definition -> Maybe TypeDef
+asType = \case
+    TypeDefinition t -> Just t
     _ -> Nothing
 
 
@@ -478,6 +517,111 @@ instance FromJSON ConstraintDef where
         references <- o .:? "references" >>= traverse (withObject "references" \r -> ForeignKeyTarget <$> (qname <$> r .: "schema" <*> r .: "table") <*> (map identifier <$> r .: "columns"))
         clause <- o .: "clause"
         pure ConstraintDef{kind, validity, columns, references, clause}
+
+
+-- | A sequence that is not an identity column's.
+data SequenceDef = SequenceDef
+    { dataType :: TypeName
+    , increment :: Integer
+    , minValue :: Integer
+    , maxValue :: Integer
+    , start :: Integer
+    , cache :: Integer
+    , cycles :: Bool
+    , ownedBy :: Maybe (QName, Identifier)
+    -- ^ The column whose drop takes the sequence with it.
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+-- | The options @create sequence@ and @alter sequence@ take, all of them spelled out.
+sequenceOptions :: SequenceDef -> Text
+sequenceOptions q =
+    T.unwords
+        [ "as " <> typeText q.dataType
+        , "increment by " <> tshow q.increment
+        , "minvalue " <> tshow q.minValue
+        , "maxvalue " <> tshow q.maxValue
+        , "start with " <> tshow q.start
+        , "cache " <> tshow q.cache
+        , if q.cycles then "cycle" else "no cycle"
+        ]
+
+
+sequenceText :: SequenceDef -> Text
+sequenceText q = sequenceOptions q <> foldMap (\(t, c) -> " owned by " <> qualified t <> "." <> quoted c) q.ownedBy
+
+
+data ExtensionDef = ExtensionDef
+    { version :: Text
+    , schema :: Identifier
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+-- | A user-defined type; a domain's constraints are objects of their own.
+data TypeDef
+    = -- | The labels, in order.
+      EnumType [Text]
+    | -- | The base type, whether it is not null, and its default.
+      DomainType TypeName Bool (Maybe Text)
+    | -- | The attributes and their types.
+      CompositeType [(Identifier, TypeName)]
+    | -- | The subtype.
+      RangeType TypeName
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+typeDefText :: TypeDef -> Text
+typeDefText = \case
+    EnumType labels -> "enum (" <> T.intercalate ", " (map quoteLiteral labels) <> ")"
+    DomainType base notNull dflt -> T.unwords (["domain " <> typeText base] <> ["not null" | notNull] <> ["default " <> d | Just d <- [dflt]])
+    CompositeType attributes -> "composite (" <> T.intercalate ", " [quoted a <> " " <> typeText t | (a, t) <- attributes] <> ")"
+    RangeType subtype -> "range (subtype = " <> typeText subtype <> ")"
+
+
+-- | Like PostgreSQL's @quote_literal@: quotes doubled, and an @E@ string when there is a
+-- backslash, doubled too.
+quoteLiteral :: Text -> Text
+quoteLiteral t
+    | "\\" `T.isInfixOf` t = "E'" <> T.replace "\\" "\\\\" (T.replace "'" "''" t) <> "'"
+    | otherwise = "'" <> T.replace "'" "''" t <> "'"
+
+
+instance FromJSON SequenceDef where
+    parseJSON = withObject "sequence" \o ->
+        SequenceDef
+            <$> (typeName <$> o .: "type")
+            <*> o
+            .: "increment"
+            <*> o
+            .: "min"
+            <*> o
+            .: "max"
+            <*> o
+            .: "start"
+            <*> o
+            .: "cache"
+            <*> o
+            .: "cycle"
+            <*> (o .:? "owned_by" >>= traverse (withObject "owner" \w -> (,) <$> (qname <$> w .: "schema" <*> w .: "table") <*> (identifier <$> w .: "column")))
+
+
+instance FromJSON ExtensionDef where
+    parseJSON = withObject "extension" \o -> ExtensionDef <$> o .: "version" <*> (identifier <$> o .: "schema")
+
+
+instance FromJSON TypeDef where
+    parseJSON = withObject "type" \o ->
+        o .: "kind" >>= \case
+            "enum" -> EnumType <$> o .:? "labels" .!= []
+            "domain" -> DomainType <$> (typeName <$> o .: "base") <*> o .: "not_null" <*> o .:? "default"
+            "composite" -> CompositeType . map (\(a, t) -> (identifier a, typeName t)) <$> o .:? "attributes" .!= []
+            "range" -> RangeType . typeName <$> o .: "subtype"
+            other -> fail ("unknown kind of type " <> T.unpack other)
 
 
 -- | An object's privileges.

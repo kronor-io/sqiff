@@ -1,0 +1,4 @@
+changed sequence public.counter
+  - as bigint increment by 1 minvalue 1 maxvalue 9223372036854775807 start with 1 cache 1 no cycle owned by public.t.id
+  + as bigint increment by 5 minvalue 1 maxvalue 1000 start with 1 cache 1 cycle
+0 added, 0 dropped, 1 changed

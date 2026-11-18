@@ -1,0 +1,4 @@
+changed type public.path
+  - enum (E'a\\, b', 'z')
+  + enum (E'a\\, b', 'm', 'z')
+0 added, 0 dropped, 1 changed

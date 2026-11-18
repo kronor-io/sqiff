@@ -30,7 +30,7 @@ import Sqiff.Body (BodyCheck, checkBodies, sameDefinition)
 import Sqiff.Catalog (Addresses, CatalogId (..), Partitions (..), PlFunction (..), PlFunctions (..), Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, notChecked, pgClass, pgProc, plpgsqlFunctions, relationColumns, tempTableStatements)
 import Sqiff.Config (Config (..), Layout (..), Names (..), fill, loadConfig, match, sqitchLayout)
 import Sqiff.ConnectionString (ConnectionString, connectionString, redacted)
-import Sqiff.Definition
+import Sqiff.Definition hiding (DomainType)
 import Sqiff.Diff (BodyText (..), Change (..), Changes, affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
 import Sqiff.Folder (Existing (..), writeFolder)
 import Sqiff.Git (Repo, findRepo, showFile)
