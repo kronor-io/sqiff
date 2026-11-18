@@ -19,6 +19,7 @@ import RIO.FilePath (takeDirectory, (</>))
 import RIO.Map qualified as Map
 import Sqiff.Catalog (failWith)
 import Sqiff.Config (BaselineConfig (..), DeployStep (..), Password (..), SqitchPlace (..), fill)
+import Sqiff.ConnectionString (ConnectionString, fromPairs)
 import Sqiff.Git (Repo, commonDir, findRepo, git, resolveCommit)
 import System.Environment (getEnvironment, lookupEnv)
 import System.Process.Typed (ProcessConfig, nullStream, proc, readProcess, runProcess, setEnv, setStdin, setStdout, setWorkingDir, useHandleOpen)
@@ -34,7 +35,7 @@ data Paths = Paths
 
 -- | Makes sure the baseline database holds the schema of @rev@'s sqitch plan and
 -- returns its connection string.
-ensureBaseline :: BaselineConfig -> Text -> IO Text
+ensureBaseline :: BaselineConfig -> Text -> IO ConnectionString
 ensureBaseline cfg rev = do
     for_ ["docker", "git"] \tool -> do
         found <- findExecutable tool
@@ -72,12 +73,12 @@ note message = TIO.hPutStrLn stderr ("sqiff: " <> message)
 
 
 -- | The connection string for the port Docker published the service on.
-connInfo :: BaselineConfig -> Paths -> IO Text
+connInfo :: BaselineConfig -> Paths -> IO ConnectionString
 connInfo cfg p = do
     port <- publishedPort cfg p
     password <- passwordOf cfg
     let pairs = [("host", "localhost"), ("port", port), ("user", cfg.user), ("dbname", cfg.database)] <> [("password", pw) | pw <- maybeToList password]
-    pure (T.unwords [k <> "='" <> T.replace "'" "\\'" (T.replace "\\" "\\\\" v) <> "'" | (k, v) <- pairs])
+    pure (fromPairs pairs)
 
 
 passwordOf :: BaselineConfig -> IO (Maybe Text)

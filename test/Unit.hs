@@ -15,6 +15,7 @@ import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import Sqiff.Config (fill, match)
+import Sqiff.ConnectionString (connectionString, fromPairs, libpqText, redacted)
 import Sqiff.Diff (Change (..), diff)
 import Sqiff.Identifier (identifier, qname, quoteIdent)
 import Sqiff.Model (Address (..), Aspect (..), ObjectId (..), ObjectKey (..), fromAddress, toAddress)
@@ -33,6 +34,7 @@ tests =
     testGroup
         "unit"
         [ quoting
+        , connections
         , addresses
         , templates
         , scripts
@@ -55,6 +57,40 @@ quoting =
         , testCase "a leading digit is quoted" $ quoteIdent "1a" @?= "\"1a\""
         , testCase "embedded quotes are doubled" $ quoteIdent "a\"b" @?= "\"a\"\"b\""
         , testCase "the empty name is quoted" $ quoteIdent "" @?= "\"\""
+        ]
+
+
+connections :: TestTree
+connections =
+    testGroup
+        "connection strings"
+        [ testCase "keyword form"
+            $ redacted (connectionString "host=h password=s3cret dbname=d")
+            @?= "host=h password=*** dbname=d"
+        , testCase "quoted keyword value"
+            $ redacted (connectionString "password='a \\' b' host=h")
+            @?= "password=*** host=h"
+        , testCase "spaces around the equals sign"
+            $ redacted (connectionString "host=h password = s3cret")
+            @?= "host=h password=***"
+        , testCase "a key that only ends in password stays"
+            $ redacted (connectionString "host=h xpassword=x")
+            @?= "host=h xpassword=x"
+        , testCase "URI user info"
+            $ redacted (connectionString "postgresql://me:s3cret@h:5432/d")
+            @?= "postgresql://me:***@h:5432/d"
+        , testCase "URI query parameter"
+            $ redacted (connectionString "postgres://h/d?sslmode=require&password=s3cret")
+            @?= "postgres://h/d?sslmode=require&password=***"
+        , testCase "the empty string is libpq's environment"
+            $ libpqText (connectionString "")
+            @?= ""
+        , testCase "fromPairs quotes values"
+            $ libpqText (fromPairs [("host", "h"), ("password", "it's")])
+            @?= "host='h' password='it\\'s'"
+        , testCase "show never prints the password"
+            $ T.isInfixOf "s3cret" (T.pack (show (fromPairs [("password", "s3cret")])))
+            @?= False
         ]
 
 

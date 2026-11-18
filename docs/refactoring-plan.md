@@ -74,6 +74,18 @@ Guiding rules:
   via an `AppEnv` with `HasLogFunc`, a timing capability and bracketed resources.
 - **Hazards, txn mode, verify and inverse are derived from `Operation`,** not from SQL substrings.
 
+## Progress
+
+- [x] **Phase 0:** test suite (`383bf3a`).
+- [x] **Phase 1:** typed identity (`Sqiff.Identifier`, `Sqiff.Model`, `CatalogId`,
+  `ConnectionString`). Output is unchanged and every golden file matches. Notes:
+  - Interpolating an `Identifier`, `QName` or `TypeName` with `[i|...|]` is a compile
+    error. Use `quoted` / `qualified` for SQL and `nameText` / `dotted` for messages.
+  - The catalog never describes foreign tables, operators, casts, rules or collations,
+    so those paths stay `Unknown` and are effectively dead. Phase 3 can delete them.
+  - `ColumnDef.notNullName`, ACL role names and the `Change` payloads are still `Text`.
+    They become typed in Phase 2.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

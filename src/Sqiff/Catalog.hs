@@ -60,6 +60,7 @@ import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import RIO.Text.Partial qualified as TP
 import RIO.Vector qualified as V
+import Sqiff.ConnectionString (ConnectionString, libpqText)
 import Sqiff.Identifier (Identifier, QName (..), identifier, nameText, qname)
 import Sqiff.Model
 import Sqiff.Timing (timed)
@@ -97,9 +98,9 @@ failWith :: MonadIO m => Text -> m a
 failWith = throwIO . UserError . T.unwords . T.words
 
 
-connect :: Text -> IO Connection.Connection
+connect :: ConnectionString -> IO Connection.Connection
 connect conninfo =
-    Connection.acquire Pqi.Ffi.adapter (Settings.connectionString conninfo)
+    Connection.acquire Pqi.Ffi.adapter (Settings.connectionString (libpqText conninfo))
         >>= either (\e -> failWith ("could not connect: " <> firstLine (reason e))) pure
   where
     reason = \case

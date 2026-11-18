@@ -27,6 +27,7 @@ library
     Sqiff.Body
     Sqiff.Catalog
     Sqiff.Config
+    Sqiff.ConnectionString
     Sqiff.Diff
     Sqiff.Folder
     Sqiff.Git

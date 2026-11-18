@@ -24,6 +24,7 @@ import RIO.Directory (createDirectory, findExecutable, removeDirectoryRecursive)
 import RIO.FilePath ((</>))
 import RIO.Text qualified as T
 import Sqiff.Catalog (connect, errorText)
+import Sqiff.ConnectionString (connectionString)
 import System.Environment (lookupEnv)
 import System.IO.Temp (createTempDirectory)
 import System.Process.Typed (proc, readProcess)
@@ -99,5 +100,5 @@ createDatabase cluster db = do
 -- | Runs @sql@ on @db@ as one simple-protocol script, so in one implicit transaction.
 runScript :: Cluster -> Text -> Text -> IO (Either Text ())
 runScript cluster db sql =
-    bracket (connect (conninfo cluster db)) Connection.release \conn ->
+    bracket (connect (connectionString (conninfo cluster db))) Connection.release \conn ->
         first errorText <$> Connection.use conn (Session.script sql)

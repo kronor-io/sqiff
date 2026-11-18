@@ -29,6 +29,7 @@ import Sqiff.Baseline (ensureBaseline)
 import Sqiff.Body (BodyCheck, checkBodies, sameDefinition)
 import Sqiff.Catalog (Addresses, CatalogId (..), Partitions (..), PlFunction (..), PlFunctions (..), Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, notChecked, pgClass, pgProc, plpgsqlFunctions, relationColumns, tempTableStatements)
 import Sqiff.Config (Config (..), Layout (..), Names (..), fill, loadConfig, match, sqitchLayout)
+import Sqiff.ConnectionString (ConnectionString, connectionString, redacted)
 import Sqiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
 import Sqiff.Folder (Existing (..), writeFolder)
 import Sqiff.Git (Repo, findRepo, showFile)
@@ -371,20 +372,15 @@ data Connected = Connected
 
 
 -- | A connection to the database the table command edits in rolled-back transactions.
-connectScratch :: Text -> IO Connection.Connection
+connectScratch :: ConnectionString -> IO Connection.Connection
 connectScratch db = do
     conn <- connect db
-    requireScratch (shown db) conn
+    requireScratch (redacted db) conn
     pure conn
 
 
--- | A connection string as messages name it; the empty one is libpq's environment.
-shown :: Text -> Text
-shown db = if T.null db then "the database PGHOST, PGPORT and PGDATABASE name" else db
-
-
 -- | A database's schema over 'describeConnections' connections.
-describeDatabase :: Scope -> Text -> IO Connected
+describeDatabase :: Scope -> ConnectionString -> IO Connected
 describeDatabase scope db = do
     tempTables <- async (either (const Nothing) id <$> tryAny (bracket (connect db) Connection.release tempTableStatements))
     (conn, extra) <- concurrently (connect db) (replicateConcurrently (describeConnections - 1) (connect db))
@@ -394,7 +390,7 @@ describeDatabase scope db = do
 
 -- | Reads both databases at the same time, then the edges each command needs, given what
 -- differs, alongside the body checks; the edges of @--to@ only for 'ForPlan'.
-readBoth :: Config -> Scope -> Source -> Text -> Purpose -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
+readBoth :: Config -> Scope -> Source -> ConnectionString -> Purpose -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
 readBoth config scope from toDb purpose = do
     toDescribed <- async (timed "describe --to" $ describeDatabase scope toDb)
     fromDb <- timed "connInfoOf" $ connInfoOf config from
@@ -418,7 +414,7 @@ readBoth config scope from toDb purpose = do
 
 
 -- | Body checks for the definitions that are added or changed: no other check is consulted.
-bodyChecks :: Scope -> Text -> Schema -> Map ObjectKey Change -> IO (Map ObjectKey BodyCheck)
+bodyChecks :: Scope -> ConnectionString -> Schema -> Map ObjectKey Change -> IO (Map ObjectKey BodyCheck)
 bodyChecks scope toDb toSchema plainChanges
     | scope.bodyCheck == CheckBodies =
         bracket (connect toDb) Connection.release \conn ->
@@ -430,7 +426,7 @@ bodyChecks scope toDb toSchema plainChanges
 
 -- | What @--from@ names: a connection string, or the baseline database built from a revision.
 data Source
-    = Database Text
+    = Database ConnectionString
     | BaselineAt Text
 
 
@@ -438,21 +434,21 @@ source :: Text -> Source
 source s
     | s == "master" = BaselineAt s
     | Just rev <- T.stripPrefix "rev:" s = BaselineAt rev
-    | otherwise = Database s
+    | otherwise = Database (connectionString s)
 
 
-connInfoOf :: Config -> Source -> IO Text
+connInfoOf :: Config -> Source -> IO ConnectionString
 connInfoOf config = \case
     Database db -> pure db
     BaselineAt rev -> ensureBaseline config.baseline rev
 
 
 data Command
-    = Describe Text (Maybe FilePath) Existing Scope
-    | Diff Source Text Scope
-    | Plan Source Text Scope
-    | Sqitch Source Text Scope SqitchOptions
-    | TableFile FilePath Text TableOptions
+    = Describe ConnectionString (Maybe FilePath) Existing Scope
+    | Diff Source ConnectionString Scope
+    | Plan Source ConnectionString Scope
+    | Sqitch Source ConnectionString Scope SqitchOptions
+    | TableFile FilePath ConnectionString TableOptions
 
 
 data TableOptions = TableOptions
@@ -467,7 +463,7 @@ data TableOptions = TableOptions
     , renames :: [(Identifier, Identifier)]
     , sameTypeSwap :: SameTypeSwap
     , fileMode :: FileMode
-    , liveFrom :: Maybe Text
+    , liveFrom :: Maybe ConnectionString
     }
 
 
@@ -582,7 +578,7 @@ layoutOf root top planFile = case (top, planFile) of
 -- edit, and where they live.
 data TableEnv = TableEnv
     { opts :: TableOptions
-    , db :: Text
+    , db :: ConnectionString
     , file :: FilePath
     , root :: FilePath
     , repo :: Repo
@@ -643,7 +639,7 @@ data Findings = Findings
 
 -- | Prints the migration that turns the table into what its edited file creates, or
 -- writes it with sqitch.
-tableCommand :: FilePath -> Text -> TableOptions -> IO ()
+tableCommand :: FilePath -> ConnectionString -> TableOptions -> IO ()
 tableCommand file db opts = do
     requireSqitch
     root <- makeAbsolute opts.project
@@ -685,7 +681,7 @@ rewriteFromDatabase = do
             c <- connect name
             readOnly c
             pure (OtherDatabase c, c)
-    let liveDb = shown (fromMaybe env.db opts.liveFrom)
+    let liveDb = redacted (fromMaybe env.db opts.liveFrom)
     order <- liftIO (columnOrder liveConn table)
     when (null order) $ failWith [i|#{qualified table} is not in #{liveDb}; there is nothing to rewrite the file from|]
     for_ opts.liveFrom \_ -> do
@@ -1202,18 +1198,19 @@ commandParser =
                     <*> O.many (O.option (O.eitherReader renameArg) (O.long "rename" <> O.metavar "OLD:NEW" <> O.help "Column OLD is renamed to NEW; repeat for more columns"))
                     <*> O.flag AskIfRename DropAndAdd (O.long "drop-and-add" <> O.help "A column dropped and one added with the same type are not a rename")
                     <*> O.flag MigrateToFile RewriteFromDatabase (O.long "rewrite-file" <> O.help "Print the file rewritten to create the table as --db has it; with --write, write it and rework the change")
-                    <*> O.optional (O.strOption (O.long "live-from" <> O.metavar "CONNINFO" <> O.help "With --rewrite-file, read the table from this database, read-only, instead of --db; --db still builds the file"))
+                    <*> O.optional (connectionString <$> O.strOption (O.long "live-from" <> O.metavar "CONNINFO" <> O.help "With --rewrite-file, read the table from this database, read-only, instead of --db; --db still builds the file"))
                 )
     renameArg s = case T.split (== ':') (T.pack s) of
         [old, new] | not (T.null old), not (T.null new) -> Right (identifier old, identifier new)
         _ -> Left "expected OLD:NEW"
     dbOption name help =
-        O.strOption
-            ( O.long name
-                <> O.metavar "CONNINFO"
-                <> O.value ""
-                <> O.help (help <> "; left out, libpq's PGHOST, PGPORT, PGUSER, PGDATABASE or PGSERVICE name it")
-            )
+        connectionString
+            <$> O.strOption
+                ( O.long name
+                    <> O.metavar "CONNINFO"
+                    <> O.value ""
+                    <> O.help (help <> "; left out, libpq's PGHOST, PGPORT, PGUSER, PGDATABASE or PGSERVICE name it")
+                )
     projectOption = O.strOption (O.long "project" <> O.metavar "DIR" <> O.value "." <> O.help "Where sqitch.conf and sqiff.yaml are")
     topDirOption = O.optional (O.strOption (O.long "top-dir" <> O.metavar "DIR" <> O.help "sqitch's top directory; sqitch config's core.top_dir when left out"))
     planFileOption = O.optional (O.strOption (O.long "plan-file" <> O.metavar "FILE" <> O.help "sqitch's plan; sqitch config's core.plan_file when left out"))
