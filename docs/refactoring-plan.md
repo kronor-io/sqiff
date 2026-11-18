@@ -274,6 +274,15 @@ Guiding rules:
     `grant-by-other-role` covers giving a grant as another role.
   - Not handled: chains deeper than one role (A passes to B, B to C) when revoking.
 
+- [x] **`describe --out` file names (Codex 26).**
+  - Names are escaped with `%` itself escaped too, so `a b` and `a-b`, or `/` and `%2F`,
+    no longer share a file.
+  - Paths that differ only in case get a hash of the object's key, since case-folding
+    file systems would merge them.
+  - An empty schema writes the folder and its marker.
+  - `--replace` writes the new export beside the old one and swaps it in when it is
+    complete, so a failure leaves the old export as it was.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

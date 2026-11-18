@@ -15,6 +15,8 @@ import Hedgehog (Gen, forAll, property, (===))
 import Hedgehog.Gen qualified as Gen
 import Hedgehog.Range qualified as Range
 import RIO
+import RIO.Directory (doesFileExist, listDirectory)
+import RIO.FilePath ((</>))
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
@@ -23,6 +25,7 @@ import Sqiff.Config (fill, match)
 import Sqiff.ConnectionString (connectionString, fromPairs, libpqText, redacted)
 import Sqiff.Definition hiding (columns)
 import Sqiff.Diff (Change (..), affected, diff)
+import Sqiff.Folder (Existing (..), exportManifest, writeFolder)
 import Sqiff.Graph (schedule)
 import Sqiff.Identifier (identifier, qname, quoteIdent, typeName)
 import Sqiff.Model (Address (..), Aspect (..), Edge (..), ObjectId (..), ObjectKey (..), RoutineKind (..), fromAddress, toAddress)
@@ -57,6 +60,7 @@ tests =
         , formatting
         , tableFlags
         , sqitchChecks
+        , folderExport
         ]
 
 
@@ -541,3 +545,35 @@ sqitchChecks =
   where
     plan entries = parsePlan ("%syntax-version=1.0.0\n%project=p\n\n" <> entries)
     unitNamed kind changeName = Unit{kind, changeName, note = "", placement = Migration, deploy = [], revert = []}
+
+
+folderExport :: TestTree
+folderExport =
+    testGroup
+        "describe --out"
+        [ testCase "names that differ give files that differ" do
+            let paths = Map.keys (exportManifest (Map.fromList [(table n, Printed n) | n <- ["a b", "a-b", "a/b", "a%2Fb", ".a", "%2Ea"]]))
+            length paths @?= 6
+        , testCase "names that differ only in case get a hash, as some file systems fold case" do
+            let paths = Map.keys (exportManifest (Map.fromList [(table n, Printed n) | n <- ["Orders", "orders", "other"]]))
+                folded = Set.fromList (map (T.toLower . T.pack) paths)
+            (length paths, Set.size folded) @?= (3, 3)
+            ("table/public/other.sql" `elem` paths) @?= True
+        , testCase "an empty schema writes the folder and its marker" do
+            withSystemTempDirectory "sqiff-folder" \dir -> do
+                writeFolder KeepExisting (dir </> "out") Map.empty
+                doesFileExist (dir </> "out" </> ".sqiff") >>= (@?= True)
+        , testCase "--replace swaps in the new export, and keeps the old one when writing fails" do
+            withSystemTempDirectory "sqiff-folder" \dir -> do
+                let out = dir </> "out"
+                writeFolder KeepExisting out (Map.fromList [(table "old", Printed "old")])
+                writeFolder ReplaceOwn out (Map.fromList [(table "new", Printed "new")])
+                listDirectory (out </> "table" </> "public") >>= (@?= ["new.sql"])
+                -- The staging folder cannot be made where a file of its name is.
+                writeFileUtf8 (out <> ".sqiff-staging") "in the way"
+                result <- tryAny (writeFolder ReplaceOwn out (Map.fromList [(table "newer", Printed "newer")]))
+                isLeft result @?= True
+                listDirectory (out </> "table" </> "public") >>= (@?= ["new.sql"])
+        ]
+  where
+    table n = ObjectKey Definition (Table (qname "public" n))
