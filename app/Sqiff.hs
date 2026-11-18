@@ -31,13 +31,15 @@ import Sqiff.Catalog (Addresses, CatalogId (..), Partitions (..), PlFunction (..
 import Sqiff.Config (Config (..), Layout (..), Names (..), fill, loadConfig, match, sqitchLayout)
 import Sqiff.ConnectionString (ConnectionString, connectionString, redacted)
 import Sqiff.Definition hiding (DomainType)
-import Sqiff.Diff (BodyText (..), Change (..), Changes, affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
+import Sqiff.Diff (BodyText (..), Change (..), Changes, affected, bodiesToAnalyse, bodyText, dependentsBy, diff)
 import Sqiff.Folder (Existing (..), writeFolder)
 import Sqiff.Git (Repo, findRepo, showFile)
+import Sqiff.Graph (reachedFrom)
 import Sqiff.Identifier
 import Sqiff.Model
-import Sqiff.Plan (context, invert, plan, planWith, renderStep, topoOrder)
-import Sqiff.Recipe (Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), recipe, revokeGranted)
+import Sqiff.Plan (DependencyCycle, context, cycleMessage, invert, planWith, renderStep)
+import Sqiff.Recipe (Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..))
+import Sqiff.Recreate (standardBody, viewsAroundTypeChanges, withViewsAround)
 import Sqiff.Rewrite (Rewrite (..), fileDrift, rewriteFile)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
 import Sqiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), deployedChanges, moveToEnd, parsePlan, plannedChanges, readPlan, requireSqitch, reworkEdited, units, writeUnits)
@@ -245,96 +247,6 @@ data Dependents = Dependents
     }
 
 
--- | For each retyped column, the statements that drop the views, policies, triggers and
--- routines that hold it, and the ones that create them again.
-viewsAroundTypeChanges :: Dependents -> [(QName, Identifier, ObjectId)] -> Map (QName, Identifier) (Set ObjectId, ([Text], [Text]))
-viewsAroundTypeChanges deps retyped =
-    Map.fromList
-        [ ((t, c), (members, (map dropStatement (reverse order), concatMap createAgain order)))
-        | (t, c, column) <- retyped
-        , let closure = Map.findWithDefault Set.empty column deps.exact
-              onColumn = Set.filter (\a -> isPolicyOrTrigger a && any (\e -> e.dependent == a && e.referenced == column) deps.dbEdges) closure
-              members = held column closure (Set.filter isView closure <> onColumn)
-              order = topoOrder members [(d, r) | e <- deps.dbEdges, let d = relationOf e.dependent, let r = relationOf e.referenced, d `Set.member` members, r `Set.member` members]
-        , not (Set.null members)
-        ]
-  where
-    isPolicyOrTrigger = \case
-        Policy{} -> True
-        Trigger{} -> True
-        _ -> False
-    -- Adds the routines whose definitions hold the column or one of the members, until
-    -- no more do.
-    held column closure members =
-        let views = Set.filter isView members
-            holds r = case printed <$> Map.lookup (definitionKey r) deps.dbSchema of
-                Just def
-                    | standardBody def -> any (\e -> e.dependent == r && (e.referenced == column || relationOf e.referenced `Set.member` members)) deps.dbEdges
-                    | otherwise -> any (\v -> qualifiedName v `T.isInfixOf` signature def) views
-                Nothing -> False
-            more = Set.filter (\r -> isRoutine r && r `Set.notMember` members && holds r) closure
-         in if Set.null more then members else held column closure (members <> more)
-    signature = T.unlines . takeWhile (\l -> not ("AS " `T.isPrefixOf` T.stripStart l || "BEGIN ATOMIC" `T.isInfixOf` l)) . T.lines
-    ctx0 = context Map.empty Map.empty Map.empty [] Map.empty
-    stepsFor key c = map (.sql) (recipe ctx0 key c)
-    createAgain a =
-        concat
-            [ [revokeGranted (qualifiedName a) | aspect == Privileges, isView a] <> stepsFor key (Added def)
-            | aspect <- [Definition, Privileges]
-            , let key = ObjectKey aspect a
-            , Just def <- [Map.lookup key deps.dbSchema]
-            ]
-            <> [ printed def
-               | (k, def) <- Map.toList deps.dbSchema
-               , k.aspect == Definition
-               , case k.object of
-                    Index _ | IndexDefinition ix <- def -> isRelation a == Just ix.table
-                    Trigger t _ -> isRelation a == Just t
-                    _ -> False
-               ]
-            <> concat
-                [ stepsFor k (Added def)
-                | (k, def) <- Map.toList deps.dbSchema
-                , k.aspect == Comment
-                , k.object == a || (relationOf k.object == a && k.object /= a)
-                ]
-
-
--- | The relation a column belongs to; any other object is its own.
-relationOf :: ObjectId -> ObjectId
-relationOf = \case
-    Column t _ -> Table t
-    OtherColumn OfView t _ -> View t
-    OtherColumn OfMaterializedView t _ -> MaterializedView t
-    OtherColumn OfCompositeType t _ -> Unknown (Address "composite type" [nameText t.schema, nameText t.name] [])
-    OtherColumn OfForeignTable t _ -> Unknown (Address "foreign table" [nameText t.schema, nameText t.name] [])
-    object -> object
-
-
--- | An object's name as SQL writes it after its kind.
-qualifiedName :: ObjectId -> Text
-qualifiedName object = case (toAddress object).objectNames of
-    [s, n] -> qualified (qname s n)
-    names -> T.intercalate "." names
-
-
--- | The statement that drops a view, routine, policy or trigger around a type change.
-dropStatement :: ObjectId -> Text
-dropStatement object = case object of
-    Routine _ q args ->
-        let keyword = (toAddress object).objectType
-            list = T.intercalate ", " (map typeText args)
-         in [i|drop #{keyword} #{qualified q}(#{list})|]
-    Policy t n -> [i|drop policy #{quoted n} on #{qualified t}|]
-    Trigger t n -> [i|drop trigger #{quoted n} on #{qualified t}|]
-    _ -> let keyword = (toAddress object).objectType in [i|drop #{keyword} #{qualifiedName object}|]
-
-
--- | A SQL-standard body, which PostgreSQL parses once and tracks in pg_depend.
-standardBody :: Text -> Bool
-standardBody def = "BEGIN ATOMIC" `T.isInfixOf` def || any ("RETURN " `T.isPrefixOf`) (T.lines def)
-
-
 -- | For a foreign key on @table@, each of its columns' types paired with the referenced
 -- column's, by @typeIn table column@.
 foreignKeyTypes :: (QName -> Identifier -> Maybe Text) -> QName -> ConstraintDef -> Maybe [(Text, Text)]
@@ -389,14 +301,18 @@ readBoth config scope from toDb purpose = do
     let fromSchema = fromDatabase.schema
         toSchema = toDatabase.schema
         plainChanges = diff (\_ a b -> a == b) fromSchema toSchema
-        needed = neededFor purpose plainChanges
+        -- What depends on the changes in --from, to the end of the chain, so views on
+        -- views of a retyped column are found; in --to, for ordering, what the changed
+        -- objects use.
+        fromNeeded = neededFor ForDiff plainChanges
+        toNeeded = neededFor ForPlan plainChanges
     measure "readBoth.plainDiff" (Map.size plainChanges)
     (((fromEdges, fromNotes), (toEdges, toNotes)), checks) <-
         timed "readBoth.edgesAndChecks"
             $ concurrently
                 ( concurrently
-                    (edgesOf "--from" scope needed fromDatabase)
-                    (if purpose == ForPlan then edgesOf "--to" scope needed toDatabase else pure ([], []))
+                    (edgesOf "--from" scope fromNeeded fromDatabase)
+                    (if purpose == ForPlan then edgesOf "--to" scope toNeeded toDatabase else pure ([], []))
                 )
                 (bodyChecks scope toDb toSchema plainChanges)
     for_ (fromNotes <> toNotes) (TIO.hPutStrLn stderr)
@@ -521,7 +437,8 @@ main =
                 config <- loadConfig "."
                 let scope = withConfigured config scope'
                 ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth config scope from toDb ForPlan
-                let steps = plan checks fromSchema toSchema fromEdges toEdges (diff (sameDefinition checks) fromSchema toSchema)
+                let changes = diff (sameDefinition checks) fromSchema toSchema
+                steps <- either (failWith . cycleMessage) pure (planWith (withViewsAround fromSchema fromEdges changes) checks fromSchema toSchema fromEdges toEdges changes)
                 measure "plan.planRender" (T.length (T.unlines (map renderStep steps)))
                 for_ steps (TIO.putStrLn . renderStep)
             Sqitch from toDb scope' opts -> do
@@ -533,8 +450,8 @@ main =
                 ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth config scope from toDb ForPlan
                 now <- getCurrentTime
                 let changes = diff (sameDefinition checks) fromSchema toSchema
-                    steps = plan checks fromSchema toSchema fromEdges toEdges changes
-                    inverseCtx = context Map.empty toSchema fromSchema toEdges (Map.map invert changes)
+                steps <- either (failWith . cycleMessage) pure (planWith (withViewsAround fromSchema fromEdges changes) checks fromSchema toSchema fromEdges toEdges changes)
+                let inverseCtx = context Map.empty toSchema fromSchema toEdges (Map.map invert changes)
                     written = units config.names (const True) inverseCtx sqitchPlan now steps
                     tagName = fromMaybe (defaultTag now) opts.tag
                 measure "sqitch.planUnits" (sum [length u.deploy + length u.revert | u <- written])
@@ -826,7 +743,7 @@ compareAndReport described = do
     let retyped = retypedColumns edit
     foreignKeyBreaks <- liftIO (foreignKeyBreaksFor conn deps retyped)
     typeFacts <- liftIO (typeFactsFor conn edit retyped)
-    let findings = findingsFor env Evidence{edit, deps, bodies, retyped, foreignKeyBreaks, typeFacts, branchChanges, pendingRenames, renamedFrom}
+    findings <- either (failWith . cycleMessage) pure $ findingsFor env Evidence{edit, deps, bodies, retyped, foreignKeyBreaks, typeFacts, branchChanges, pendingRenames, renamedFrom}
     measure "table.planRender" (T.length (T.unlines (map renderStep findings.steps <> findings.usage)) + length findings.blocking)
     printLeftAlone edit
     case opts.output of
@@ -929,8 +846,11 @@ typeFactsFor conn edit retyped =
                 Nothing -> pure Nothing
 
 
-findingsFor :: TableEnv -> Evidence -> Findings
-findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames, usage, blocking, renameLike, same, withViews}
+findingsFor :: TableEnv -> Evidence -> Either DependencyCycle Findings
+findingsFor env ev = do
+    planned <- planWith withViews Map.empty edit.current edit.desired [] [] edit.changes
+    let steps = renameSteps <> map withTypeFacts planned
+    pure Findings{steps, renameSteps, newRenames = ev.pendingRenames, usage, blocking, renameLike, same, withViews}
   where
     opts = env.opts
     table = env.table
@@ -962,7 +882,7 @@ findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames
     dependents = deps.exact
     mentions = Map.map (Set.filter (\a -> a `Map.notMember` breaking && a `Set.notMember` passed)) deps.named
     retypedAddresses = Set.fromList (map retypedObject retyped)
-    around = viewsAroundTypeChanges deps [(r.table, r.column, retypedObject r) | r <- retyped]
+    around = viewsAroundTypeChanges deps.exact deps.dbSchema deps.dbEdges [(r.table, r.column, retypedObject r) | r <- retyped]
     withViews c = c{viewsAround = Map.map snd around}
     aroundOf addr = fold [members | r <- retyped, retypedObject r == addr, Just (members, _) <- [Map.lookup (r.table, r.column) around]]
     foreignKeysFor addr = Map.findWithDefault [] addr ev.foreignKeyBreaks
@@ -973,7 +893,6 @@ findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames
         , let addr = Column table new
               def = Map.findWithDefault (Printed "") (definitionKey addr) edit.desired
         ]
-    steps = renameSteps <> map withTypeFacts (planWith withViews Map.empty edit.current edit.desired [] [] edit.changes)
     same :: Text
     same
         | opts.compareWith == LiveDatabase = "the file matches the table"

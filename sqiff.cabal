@@ -32,10 +32,12 @@ library
     Sqiff.Diff
     Sqiff.Folder
     Sqiff.Git
+    Sqiff.Graph
     Sqiff.Identifier
     Sqiff.Model
     Sqiff.Plan
     Sqiff.Recipe
+    Sqiff.Recreate
     Sqiff.Rewrite
     Sqiff.Script
     Sqiff.Sqitch

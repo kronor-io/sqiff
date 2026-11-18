@@ -19,9 +19,10 @@ import RIO.Text qualified as T
 import Sqiff.Config (fill, match)
 import Sqiff.ConnectionString (connectionString, fromPairs, libpqText, redacted)
 import Sqiff.Definition hiding (columns)
-import Sqiff.Diff (Change (..), diff)
+import Sqiff.Diff (Change (..), affected, diff)
+import Sqiff.Graph (schedule)
 import Sqiff.Identifier (identifier, qname, quoteIdent, typeName)
-import Sqiff.Model (Address (..), Aspect (..), ObjectId (..), ObjectKey (..), fromAddress, toAddress)
+import Sqiff.Model (Address (..), Aspect (..), Edge (..), ObjectId (..), ObjectKey (..), fromAddress, toAddress)
 import Sqiff.Plan (invert, topoOrder)
 import Sqiff.Rewrite (fileDrift)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
@@ -260,6 +261,15 @@ ordering =
         , testCase "puts cyclic nodes last"
             $ topoOrder (Set.fromList "abc") [('a', 'b'), ('b', 'a')]
             @?= "cab"
+        , testCase "schedule takes the smallest priority among the ready"
+            $ schedule [(2 :: Int, 'a'), (1, 'b'), (3, 'c')] []
+            @?= Right "bac"
+        , testCase "schedule lets a constraint beat priority"
+            $ schedule [(1 :: Int, 'f'), (2, 'v')] [(0, 1)]
+            @?= Right "vf"
+        , testCase "schedule reports what a cycle blocks"
+            $ schedule [(1 :: Int, 'a'), (2, 'b'), (3, 'c'), (4, 'd')] [(0, 1), (1, 0), (3, 0)]
+            @?= Left ("c", "abd")
         , testProperty "every pair is respected in an acyclic graph" $ property do
             n <- forAll (Gen.int (Range.linear 1 30))
             pairs <- forAll (Gen.list (Range.linear 0 60) ((,) <$> Gen.int (Range.linear 0 (n - 1)) <*> Gen.int (Range.linear 0 (n - 1))))
@@ -279,6 +289,11 @@ diffing =
         [ testCase "finds added, dropped and changed definitions"
             $ diff (\_ a b -> a == b) (Map.fromList [(k "a", "1"), (k "b", "2"), (k "c", "3")]) (Map.fromList [(k "b", "2"), (k "c", "4"), (k "d", "5")])
             @?= Map.fromList [(k "a", Dropped "1"), (k "c", Changed "3" "4"), (k "d", Added "5")]
+        , testCase "a dependent whose comment changes still depends" do
+            let column = Column (qname "public" "t") (identifier "a")
+                view = View (qname "public" "v")
+                changes = Map.fromList [(ObjectKey Definition column, Changed "int" "bigint"), (ObjectKey Comment view, Changed "old" "new" :: Change Text)]
+            affected (Set.fromList [column, view]) [Edge view column] changes @?= Map.fromList [(column, Set.singleton view)]
         , testCase "the sameness test can hide a change"
             $ diff (\_ _ _ -> True) (Map.fromList [(k "a", "1")]) (Map.fromList [(k "a", "2")])
             @?= Map.empty

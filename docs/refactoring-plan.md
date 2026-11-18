@@ -108,6 +108,27 @@ Guiding rules:
     recipes mostly emit the text as it is. They still read routine headers and bodies
     (`BEGIN ATOMIC`, `RETURN`) and rewrite `CREATE TRIGGER` to `CREATE OR REPLACE TRIGGER`.
 
+- [x] **Phase 3:** dependency-correct planning.
+  - `Sqiff.Graph` holds the shared graph code: `reachedFrom`, `topoOrder`, and `schedule`,
+    a topological sort with priorities that reports what a cycle blocks.
+  - Steps are scheduled over a dependency graph. Edges are hard constraints, and kind
+    rank, object order and recipe order only break ties among ready steps. A dependent
+    waits for an object's main step, not for its settings, grants or comment. A new
+    table's columns pass their dependencies to the table's step. A sequence's ownership
+    waits for its column; the sequence itself does not.
+  - Routines rank after views. PostgreSQL records what a view uses, but not what a
+    function's string body uses.
+  - `plan` and `planWith` return `Either DependencyCycle [Step]`, and the commands fail
+    with the objects involved. Before, a cycle was silently appended.
+  - `affected` excludes only dependents whose definition is in the diff.
+  - The view handling around retyped columns moved to `Sqiff.Recreate`, and `plan` and
+    `sqitch` use it. `--from` reads the transitive dependents of what changes.
+  - Fixed: function-needs-new-view, retype-column-under-view, and two new fixtures that
+    fail on the previous commit: table-default-uses-new-function and
+    retype-column-under-nested-views.
+  - Not done: serial-to-identity as one coordinated operation, and reverts per unit
+    (Codex 11 and 16).
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

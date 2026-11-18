@@ -1,1 +1,0 @@
-steps sort by object kind before dependencies, so the function is created before the view it reads (Plan.hs, Recipe createRank)

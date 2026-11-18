@@ -1,0 +1,8 @@
+added   function app.next_code
+added   table app.voucher
+added   table column app.voucher.code
+added   table column app.voucher.id
+added   table constraint app.voucher.voucher_pkey
+added   function app.next_code (privileges)
+added   table app.voucher (privileges)
+7 added, 0 dropped, 0 changed

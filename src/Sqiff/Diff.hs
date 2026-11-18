@@ -12,7 +12,6 @@ module Sqiff.Diff (
     BodyText (..),
     bodyText,
     dependentsBy,
-    reachedFrom,
     bodiesToAnalyse,
 ) where
 
@@ -25,6 +24,7 @@ import RIO.NonEmpty qualified as L
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import Sqiff.Definition (Definition)
+import Sqiff.Graph (reachedFrom)
 import Sqiff.Identifier (QName (..), TypeName, nameText, typeText)
 import Sqiff.Model
 
@@ -67,7 +67,7 @@ diff same =
 
 
 -- | For each dropped or changed definition, the objects in @known@ that depend on it,
--- directly or through others, and are not in the diff themselves.
+-- directly or through others, and whose definitions are not in the diff themselves.
 affected :: Set ObjectId -> [Edge] -> Map ObjectKey (Change a) -> Map ObjectId (Set ObjectId)
 affected known edges changes =
     Map.filter (not . Set.null)
@@ -78,7 +78,9 @@ affected known edges changes =
             , removesOrChanges change
             ]
   where
-    inDiff = Set.fromList (map (.object) (Map.keys changes))
+    -- Objects whose own definition changes are planned by their own recipes; one whose
+    -- comment or grants change still stands in the way.
+    inDiff = Set.fromList [k.object | k <- Map.keys changes, k.aspect == Definition]
 
     dependents =
         Map.fromListWith
@@ -133,17 +135,6 @@ dependentsBy edges = \object -> direct object <> concatMap direct (columnsOf obj
     direct object = Map.findWithDefault [] object deps
     columns = Map.fromListWith (<>) [(t, Set.singleton e.referenced) | e <- edges, Column t _ <- [e.referenced]]
     columnsOf object = maybe [] (\q -> maybe [] Set.toList (Map.lookup q columns)) (isRelation object)
-
-
--- | The objects reachable from @starts@ by one step or more of @dependents@.
-reachedFrom :: (ObjectId -> [ObjectId]) -> Set ObjectId -> Set ObjectId
-reachedFrom dependents starts = go Set.empty (Set.fromList (concatMap dependents (Set.toList starts)))
-  where
-    go seen frontier
-        | Set.null frontier = seen
-        | otherwise =
-            let seen' = seen <> frontier
-             in go seen' (Set.fromList (concatMap dependents (Set.toList frontier)) `Set.difference` seen')
 
 
 -- | Of @functions@, those whose body edges 'affected' can follow from @starts@: their

@@ -14,6 +14,9 @@ module Sqiff.Recipe (
     Context (..),
     columnSql,
     recipe,
+    createRank,
+    dropRank,
+    sequenceOwnerRank,
 ) where
 
 import Data.ByteString qualified as B
@@ -131,9 +134,11 @@ createRank = \case
     Sequence _ -> 3
     Table _ -> 4
     Column _ _ -> 5
-    Routine{} -> 6
     View _ -> 7
     MaterializedView _ -> 8
+    -- After views: PostgreSQL records what a view uses, so a view on a new function waits
+    -- for it, but not what a function's string body uses, which may be a new view.
+    Routine{} -> 9
     TableConstraint _ _ -> 10
     DomainConstraint _ _ -> 10
     Index _ -> 11
