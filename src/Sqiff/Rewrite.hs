@@ -25,7 +25,7 @@ import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Recipe (columnSql)
 import Sqiff.Script (splitStatements)
-import Sqiff.Sqitch (tidyConstraint, tidyIndex)
+import Sqiff.Sqitch.Units (tidyConstraint, tidyIndex)
 import Sqiff.Sql (Region (..), codeOnly, regions, replaceInCode, topWords)
 import Sqiff.Sql qualified as Sql
 

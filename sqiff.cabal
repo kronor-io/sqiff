@@ -23,10 +23,22 @@ library
   import:          shared
   hs-source-dirs:  src
   exposed-modules:
+    Sqiff.App.Compare
+    Sqiff.App.Dependents
+    Sqiff.App.Env
+    Sqiff.App.Options
+    Sqiff.App.Read
+    Sqiff.App.Table
+    Sqiff.App.Table.Env
+    Sqiff.App.Table.Findings
+    Sqiff.App.Table.Rewrite
     Sqiff.Baseline
     Sqiff.Body
     Sqiff.Catalog
+    Sqiff.Catalog.PlpgsqlCheck
+    Sqiff.Catalog.Rows
     Sqiff.Config
+    Sqiff.Connection
     Sqiff.ConnectionString
     Sqiff.Definition
     Sqiff.Diff
@@ -42,6 +54,8 @@ library
     Sqiff.Script
     Sqiff.Sql
     Sqiff.Sqitch
+    Sqiff.Sqitch.Plan
+    Sqiff.Sqitch.Units
     Sqiff.TableEdit
     Sqiff.Timing
 
@@ -51,10 +65,12 @@ library
     , bytestring
     , containers
     , crypton
+    , Diff
     , file-embed
     , filepath
     , hasql
     , hasql-th
+    , opt-env-conf
     , pqi-ffi
     , rio
     , string-interpolate
@@ -73,16 +89,10 @@ executable sqiff
 
   build-depends:
     , base
-    , containers
-    , Diff
-    , filepath
-    , hasql
-    , sqiff
-    , optparse-applicative
     , rio
+    , sqiff
     , string-interpolate
     , text
-    , time
 
 test-suite sqiff-test
   import:             shared

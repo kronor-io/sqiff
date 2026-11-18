@@ -16,6 +16,7 @@ module Sqiff.Config (
     loadConfig,
     configFile,
     sqitchLayout,
+    findLayout,
     fill,
     match,
 ) where
@@ -31,7 +32,7 @@ import RIO hiding (view)
 import RIO.Directory (doesFileExist)
 import RIO.FilePath ((</>))
 import RIO.Map qualified as Map
-import Sqiff.Catalog (failWith)
+import Sqiff.Connection (failWith)
 import System.Process.Typed (nullStream, proc, readProcess, setStdin, setWorkingDir)
 
 
@@ -192,6 +193,16 @@ sqitchLayout root = do
     pure Layout{topDir, planFile}
   where
     decode = T.strip . decodeUtf8Lenient . toStrictBytes
+
+
+-- | sqitch's top directory and plan file in @root@: the given ones, and sqitch's
+-- configuration for the others.
+findLayout :: FilePath -> Maybe FilePath -> Maybe FilePath -> IO Layout
+findLayout root top planFile = case (top, planFile) of
+    (Just topDir, Just given) -> pure Layout{topDir, planFile = given}
+    _ -> do
+        found <- sqitchLayout root
+        pure Layout{topDir = fromMaybe found.topDir top, planFile = fromMaybe found.planFile planFile}
 
 
 -- | @pattern@ with each @{key}@ replaced by its value, in one pass, so a value is never

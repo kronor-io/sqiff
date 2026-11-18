@@ -14,7 +14,7 @@ import RIO
 import RIO.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory, removeDirectoryRecursive)
 import RIO.FilePath (joinPath, takeDirectory, (<.>), (</>))
 import RIO.Map qualified as Map
-import Sqiff.Catalog (failWith)
+import Sqiff.Connection (failWith)
 import Sqiff.Definition (printed)
 import Sqiff.Model (Address (..), Aspect (..), ObjectKey (..), Schema, toAddress)
 

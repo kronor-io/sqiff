@@ -13,9 +13,6 @@ module Sqiff.Catalog (
     ClassOid (..),
     pgClass,
     pgProc,
-    UserError (..),
-    failWith,
-    connect,
     describe,
     Partitions (..),
     Addresses,
@@ -23,21 +20,8 @@ module Sqiff.Catalog (
     dependencies,
     dependenciesOn,
     dependenciesFrom,
-    qualifiedNames,
-    Skipped,
-    bodyUses,
-    BodyUses,
-    PlFunction (..),
-    PlFunctions (..),
-    plpgsqlFunctions,
-    analyseBodies,
     edgesBetween,
     relationColumns,
-    bodyErrors,
-    errorText,
-    notChecked,
-    serverError,
-    tempTableStatements,
 ) where
 
 import Data.Aeson qualified as Aeson
@@ -46,27 +30,22 @@ import Data.FileEmbed (embedDir, embedFile, makeRelativeToProject)
 import Data.Functor.Contravariant (contramap)
 import Data.String.Interpolate (i)
 import Hasql.Connection qualified as Connection
-import Hasql.Connection.Settings qualified as Settings
 import Hasql.Decoders qualified as D
 import Hasql.Encoders qualified as E
-import Hasql.Errors qualified as Errors
-import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
-import Hasql.TH (maybeStatement, singletonStatement, vectorStatement)
-import Pqi.Ffi qualified
+import Hasql.TH (vectorStatement)
 import RIO
 import RIO.FilePath (takeBaseName)
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
-import RIO.Text.Partial qualified as TP
 import RIO.Vector qualified as V
-import Sqiff.ConnectionString (ConnectionString, libpqText)
+import Sqiff.Catalog.Rows
+import Sqiff.Connection (failWith, qualifiedNames, run)
 import Sqiff.Definition (Definition (..))
 import Sqiff.Identifier (Identifier, QName (..), identifier, nameText, qname)
 import Sqiff.Model
-import Sqiff.Sql (doBlock, literal)
 import Sqiff.Timing (timed)
 
 
@@ -76,63 +55,6 @@ describeQueries = $(makeRelativeToProject "sql/describe" >>= embedDir)
 
 dependQuery :: ByteString
 dependQuery = $(makeRelativeToProject "sql/depend.sql" >>= embedFile)
-
-
-plpgsqlFunctionsQuery :: ByteString
-plpgsqlFunctionsQuery = $(makeRelativeToProject "sql/plpgsql/functions.sql" >>= embedFile)
-
-
-plpgsqlDependQuery :: ByteString
-plpgsqlDependQuery = $(makeRelativeToProject "sql/plpgsql/depend.sql" >>= embedFile)
-
-
-plpgsqlTempTablesScript :: ByteString
-plpgsqlTempTablesScript = $(makeRelativeToProject "sql/plpgsql/temp_tables.sql" >>= embedFile)
-
-
--- | A failure the command line reports as one line.
-newtype UserError = UserError Text
-    deriving stock (Show)
-
-
-instance Exception UserError
-
-
-failWith :: MonadIO m => Text -> m a
-failWith = throwIO . UserError . T.unwords . T.words
-
-
-connect :: ConnectionString -> IO Connection.Connection
-connect conninfo =
-    Connection.acquire Pqi.Ffi.adapter (Settings.connectionString (libpqText conninfo))
-        >>= either (\e -> failWith ("could not connect: " <> firstLine (reason e))) pure
-  where
-    reason = \case
-        Errors.NetworkingConnectionError t -> t
-        Errors.AuthenticationConnectionError t -> t
-        Errors.CompatibilityConnectionError t -> t
-        Errors.OtherConnectionError t -> t
-    firstLine = T.takeWhile (/= '\n')
-
-
--- | The oid of a system catalog, such as @pg_class@.
-newtype ClassOid = ClassOid Int64
-    deriving newtype (Eq, Ord, Show, NFData)
-
-
-pgClass, pgProc :: ClassOid
-pgClass = ClassOid 1259
-pgProc = ClassOid 1255
-
-
--- | An object's class, object and sub-object id, as in @pg_depend@.
-data CatalogId = CatalogId
-    { classId :: ClassOid
-    , objectOid :: Int64
-    , subId :: Int32
-    }
-    deriving stock (Eq, Ord, Show, Generic)
-    deriving anyclass (NFData)
 
 
 -- | Each described object, by its catalog ids.
@@ -291,254 +213,6 @@ edgesBetween addresses pairs =
     [Edge a b | (x, y) <- pairs, Just a <- [Map.lookup x addresses], Just b <- [Map.lookup y addresses]]
 
 
--- | Runs @action@ with an empty @search_path@, which schema-qualifies the names the catalog
--- functions print.
-qualifiedNames :: Connection.Connection -> IO a -> IO a
-qualifiedNames conn action = do
-    previous <- run conn () [singletonStatement| select current_setting('search_path') :: text |]
-    void (run conn "" setPath)
-    action `finally` void (Connection.use conn (Session.statement previous setPath))
-  where
-    setPath = [singletonStatement| select set_config('search_path', $1 :: text, false) :: text |]
-
-
--- | Functions plpgsql_check could not analyse, with the reason.
-type Skipped = [(Text, Text)]
-
-
--- | Pairs of a function and what its body uses, and the functions not analysed.
-type BodyUses = ([(CatalogId, CatalogId)], Skipped)
-
-
--- | What PL/pgSQL bodies use, as catalog ids, for the functions in @only@ or all of them;
--- 'Nothing' when plpgsql_check is not installed.
-bodyUses :: NonEmpty Connection.Connection -> [Text] -> Maybe (Set Int64) -> IO (Maybe Text) -> IO (Maybe BodyUses)
-bodyUses conns@(conn :| _) excluded only madeTempTables =
-    plpgsqlFunctions conn excluded >>= traverse \fs -> do
-        let checkable = maybe fs.checkable (\oids -> [f | f <- fs.checkable, f.oid `Set.member` oids]) only
-        (uses, failed) <- analyseBodies conns fs{tempTables = madeTempTables >>= maybe fs.tempTables pure} checkable
-        pure (uses, fs.unchecked <> failed)
-
-
--- | The statements temp_tables.sql runs on a connection without temp tables; 'Nothing'
--- when it fails or plpgsql_check is not installed.
-tempTableStatements :: Connection.Connection -> IO (Maybe Text)
-tempTableStatements conn =
-    timed "tempTableStatements"
-        $ run conn () plpgsqlCheckSchema
-        >>= \case
-            Nothing -> pure Nothing
-            Just extSchema -> do
-                result <-
-                    Connection.use conn do
-                        Session.script "begin"
-                        Session.script (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))
-                        Session.statement () [singletonStatement| select coalesce(current_setting('sqiff.temp_tables', true), '') :: text |]
-                _ <- Connection.use conn (Session.script "rollback")
-                pure (either (const Nothing) (Just . ("set client_min_messages = error;\n" <>)) result)
-
-
--- | A PL/pgSQL function plpgsql_check can analyse: its oid, name, trigger table and
--- estimated cost.
-data PlFunction = PlFunction
-    { oid :: Int64
-    , name :: Text
-    , relid :: Maybe Int64
-    , cost :: Int64
-    }
-
-
--- | The PL/pgSQL functions to analyse, the ones that cannot be, and the functions behind
--- user-defined casts and operators.
-data PlFunctions = PlFunctions
-    { query :: Text
-    , tempTables :: IO Text
-    , checkable :: [PlFunction]
-    , unchecked :: Skipped
-    , implicit :: [Int64]
-    }
-
-
--- | The PL/pgSQL functions the describe queries cover; 'Nothing' when plpgsql_check is
--- not installed.
-plpgsqlFunctions :: Connection.Connection -> [Text] -> IO (Maybe PlFunctions)
-plpgsqlFunctions conn excluded =
-    timed "plpgsqlFunctions"
-        $ qualifiedNames conn
-        $ run conn () plpgsqlCheckSchema
-        >>= traverse \extSchema -> do
-            functions <- run conn excluded (Statement.unpreparable (decodeUtf8Lenient plpgsqlFunctionsQuery) excludedParam (D.rowList functionRow))
-            implicit <- toList <$> run conn () implicitQuery
-            let (unchecked, checkable) = partitionEithers (map triggerTable functions)
-            let withSchema = TP.replace "@extschema@" extSchema . decodeUtf8Lenient
-            pure (PlFunctions (withSchema plpgsqlDependQuery) (pure (withSchema plpgsqlTempTablesScript)) checkable unchecked implicit)
-  where
-    implicitQuery =
-        [vectorStatement|
-            select castfunc::int8
-            from pg_cast
-            where castfunc >= 16384
-            union
-            select oprcode::int8
-            from pg_operator
-            where oprcode >= 16384
-        |]
-    functionRow = (,,,,) <$> D.column (D.nonNullable D.int8) <*> textColumn <*> D.column (D.nonNullable D.bool) <*> D.column (D.nullable D.int8) <*> int8Column
-    triggerTable (oid, name, isTrigger, relid, cost)
-        | isTrigger && isNothing relid = Left (name, "no trigger uses it")
-        | otherwise = Right (PlFunction oid name relid cost)
-
-
--- | What the bodies of @functions@ use, and the ones plpgsql_check failed on, in the
--- order of @fs@, the slowest analysed first.
-analyseBodies :: NonEmpty Connection.Connection -> PlFunctions -> [PlFunction] -> IO BodyUses
-analyseBodies conns fs functions = do
-    let
-        (slow, fast) = L.partition ((> 0) . (.cost)) functions
-    queue <- newIORef (map pure (L.sortOn (Down . (.cost)) slow) <> chunks fast)
-    let next = atomicModifyIORef' queue \case
-            [] -> ([], Nothing)
-            b : rest -> (rest, Just b)
-        batch c b = let firstName = maybe "" (\f -> f.name) (listToMaybe b) in (:) <$> timed [i|analyse.batch n=#{length b} first=#{firstName}|] (inBatches c fs.query b) <*> work c
-        work c = next >>= maybe (pure []) (batch c)
-        worker c =
-            next >>= \case
-                Nothing -> pure []
-                Just b -> do
-                    void (timed "analyse.tempTables" $ fs.tempTables >>= Connection.use c . Session.script)
-                    batch c b `finally` void (Connection.use c (Session.script "discard temp; reset client_min_messages"))
-    results <- concat <$> forConcurrently (toList conns) worker
-    let position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
-        failed = L.sortOn (\(name, _) -> Map.lookup name position) (concatMap snd results)
-    pure (concatMap fst results, failed)
-  where
-    chunks xs = case L.splitAt batchSize xs of
-        ([], _) -> []
-        (b, rest) -> b : chunks rest
-
-    batchSize = 16
-
-    inBatches _ _ [] = pure ([], [])
-    inBatches c query batch =
-        Connection.use c (Session.statement batch (Statement.unpreparable query dependParams (D.rowList useRow)))
-            >>= \case
-                Right uses -> pure ([(CatalogId pgProc f 0, CatalogId (ClassOid k) o 0) | (f, k, o) <- uses], [])
-                Left (Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message _ _ _)))
-                    | [f] <- batch -> pure ([], [(f.name, message)])
-                    | otherwise -> do
-                        let (left, right) = L.splitAt (length batch `div` 2) batch
-                        (e1, s1) <- inBatches c query left
-                        (e2, s2) <- inBatches c query right
-                        pure (e1 <> e2, s1 <> s2)
-                Left e -> failWith [i|query failed: #{errorText e}|]
-
-    dependParams =
-        contramap (map (.oid)) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int8))))
-            <> contramap (map (.relid)) (E.param (E.nonNullable (E.foldableArray (E.nullable E.int8))))
-
-    useRow = (,,) <$> int8Column <*> int8Column <*> int8Column
-
-
--- | plpgsql_check's errors, as (function, line, message), for these signatures in the
--- transaction @conn@ is in; 'Nothing' when plpgsql_check is not installed.
-bodyErrors :: Connection.Connection -> Text -> Text -> IO (Maybe Text) -> [Text] -> [Text] -> IO (Maybe (Set (Text, Int32, Text)))
-bodyErrors conn aside table made signatures sqlSignatures =
-    run conn () plpgsqlCheckSchema
-        >>= traverse \extSchema -> do
-            tempTables <- made >>= maybe (pure (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))) pure
-            made' <- timed "bodyErrors.tempTables" $ guarded (Connection.use conn (Session.script tempTables))
-            recompiled <- if null signatures then pure (Right ()) else timed "bodyErrors.recompile" $ guarded (Connection.use conn (Session.script recompile))
-            plErrors <- case (made', recompiled) of
-                (Left e, _) -> pure [[(s, 0, notChecked <> "plpgsql_check's temp tables could not be made: " <> errorText e) | s <- signatures]]
-                (_, Left e) -> pure [[(s, 0, notChecked <> "the functions could not be recompiled: " <> errorText e) | s <- signatures]]
-                _ -> for (chunks signatures) (timed "bodyErrors.batch" . inBatches extSchema)
-            sqlErrors <- for sqlSignatures \signature ->
-                either (\e -> [(signature, 0, errorText e)]) (const [])
-                    <$> timed ("bodyErrors.sql " <> signature) (guarded (Connection.use conn (Session.statement signature validate)))
-            pure (Set.fromList (concat (plErrors <> sqlErrors)))
-  where
-    validate = [singletonStatement| select pg_catalog.fmgr_sql_validator(to_regprocedure($1 :: text)) :: text? |]
-    recompile =
-        let list = T.intercalate ", " (map literal signatures)
-         in doBlock
-                [i|
-declare f record;
-begin
-    for f in select p.oid::regprocedure as signature, p.prosecdef from pg_proc p where p.oid in (select to_regprocedure(s) from unnest(array[#{list}]::text[]) s) loop
-        execute format('alter routine %s %s', f.signature, case when f.prosecdef then 'security definer' else 'security invoker' end);
-    end loop;
-end |]
-    guarded action = do
-        savepoint "savepoint sqiff_check"
-        result <- action
-        savepoint (either (const "rollback to savepoint sqiff_check") (const "release savepoint sqiff_check") result)
-        pure result
-    savepoint sql = Connection.use conn (Session.script sql) >>= either (\e -> failWith [i|the body check lost its transaction: #{errorText e}|]) pure
-    inBatches _ [] = pure []
-    inBatches extSchema batch =
-        guarded (Connection.use conn (Session.statement (batch, table) (Statement.unpreparable (query extSchema) params decoder))) >>= \case
-            Right errors -> pure errors
-            Left e@(Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError _))
-                | [s] <- batch -> pure [(s, 0, notChecked <> errorText e)]
-            Left e
-                | [_] <- batch -> failWith [i|the body check failed: #{errorText e}|]
-                | otherwise -> do
-                    let (left, right) = L.splitAt (length batch `div` 2) batch
-                    (<>) <$> inBatches extSchema left <*> inBatches extSchema right
-    chunks xs = case L.splitAt 16 xs of
-        ([], _) -> []
-        (b, rest) -> b : chunks rest
-    params = contramap fst (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.text)))) <> contramap snd (E.param (E.nonNullable E.text))
-    decoder = D.rowList ((,,) <$> textColumn <*> D.column (D.nonNullable D.int4) <*> textColumn)
-    query extSchema =
-        [i|
-            select s.signature, e.lineno, e.message
-            from unnest($1::text[]) with ordinality s (signature, n)
-            cross join lateral (
-                select coalesce(c.lineno, 0)::int4 as lineno, c.message
-                from pg_proc f
-                left join lateral (select t.tgrelid, t.tgoldtable, t.tgnewtable from pg_trigger t where t.tgfoid = f.oid order by t.oid limit 1) t on true
-                cross join lateral #{extSchema}.plpgsql_check_function_tb(
-                    f.oid::regprocedure,
-                    coalesce(
-                        case
-                            when (select n.nspname from pg_class k join pg_namespace n on n.oid = k.relnamespace where k.oid = t.tgrelid) = #{literal aside} then to_regclass($2)
-                            else t.tgrelid::regclass
-                        end,
-                        0::regclass
-                    ),
-                    fatal_errors => false,
-                    oldtable => t.tgoldtable,
-                    newtable => t.tgnewtable
-                ) c
-                where f.oid = to_regprocedure(s.signature)
-                    and not (f.prorettype = 'trigger'::regtype and t.tgrelid is null)
-                    and c.level = 'error'
-            ) e
-            order by s.n
-        |]
-
-
--- | How 'bodyErrors' starts the message for a function it could not check.
-notChecked :: Text
-notChecked = "not checked: "
-
-
--- | The message of an error the server raised; 'Nothing' for connection and client errors.
-serverError :: Errors.SessionError -> Maybe Text
-serverError e = case e of
-    Errors.ScriptSessionError _ _ -> Just (errorText e)
-    Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError _) -> Just (errorText e)
-    _ -> Nothing
-
-
-errorText :: Errors.SessionError -> Text
-errorText = \case
-    Errors.ScriptSessionError _ (Errors.ServerError _ message detail _ _) -> message <> maybe "" ("; " <>) detail
-    Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message detail _ _)) -> message <> maybe "" ("; " <>) detail
-    e -> tshow e
-
-
 -- | The column names of the given relations, by schema and name.
 relationColumns :: Connection.Connection -> [QName] -> IO (Map QName (Set Identifier))
 relationColumns conn relations =
@@ -567,66 +241,9 @@ relationColumns conn relations =
         |]
 
 
--- | The schema plpgsql_check is installed in, if it is.
-plpgsqlCheckSchema :: Statement.Statement () (Maybe Text)
-plpgsqlCheckSchema =
-    [maybeStatement|
-        select extnamespace::regnamespace::text
-        from pg_extension
-        where extname = 'plpgsql_check'
-    |]
-
-
-run :: Connection.Connection -> params -> Statement.Statement params a -> IO a
-run conn params statement =
-    Connection.use conn (Session.statement params statement)
-        >>= either (\e -> failWith [i|query failed: #{errorText e}|]) pure
-
-
-excludedParam :: E.Params [Text]
-excludedParam = E.param (E.nonNullable (E.foldableArray (E.nonNullable E.text)))
-
-
 describeParams :: E.Params ([Text], Bool, Maybe Text, Maybe Int32)
 describeParams =
     contramap (\(excluded, _, _, _) -> excluded) excludedParam
         <> contramap (\(_, includePartitions, _, _) -> includePartitions) (E.param (E.nonNullable E.bool))
         <> contramap (\(_, _, onlyTable, _) -> onlyTable) (E.param (E.nullable E.text))
         <> contramap (\(_, _, _, half) -> half) (E.param (E.nullable E.int4))
-
-
--- | Catalog ids as three parallel arrays: classes, objects and sub-objects.
-catalogIdsParams :: E.Params [CatalogId]
-catalogIdsParams =
-    contramap (map (\c -> let ClassOid oid = c.classId in oid)) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int8))))
-        <> contramap (map (.objectOid)) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int8))))
-        <> contramap (map (.subId)) (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.int4))))
-
-
-catalogIdRow :: D.Row CatalogId
-catalogIdRow = CatalogId <$> (ClassOid <$> int8Column) <*> int8Column <*> D.column (D.nonNullable D.int4)
-
-
-int8Column :: D.Row Int64
-int8Column = D.column (D.nonNullable D.int8)
-
-
-int8Array :: D.Row [Int64]
-int8Array = D.column (D.nonNullable (D.listArray (D.nonNullable D.int8)))
-
-
-int4Array :: D.Row [Int32]
-int4Array = D.column (D.nonNullable (D.listArray (D.nonNullable D.int4)))
-
-
--- | An object as @pg_identify_object_as_address@ names it, parsed.
-objectRow :: D.Row ObjectId
-objectRow = fmap fromAddress (Address <$> textColumn <*> textArrayColumn <*> textArrayColumn)
-
-
-textColumn :: D.Row Text
-textColumn = D.column (D.nonNullable D.text)
-
-
-textArrayColumn :: D.Row [Text]
-textArrayColumn = D.column (D.nonNullable (D.listArray (D.nonNullable D.text)))

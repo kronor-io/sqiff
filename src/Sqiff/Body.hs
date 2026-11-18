@@ -21,7 +21,7 @@ import RIO
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Vector qualified as V
-import Sqiff.Catalog (errorText, failWith, qualifiedNames)
+import Sqiff.Connection (errorText, failWith, qualifiedNames)
 import Sqiff.Definition (Definition, printed)
 import Sqiff.Model (Address (..), Aspect (..), ObjectKey (..), Schema, fromAddress, isRoutine, toAddress)
 

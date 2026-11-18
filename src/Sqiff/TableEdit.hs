@@ -32,7 +32,8 @@ import Hasql.Session qualified as Session
 import Hasql.TH (singletonStatement, vectorStatement)
 import RIO
 import RIO.Map qualified as Map
-import Sqiff.Catalog (Partitions (..), describeOn, errorText, failWith, serverError)
+import Sqiff.Catalog (Partitions (..), describeOn)
+import Sqiff.Connection (errorText, failWith, serverError)
 import Sqiff.Definition (Definition (..), IndexDef (..), TableDef (..), mapNames, mapText)
 import Sqiff.Diff (Change (..), Changes, diff)
 import Sqiff.Identifier

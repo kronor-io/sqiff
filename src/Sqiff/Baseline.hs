@@ -17,8 +17,8 @@ import RIO
 import RIO.Directory (XdgDirectory (..), canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist, doesPathExist, findExecutable, getXdgDirectory, removeDirectoryRecursive, removeFile)
 import RIO.FilePath (takeDirectory, (</>))
 import RIO.Map qualified as Map
-import Sqiff.Catalog (failWith)
 import Sqiff.Config (BaselineConfig (..), DeployStep (..), Password (..), SqitchPlace (..), fill)
+import Sqiff.Connection (failWith)
 import Sqiff.ConnectionString (ConnectionString, fromPairs)
 import Sqiff.Git (Repo, commonDir, findRepo, git, resolveCommit)
 import System.Environment (getEnvironment, lookupEnv)

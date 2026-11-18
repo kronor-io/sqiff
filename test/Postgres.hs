@@ -23,7 +23,7 @@ import RIO
 import RIO.Directory (createDirectory, findExecutable, removeDirectoryRecursive)
 import RIO.FilePath ((</>))
 import RIO.Text qualified as T
-import Sqiff.Catalog (connect, errorText)
+import Sqiff.Connection (connect, errorText)
 import Sqiff.ConnectionString (connectionString)
 import System.Environment (lookupEnv)
 import System.IO.Temp (createTempDirectory)

@@ -149,6 +149,40 @@ Guiding rules:
     `nextval('…')` literals. `Script.splitStatements` keeps its own state machine, which
     tracks `BEGIN ATOMIC` depth.
 
+- [x] **Phase 5:** app layer.
+  - `app/Sqiff.hs` is now about 40 lines: it parses the command and dispatches. The
+    workflows are library modules:
+    - `Sqiff.App.Compare`: describe, diff, plan and sqitch.
+    - `Sqiff.App.Read`: describing databases and finding edges.
+    - `Sqiff.App.Dependents`.
+    - `Sqiff.App.Table` with `.Env`, `.Findings` (pure) and `.Rewrite`.
+  - `Sqiff.App.Env`: `AppEnv` (configuration, and the scope with its excluded schemas)
+    for `RIO`, plus `say` and `note`.
+  - The CLI uses opt-env-conf (`Sqiff.App.Options`). The table flags parse into a
+    `TableMode`:
+    - `MigrateToFile` takes a `Comparison` (`WithBaseFile renames | WithLiveTable drops`).
+    - `RewriteFile` takes an optional `--live-from` database.
+  - Flags that do not apply together fail in the parser (`checkMapEither`), with exit
+    code 1, before anything connects. `--allow-drops` without `--against-database` and
+    the file-comparison flags with `--rewrite-file` used to be ignored silently.
+  - Every connection is scoped (`withConnection`, `withConnections`), and every
+    background read uses `withAsync`.
+    - `withDatabase` opens the connections and describes the database the first time
+      the workflow asks (`onDemand`).
+    - All of it is released when the workflow ends or fails.
+    - A smoke run against a throwaway cluster gave the same output as the previous
+      commit, with no connections left open.
+  - `Catalog` is split:
+    - `Sqiff.Connection`: connections, `UserError`, `run`.
+    - `Sqiff.Catalog.Rows`: catalog ids and codecs.
+    - `Sqiff.Catalog.PlpgsqlCheck`.
+  - `Sqitch` is split:
+    - `Sqiff.Sqitch.Plan`: the plan file and registry.
+    - `Sqiff.Sqitch.Units`: pure grouping and rendering.
+    - `Sqiff.Sqitch`: running sqitch.
+  - `locateTable` normalises the deploy directory, so `--top-dir .` works.
+  - The SQL-text unit tests from Phase 4 were never registered; they now run.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

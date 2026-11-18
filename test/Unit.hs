@@ -1,3 +1,4 @@
+{-# LANGUAGE DisambiguateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NoImplicitPrelude #-}
@@ -16,6 +17,7 @@ import RIO
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
+import Sqiff.App.Options (Comparison (..), MigrateOptions (..), Output (..), SameTypeSwap (..), TableFlags (..), TableMode (..), TableOptions (..), tableOptions)
 import Sqiff.Config (fill, match)
 import Sqiff.ConnectionString (connectionString, fromPairs, libpqText, redacted)
 import Sqiff.Definition hiding (columns)
@@ -26,7 +28,8 @@ import Sqiff.Model (Address (..), Aspect (..), Edge (..), ObjectId (..), ObjectK
 import Sqiff.Plan (invert, topoOrder)
 import Sqiff.Rewrite (fileDrift)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
-import Sqiff.Sqitch (SqitchPlan (..), parsePlan, tidyIndex)
+import Sqiff.Sqitch.Plan (SqitchPlan (..), parsePlan)
+import Sqiff.Sqitch.Units (tidyIndex)
 import Sqiff.Sql qualified as Sql
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
@@ -38,6 +41,7 @@ tests =
     testGroup
         "unit"
         [ quoting
+        , sqlText
         , connections
         , addresses
         , templates
@@ -47,6 +51,7 @@ tests =
         , diffing
         , columns
         , formatting
+        , tableFlags
         ]
 
 
@@ -305,15 +310,15 @@ diffing =
     testGroup
         "diff"
         [ testCase "finds added, dropped and changed definitions"
-            $ diff (\_ a b -> a == b) (Map.fromList [(k "a", "1"), (k "b", "2"), (k "c", "3")]) (Map.fromList [(k "b", "2"), (k "c", "4"), (k "d", "5")])
+            $ diff (\_ a b -> a == b) (Map.fromList [(k "a", "1"), (k "b", "2"), (k "c", "3") :: (ObjectKey, Text)]) (Map.fromList [(k "b", "2"), (k "c", "4"), (k "d", "5")])
             @?= Map.fromList [(k "a", Dropped "1"), (k "c", Changed "3" "4"), (k "d", Added "5")]
         , testCase "a dependent whose comment changes still depends" do
             let column = Column (qname "public" "t") (identifier "a")
-                view = View (qname "public" "v")
-                changes = Map.fromList [(ObjectKey Definition column, Changed "int" "bigint"), (ObjectKey Comment view, Changed "old" "new" :: Change Text)]
-            affected (Set.fromList [column, view]) [Edge view column] changes @?= Map.fromList [(column, Set.singleton view)]
+                v = View (qname "public" "v")
+                changes = Map.fromList [(ObjectKey Definition column, Changed "int" "bigint"), (ObjectKey Comment v, Changed "old" "new" :: Change Text)]
+            affected (Set.fromList [column, v]) [Edge v column] changes @?= Map.fromList [(column, Set.singleton v)]
         , testCase "the sameness test can hide a change"
-            $ diff (\_ _ _ -> True) (Map.fromList [(k "a", "1")]) (Map.fromList [(k "a", "2")])
+            $ diff (\_ _ _ -> True) (Map.fromList [(k "a", "1") :: (ObjectKey, Text)]) (Map.fromList [(k "a", "2")])
             @?= Map.empty
         , testProperty "invert is an involution" $ property do
             c <- forAll (Gen.choice [Added <$> txt, Dropped <$> txt, Changed <$> txt <*> txt])
@@ -391,3 +396,56 @@ formatting =
             $ tidyIndex "CREATE INDEX t_x ON public.t USING btree (x) WHERE (y <> ' WHERE ')"
             @?= "create index t_x on public.t (x) where (y <> ' WHERE ')"
         ]
+
+
+tableFlags :: TestTree
+tableFlags =
+    testGroup
+        "table options"
+        [ testCase "the file comparison by default, with its renames"
+            $ describeMode (tableOptions flags{renames = [rename]})
+            @?= Right "base file, 1 renames, ask if rename"
+        , testCase "--against-database with --allow-drops"
+            $ describeMode (tableOptions flags{againstDatabase = True, allowDrops = True})
+            @?= Right "live table"
+        , testCase "--rewrite-file with --live-from"
+            $ describeMode (tableOptions flags{rewriteFile = True, liveFrom = Just (connectionString "dbname=live")})
+            @?= Right "rewrite from dbname=live"
+        , testCase "refuses flags that do not apply together" do
+            let refused f = either (const True) (const False) (tableOptions f)
+            for_
+                [ flags{rewriteFile = True, renames = [rename]}
+                , flags{rewriteFile = True, againstDatabase = True}
+                , flags{rewriteFile = True, allowDrops = True}
+                , flags{rewriteFile = True, dropAndAdd = True}
+                , flags{againstDatabase = True, renames = [rename]}
+                , flags{liveFrom = Just (connectionString "dbname=live")}
+                , flags{allowDrops = True}
+                ]
+                \f -> refused f @?= True
+        ]
+  where
+    rename = (identifier "a", identifier "b")
+    flags =
+        TableFlags
+            { output = PrintMigration
+            , againstDatabase = False
+            , allowDrops = False
+            , base = "master"
+            , project = "."
+            , top = Nothing
+            , planPath = Nothing
+            , tableTag = Nothing
+            , renames = []
+            , dropAndAdd = False
+            , rewriteFile = False
+            , liveFrom = Nothing
+            }
+    describeMode :: Either Text TableOptions -> Either Text Text
+    describeMode = fmap \o -> case o.mode of
+        MigrateToFile m ->
+            let swap = if m.sameTypeSwap == AskIfRename then "ask if rename" else "drop and add"
+             in case m.comparison of
+                    WithBaseFile rs -> "base file, " <> tshow (length rs) <> " renames, " <> swap
+                    WithLiveTable _ -> "live table"
+        RewriteFile live -> "rewrite from " <> maybe "--db" redacted live
