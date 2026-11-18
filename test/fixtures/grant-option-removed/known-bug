@@ -1,0 +1,1 @@
+grants carry no grantor: analyst's SELECT was granted by reader, so it must be revoked 'granted by reader' before reader loses the grant option (privileges.sql, Definition Grant)

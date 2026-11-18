@@ -5,5 +5,8 @@ CREATE OR REPLACE FUNCTION public.secret()
 AS $function$ select 42 $function$;
 
 -- function public.secret
+revoke EXECUTE on function public.secret() from public;
+
+-- function public.secret
 grant EXECUTE on function public.secret() to sqiff;
 

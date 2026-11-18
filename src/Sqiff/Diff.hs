@@ -4,6 +4,9 @@
 
 module Sqiff.Diff (
     Change (..),
+    Changes,
+    invert,
+    after,
     diff,
     affected,
     BodyText (..),
@@ -21,19 +24,41 @@ import RIO.Map qualified as Map
 import RIO.NonEmpty qualified as L
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
+import Sqiff.Definition (Definition)
 import Sqiff.Identifier (QName (..), TypeName, nameText, typeText)
 import Sqiff.Model
 
 
-data Change
-    = Added Text
-    | Dropped Text
-    | Changed Text Text
-    deriving stock (Eq, Show)
+-- | How one aspect of one object differs between two schemas.
+data Change a
+    = Added a
+    | Dropped a
+    | Changed a a
+    deriving stock (Eq, Show, Functor, Foldable, Traversable)
+
+
+-- | What differs between two schemas.
+type Changes = Map ObjectKey (Change Definition)
+
+
+-- | The change that undoes this one.
+invert :: Change a -> Change a
+invert = \case
+    Added new -> Dropped new
+    Dropped old -> Added old
+    Changed old new -> Changed new old
+
+
+-- | The definition a change leaves, if it leaves one.
+after :: Change a -> Maybe a
+after = \case
+    Added new -> Just new
+    Changed _ new -> Just new
+    Dropped _ -> Nothing
 
 
 -- | What turns @from@ into @to@, with @same key old new@ deciding when two definitions match.
-diff :: (ObjectKey -> Text -> Text -> Bool) -> Schema -> Schema -> Map ObjectKey Change
+diff :: Eq a => (ObjectKey -> a -> a -> Bool) -> Map ObjectKey a -> Map ObjectKey a -> Map ObjectKey (Change a)
 diff same =
     Merge.merge
         (Merge.mapMissing \_ old -> Dropped old)
@@ -43,7 +68,7 @@ diff same =
 
 -- | For each dropped or changed definition, the objects in @known@ that depend on it,
 -- directly or through others, and are not in the diff themselves.
-affected :: Set ObjectId -> [Edge] -> Map ObjectKey Change -> Map ObjectId (Set ObjectId)
+affected :: Set ObjectId -> [Edge] -> Map ObjectKey (Change a) -> Map ObjectId (Set ObjectId)
 affected known edges changes =
     Map.filter (not . Set.null)
         $ Map.fromList

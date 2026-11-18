@@ -19,10 +19,11 @@ import RIO
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
-import Sqiff.Diff (Change (..), diff)
+import Sqiff.Definition
+import Sqiff.Diff (Change (..), Changes, diff)
 import Sqiff.Identifier
 import Sqiff.Model
-import Sqiff.Recipe (ColumnDef (..), columnSql, parseColumn)
+import Sqiff.Recipe (columnSql)
 import Sqiff.Script (splitStatements)
 import Sqiff.Sqitch (tidyConstraint, tidyIndex)
 
@@ -36,17 +37,20 @@ data Rewrite = Rewrite
 
 -- | What differs between the table the file creates and the one in the database, without
 -- grants, validity, and the triggers, policies and indexes that live in files of their own.
-fileDrift :: Set Identifier -> Schema -> Schema -> Map ObjectKey Change
+fileDrift :: Set Identifier -> Schema -> Schema -> Changes
 fileDrift ownFiles fromFile live = Map.filterWithKey kept (diff same fromFile live)
   where
-    same _ a b = a == b || plain a == plain b
-    plain = T.intercalate "\n" . map defaultNotNull . T.lines . T.replace " not valid" "" . T.replace " NOT VALID" ""
-    defaultNotNull l = case T.breakOn " constraint " l of
-        (front, name)
-            | "not null" `T.isPrefixOf` front
-            , "_not_null" `T.isSuffixOf` T.dropWhileEnd isDigit (T.drop (T.length " constraint ") name) ->
-                front
-        _ -> l
+    same k a b = a == b || normalise k a == normalise k b
+    -- A file cannot say whether a constraint is validated, nor name a not-null
+    -- constraint the way PostgreSQL names it after a rename.
+    normalise k = \case
+        ColumnDefinition c -> ColumnDefinition c{nullability = plainNotNull c.nullability}
+        Printed t | TableConstraint{} <- k.object -> Printed (fromMaybe t (T.stripSuffix " NOT VALID" t))
+        def -> def
+    plainNotNull = \case
+        NotNull _ name -> NotNull Validated (mfilter (not . defaultNotNullName) name)
+        Nullable -> Nullable
+    defaultNotNullName n = "_not_null" `T.isSuffixOf` T.dropWhileEnd isDigit (nameText n)
     kept k c = k.aspect /= Privileges && not (elsewhere k.object c)
     elsewhere o = \case
         Added _ -> case o of
@@ -64,8 +68,9 @@ rewriteFile :: QName -> Set Identifier -> [Identifier] -> Schema -> Schema -> Te
 rewriteFile table ownFiles order live fromFile original = do
     parts <- pieces original
     let changes = fileDrift ownFiles fromFile live
-        definitions = [(k.object, c) | (k, c) <- Map.toList changes, k.aspect == Definition]
-        comments = Map.fromList [(k.object, c) | (k, c) <- Map.toList changes, k.aspect == Comment]
+        typedDefinitions = [(k.object, c) | (k, c) <- Map.toList changes, k.aspect == Definition]
+        definitions = [(o, printed <$> c) | (o, c) <- typedDefinitions]
+        comments = Map.fromList [(k.object, printed <$> c) | (k, c) <- Map.toList changes, k.aspect == Comment]
         statements = [(n, s, classify table (snd (splitLead s))) | (n, Stmt s) <- zip [0 :: Int ..] parts]
         indentOf n = statementIndent parts n
         settings = case lookup (Table table) definitions of
@@ -74,7 +79,7 @@ rewriteFile table ownFiles order live fromFile original = do
         tableEdit = do
             (n, s, _) <- L.find (\(_, _, k) -> k == CreatesTable) statements
             let (lead, code) = splitLead s
-                columns = [(c, ch) | (Column t c, ch) <- definitions, t == table]
+                columns = [(c, ch') | (Column t c, ch) <- typedDefinitions, t == table, Just ch' <- [traverse asColumn ch]]
                 constraints = [(c, ch) | (TableConstraint t c, ch) <- definitions, t == table]
             (code', placed) <- editCreateTable table order columns constraints (settings >>= snd) code
             pure (n, lead <> code', placed)
@@ -159,7 +164,7 @@ tableSettings table file live = do
     pure (alters, options)
 
 
-describeChange :: ObjectKey -> Change -> Text
+describeChange :: ObjectKey -> Change a -> Text
 describeChange k c =
     let name = render k.object <> if k.aspect == Comment then " (comment)" else ""
         what = case c of
@@ -510,7 +515,7 @@ elementKind table body = case ws of
 -- | Applies the column and constraint differences to a @create table@ statement, with the
 -- objects it placed; the column list keeps the file's order and gets new columns after it.
 -- @options@ is a @with (...)@ clause to add.
-editCreateTable :: QName -> [Identifier] -> [(Identifier, Change)] -> [(Identifier, Change)] -> Maybe Text -> Text -> Maybe (Text, Set ObjectId)
+editCreateTable :: QName -> [Identifier] -> [(Identifier, Change ColumnDef)] -> [(Identifier, Change Text)] -> Maybe Text -> Text -> Maybe (Text, Set ObjectId)
 editCreateTable table order columns constraints options code = do
     tt <- tableText code
     let indent = maybe "        " (T.takeWhileEnd (== ' ') . (.lead)) (listToMaybe tt.elements)
@@ -560,10 +565,11 @@ editCreateTable table order columns constraints options code = do
     pure (if Set.null placed then code else renderTable tt{elements, closing = fromMaybe tt.closing closing}, placed)
 
 
-columnLine :: Identifier -> Text -> Text
+-- | A column's line in @create table@, its type without the @public.@ the catalog prints.
+columnLine :: Identifier -> ColumnDef -> Text
 columnLine c def =
-    let parsed = parseColumn def
-     in quoted c <> " " <> columnSql parsed{colType = fromMaybe parsed.colType (T.stripPrefix "public." parsed.colType)}
+    let unqualified = typeName (fromMaybe (typeText def.colType) (T.stripPrefix "public." (typeText def.colType)))
+     in quoted c <> " " <> columnSql def{colType = unqualified}
 
 
 -- | The inline constraints written after a column's type and options.

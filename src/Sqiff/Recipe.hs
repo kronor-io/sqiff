@@ -13,9 +13,7 @@ module Sqiff.Recipe (
     revokeGranted,
     Step (..),
     Context (..),
-    ColumnDef (..),
     columnSql,
-    parseColumn,
     recipe,
 ) where
 
@@ -28,6 +26,7 @@ import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import Sqiff.Body (BodyCheck (..))
+import Sqiff.Definition
 import Sqiff.Diff (Change (..))
 import Sqiff.Identifier
 import Sqiff.Model
@@ -97,7 +96,7 @@ data Step = Step
     , txn :: Txn
     , hazards :: [Hazard]
     , key :: ObjectKey
-    , change :: Change
+    , change :: Change Definition
     }
     deriving stock (Eq, Show)
 
@@ -113,7 +112,7 @@ data Context = Context
     -- ^ Body checks, with the definition each was made for.
     , withDependents :: Set ObjectId
     -- ^ Objects that something else depends on, in the database being changed.
-    , recreatedViews :: Map QName ([Text], Maybe (ObjectKey, Text))
+    , recreatedViews :: Map QName ([Text], Maybe (ObjectKey, Definition))
     -- ^ Materialized views dropped and created again, with the index definitions and
     -- privileges to restore on them.
     , viewsAround :: Map (QName, Identifier) ([Text], [Text])
@@ -123,7 +122,7 @@ data Context = Context
     }
 
 
-recipe :: Context -> ObjectKey -> Change -> [Step]
+recipe :: Context -> ObjectKey -> Change Definition -> [Step]
 recipe ctx key change = case key.aspect of
     Privileges -> privileges key object change
     Comment -> comment ctx key change
@@ -179,9 +178,9 @@ tableSettingsRank = 14
 privilegesRank = 15
 
 
-definition :: Context -> ObjectKey -> ObjectId -> Change -> [Step]
+definition :: Context -> ObjectKey -> ObjectId -> Change Definition -> [Step]
 definition ctx key object change = case object of
-    Schema s -> case change of
+    Schema s -> case textual of
         Added _ -> [create (Shared, []) ("create schema " <> quoted s)]
         Dropped _ -> [remove (Shared, []) ("drop schema " <> quoted s)]
         Changed _ _ -> []
@@ -210,11 +209,13 @@ definition ctx key object change = case object of
     OtherColumn{} -> noRecipe
     Unknown _ -> noRecipe
   where
+    -- The definitions as the catalog prints them, for the recipes that read the text.
+    textual = printed <$> change
     create (txn, hazards) sql = Step CreatePhase (createRank object) object sql txn hazards key change
     createAt rank (txn, hazards) sql = Step CreatePhase rank object sql txn hazards key change
     remove (txn, hazards) sql = Step DropPhase (dropRank object) object sql txn hazards key change
     manual why = [create (Shared, [Manual why]) ("-- " <> why)]
-    noRecipe = [create (Shared, [Manual "no recipe for this kind of object"]) ("-- " <> T.pack (show change))]
+    noRecipe = [create (Shared, [Manual "no recipe for this kind of object"]) ("-- " <> T.pack (show textual))]
     notValid = " NOT VALID" :: Text
     onEveryPartition s
         | any (`elem` [DeletesData, MayRewriteTable, LongLock]) s.hazards = s{hazards = s.hazards <> [EveryPartition]}
@@ -224,7 +225,7 @@ definition ctx key object change = case object of
         let names = Set.fromList (T.split (\ch -> not (isAlphaNum ch || ch == '_')) def)
          in any (\(t', c) -> onTable t' && nameText c `Set.member` names) (ctx.droppedColumns <> ctx.retypedColumns)
 
-    extension e = case change of
+    extension e = case textual of
         Added def ->
             let (version, schema) = extensionParts def
              in [create (Shared, []) ("create extension if not exists " <> quoted e <> " with schema " <> schema <> " version " <> literal version)]
@@ -233,7 +234,7 @@ definition ctx key object change = case object of
             | snd (extensionParts old) /= snd (extensionParts new) -> manual "extension moved to another schema"
             | otherwise -> [create (Own, []) ("alter extension " <> quoted e <> " update to " <> literal (fst (extensionParts new)))]
 
-    table t = case change of
+    table t = case textual of
         Added def -> createTable t (T.lines def)
         Dropped _ -> [remove (Shared, [DeletesData]) ("drop table " <> qualified t)]
         Changed old new -> alterTable t (T.lines old) (T.lines new)
@@ -288,62 +289,61 @@ definition ctx key object change = case object of
                    | not (null removedKeys)
                    ]
 
-    column t c = case change of
-        Added def
+    column t c = case traverse asColumn change of
+        Nothing -> manual "the catalog described the column without its column facts"
+        Just (Added parsed)
             | t `Set.member` ctx.newTables -> []
             | otherwise ->
-                let parsed = parseColumn def
-                    failsOnRows = parsed.notNull && isNothing parsed.defaultExpr && isNothing parsed.identity && isNothing parsed.generated
-                    rewrites = parsed.rewritesOnAdd || isJust parsed.identity || fmap fst parsed.generated == Just "stored"
+                let rewrites = parsed.rewritesOnAdd || isJust (identityKindOf parsed) || fmap fst (generatedOf parsed) == Just Stored
                     hazards =
-                        [MayFail "a not null column without a default fails on a table with rows" | failsOnRows]
+                        [MayFail "a not null column without a default fails on a table with rows" | failsOnRows parsed]
                             <> [h | rewrites, h <- [MayRewriteTable, LongLock]]
                  in [create (Shared, hazards) (alter <> "add column " <> quoted c <> " " <> columnSql parsed)]
-        Dropped _ -> [remove (Shared, [DeletesData]) (alter <> "drop column " <> quoted c)]
-        Changed old new -> alterColumn (parseColumn old) (parseColumn new)
+        Just (Dropped _) -> [remove (Shared, [DeletesData]) (alter <> "drop column " <> quoted c)]
+        Just (Changed old new) -> alterColumn old new
       where
         alter = [i|alter table #{qualified t} |]
         col = [i|#{alter}alter column #{quoted c} |]
         alterColumn old new =
             let typeChanged = old.colType /= new.colType || old.collation /= new.collation
-                defaultChanged = old.defaultExpr /= new.defaultExpr
-                serialToIdentity = isNothing old.identity && isJust new.identity && isJust (serialSequence old) && isNothing new.defaultExpr
-                identityToSerial = isJust old.identity && isNothing new.identity && isJust (serialSequence new) && isNothing old.defaultExpr
+                defaultChanged = defaultExpr old /= defaultExpr new
+                serialToIdentity = isNothing (identityKindOf old) && isJust (identityKindOf new) && isJust (serialSequence old)
+                identityToSerial = isJust (identityKindOf old) && isNothing (identityKindOf new) && isJust (serialSequence new)
                 sequenceMoves = serialToIdentity || identityToSerial
-             in [create (Shared, []) (col <> "drop default") | typeChanged, isJust old.defaultExpr]
+             in [create (Shared, []) (col <> "drop default") | typeChanged, isJust (defaultExpr old)]
                     <> [ create
                             ( Shared
                             , [MayRewriteTable, LongLock, MayFail "fails when an existing value does not convert to the new type"]
                                 <> [MayFail "recreating a view fails when its query relies on the old type; then edit the view" | Map.member (t, c) ctx.viewsAround]
                             )
-                            (aroundViews (col <> "type " <> new.colType <> maybe "" (" collate " <>) new.collation <> " using " <> quoted c <> "::" <> new.colType))
+                            (aroundViews (col <> "type " <> typeText new.colType <> maybe "" ((" collate " <>) . quoted) new.collation <> " using " <> quoted c <> "::" <> typeText new.colType))
                        | typeChanged
                        ]
-                    <> case new.defaultExpr of
+                    <> case defaultExpr new of
                         _ | sequenceMoves -> []
-                        Just e | defaultChanged || (typeChanged && isJust old.defaultExpr) -> [create (Shared, []) (col <> "set default " <> e)]
+                        Just e | defaultChanged || (typeChanged && isJust (defaultExpr old)) -> [create (Shared, []) (col <> "set default " <> e)]
                         Nothing | defaultChanged && not typeChanged -> [create (Shared, []) (col <> "drop default")]
                         _ -> []
                     <> notNullSteps old new
-                    <> case (old.identity, new.identity) of
-                        _ | serialToIdentity, Just k <- new.identity -> [create (Shared, []) (toIdentity (k <> " as identity" <> identityOptionsSql new.identityOptions))]
-                        _ | identityToSerial -> [create (Shared, []) (toSerial new.colType)]
-                        (Nothing, Just k) -> [create (Shared, []) (col <> "add generated " <> k <> " as identity" <> identityOptionsSql new.identityOptions)]
+                    <> case (identityKindOf old, identityKindOf new) of
+                        _ | serialToIdentity, Just k <- identityKindOf new -> [create (Shared, []) (toIdentity (identityKindSql k <> " as identity" <> identityOptionsSql (identityOptionsOf new)))]
+                        _ | identityToSerial -> [create (Shared, []) (toSerial (typeText new.colType))]
+                        (Nothing, Just k) -> [create (Shared, []) (col <> "add generated " <> identityKindSql k <> " as identity" <> identityOptionsSql (identityOptionsOf new))]
                         (Just _, Nothing) -> [create (Shared, []) (col <> "drop identity")]
                         (Just a, Just b) ->
-                            let clauses = ["set generated " <> b | a /= b] <> identityOptionChanges old.identityOptions new.identityOptions
+                            let clauses = ["set generated " <> identityKindSql b | a /= b] <> identityOptionChanges (identityOptionsOf old) (identityOptionsOf new)
                              in [create (Shared, []) (col <> T.unwords clauses) | not (null clauses)]
                         _ -> []
-                    <> case (old.generated, new.generated) of
+                    <> case (generatedOf old, generatedOf new) of
                         (Just (k, _), Just (k', e))
-                            | k == k' && old.generated /= new.generated ->
-                                [create (Shared, [h | k == "stored", h <- [MayRewriteTable, LongLock]]) [i|#{col}set expression as (#{e})|]]
+                            | k == k' && generatedOf old /= generatedOf new ->
+                                [create (Shared, [h | k == Stored, h <- [MayRewriteTable, LongLock]]) [i|#{col}set expression as (#{e})|]]
                         (a, b) | a /= b -> manual "generated column added or removed"
                         _ -> []
         aroundViews statement = case Map.lookup (t, c) ctx.viewsAround of
             Just (drops, creates) | not (null drops) -> T.intercalate ";\n" (drops <> [statement] <> creates)
             _ -> statement
-        serialSequence d = d.defaultExpr >>= T.stripPrefix "nextval('" >>= T.stripSuffix "'::regclass)"
+        serialSequence d = defaultExpr d >>= T.stripPrefix "nextval('" >>= T.stripSuffix "'::regclass)"
         tableLit = literal (qualified t)
         columnLit = literal (nameText c)
         serialName = let tableName = nameText t.name in qualified (QName t.schema (identifier [i|#{tableName}_#{nameText c}_seq|]))
@@ -375,30 +375,30 @@ end $$|]
         grantAcl :: Text -> Text
         grantAcl target =
             [i|execute coalesce((select string_agg(format('grant %s on sequence %s to %s', x.privilege_type, #{target}, case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end), '; ') from aclexplode(acl) x where x.grantee <> x.grantor), 'select');|]
-        notNullSteps old new = case (old.notNull, new.notNull) of
+        notNullSteps old new = case (isNotNull old, isNotNull new) of
             (False, True) ->
                 create (Shared, []) [i|#{alter}add #{named new}not null #{quoted c} not valid|]
-                    : [create (Own, []) (onNotNull new.notNullName "validate constraint" "") | new.notNullValid]
+                    : [create (Own, []) (onNotNull (notNullName new) "validate constraint" "") | notNullValid new]
             (True, False) -> [create (Shared, []) (col <> "drop not null")]
             (True, True) ->
-                [ create (Shared, []) (onNotNull old.notNullName "rename constraint" (" to " <> quoteIdent n))
-                | old.notNullName /= new.notNullName
-                , let n = fromMaybe (T.concat [nameText t.name, "_", nameText c, "_not_null"]) new.notNullName
+                [ create (Shared, []) (onNotNull (notNullName old) "rename constraint" (" to " <> quoted n))
+                | notNullName old /= notNullName new
+                , let n = fromMaybe (identifier (T.concat [nameText t.name, "_", nameText c, "_not_null"])) (notNullName new)
                 ]
-                    <> case (old.notNullValid, new.notNullValid) of
-                        (False, True) -> [create (Own, []) (onNotNull new.notNullName "validate constraint" "")]
+                    <> case (notNullValid old, notNullValid new) of
+                        (False, True) -> [create (Own, []) (onNotNull (notNullName new) "validate constraint" "")]
                         (True, False) -> manual "a validated not null constraint cannot be made NOT VALID again"
                         _ -> []
             (False, False) -> []
-        named d = maybe "" (\n -> [i|constraint #{quoteIdent n} |] :: Text) d.notNullName
+        named d = maybe "" (\n -> "constraint " <> quoted n <> " ") (notNullName d)
         onNotNull name action rest = case name of
-            Just n -> alter <> action <> " " <> quoteIdent n <> rest
+            Just n -> alter <> action <> " " <> quoted n <> rest
             Nothing ->
                 let command = literal [i|#{T.replace "%" "%%" (alter <> action)} %I#{T.replace "%" "%%" rest}|]
                     tableLiteral = literal (qualified t)
                  in [i|do $$ begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal (nameText c)})])); end $$|]
 
-    tableConstraint t c = case change of
+    tableConstraint t c = case textual of
         Added def -> addConstraint def
         Dropped old -> [dropConstraint old]
         Changed old new
@@ -437,7 +437,7 @@ end $$|]
                 , not (T.any (`elem` ("()" :: String)) cols)
                 ]
 
-    domainConstraint d c = case change of
+    domainConstraint d c = case textual of
         Added def -> add def
         Dropped _ -> [remove (Shared, []) (alterD <> "drop constraint " <> quoted c)]
         Changed old new
@@ -451,7 +451,7 @@ end $$|]
             | notValid `T.isSuffixOf` def = [create (Shared, []) [i|#{alterD}add constraint #{quoted c} #{def}|]]
             | otherwise = [create (Shared, []) [i|#{alterD}add constraint #{quoted c} #{def}#{notValid}|], validate]
 
-    indexRecipe ix = case change of
+    indexRecipe ix = case textual of
         Added def -> addIndex def
         Dropped def
             | indexTable def `elem` map (Just . qualified) (Set.toList ctx.droppedTables) -> []
@@ -485,7 +485,7 @@ end $$|]
             let afterOn = T.drop 4 (snd (T.breakOn " ON " def))
              in Just (fst (T.breakOn " USING " (fromMaybe afterOn (T.stripPrefix "ONLY " afterOn))))
 
-    sequenceRecipe s = case change of
+    sequenceRecipe s = case textual of
         Added def ->
             let (base, owner) = sequenceParts def
              in create (Shared, []) ("create sequence " <> qualified s <> " " <> base)
@@ -503,7 +503,7 @@ end $$|]
 
     type' typ =
         let t = typeText typ
-         in case change of
+         in case textual of
                 Added def
                     | Just rest <- T.stripPrefix "domain " def -> [create (Shared, []) ("create domain " <> t <> " as " <> rest)]
                     | Just rest <- T.stripPrefix "composite " def -> [create (Shared, []) ("create type " <> t <> " as " <> rest)]
@@ -526,7 +526,7 @@ end $$|]
       where
         drop' position labels = if position == 0 then Nothing else L.headMaybe (L.drop (position - 1) labels)
 
-    routine kind q args = case change of
+    routine kind q args = case textual of
         Added def -> replaceRoutine def []
         Changed old new
             | take 2 (T.lines old) == take 2 (T.lines new) -> replaceRoutine new []
@@ -550,7 +550,7 @@ end $$|]
                         [create (Shared, hazards <> [MayFail "a SQL-standard body that was not checked against the desired database"]) (T.stripEnd def)]
                     | otherwise -> [create (Shared, hazards) (T.stripEnd def)]
 
-    viewRecipe v = case change of
+    viewRecipe v = case textual of
         Added def -> [create (Shared, []) ("create view " <> viewHead v def <> viewBody def)]
         Changed _ new ->
             [ create
@@ -559,7 +559,7 @@ end $$|]
             ]
         Dropped _ -> [remove (Shared, []) ("drop view " <> qualified v)]
 
-    materializedView v = case change of
+    materializedView v = case textual of
         Added def -> [create (Shared, []) ("create materialized view " <> viewHead v def <> viewBody def)]
         Changed _ new ->
             [ remove (Shared, [MayFail "fails when other objects depend on it"]) ("drop materialized view " <> qualified v)
@@ -575,7 +575,7 @@ end $$|]
                 <> [createAt privilegesRank (Shared, []) (revokeGranted (qualified v)) | isJust grants]
                 <> maybe [] (\(k, def) -> privileges k k.object (Added def)) grants
 
-    trigger t n = case change of
+    trigger t n = case textual of
         Added def -> [create (Shared, []) def]
         Changed old new
             | namesAlteredColumn t old -> [dropTrigger DropPhase, create (Shared, []) new]
@@ -586,7 +586,7 @@ end $$|]
         dropTrigger phase =
             Step phase (if phase == DropPhase then dropRank object else createRank object) object ("drop trigger " <> quoted n <> " on " <> qualified t) Shared [] key change
 
-    policy t n = case change of
+    policy t n = case textual of
         Added def -> [createPolicy def]
         Changed old new
             | namesAlteredColumn t old -> [remove (Shared, []) dropPolicy, createPolicy new]
@@ -597,14 +597,13 @@ end $$|]
         createPolicy def = create (Shared, []) ("create policy " <> quoted n <> " on " <> qualified t <> "\n" <> def)
 
 
-privileges :: ObjectKey -> ObjectId -> Change -> [Step]
-privileges key object change = case (target, change) of
+privileges :: ObjectKey -> ObjectId -> Change Definition -> [Step]
+privileges key object change = case (target, traverse asAcl change) of
     (Nothing, _) -> []
-    (_, Dropped _) -> []
-    (Just onObject, Added new) -> grants onObject Set.empty (aclLines new)
-    (Just onObject, Changed old new)
-        | new == "default" -> [step [Manual "privileges reset to the defaults"] ("-- reset privileges on " <> onObject)]
-        | otherwise -> grants onObject (aclLines old) (aclLines new)
+    (Just onObject, Nothing) -> [step [Manual "the catalog described the privileges without their grants"] ("-- privileges on " <> onObject)]
+    (_, Just (Dropped _)) -> []
+    (Just onObject, Just (Added new)) -> reconcile onObject DefaultAcl new
+    (Just onObject, Just (Changed old new)) -> reconcile onObject old new
   where
     step hazards sql = Step CreatePhase privilegesRank object sql Shared hazards key change
     target = case object of
@@ -616,21 +615,40 @@ privileges key object change = case (target, change) of
         Routine Procedure q args -> Just [i|procedure #{qualified q}(#{argList args})|]
         Schema s -> Just ("schema " <> quoted s)
         _ -> Nothing
-    aclLines def = if def == "default" then Set.empty else Set.fromList (T.lines def)
-    grants onObject old new =
-        [step [] ("revoke " <> privilege <> " on " <> onObject <> " from " <> grantee) | line <- Set.toList (old Set.\\ new), let (grantee, privilege, _) = aclParts line]
-            <> [ step [] ("grant " <> privilege <> " on " <> onObject <> " to " <> grantee <> (if grantable then " with grant option" else ""))
-               | line <- Set.toList (new Set.\\ old)
-               , let (grantee, privilege, grantable) = aclParts line
-               ]
-    aclParts line =
-        let (role, rest) = T.breakOn " " line
-            (privilege, option) = T.breakOn " with grant option" (T.drop 1 rest)
-         in (if role == "public" then role else quoteIdent role, privilege, not (T.null option))
+    reconcile onObject old new = case (old, new) of
+        (DefaultAcl, DefaultAcl) -> []
+        (ExplicitAcl _, DefaultAcl) -> [step [Manual "privileges reset to the defaults"] ("-- reset privileges on " <> onObject)]
+        _ -> grantChanges onObject (grantsOf old) (grantsOf new)
+    -- What an object has when its ACL is the default, leaving out its owner's own
+    -- privileges: PostgreSQL lets anyone execute a new function or procedure.
+    grantsOf = \case
+        ExplicitAcl grants -> grants
+        DefaultAcl
+            | isRoutine object -> Set.singleton (Grant Public "EXECUTE" False)
+            | otherwise -> Set.empty
+    grantChanges onObject old new =
+        let byKey gs = Map.fromList [((g.grantee, g.privilege), g.grantable) | g <- Set.toList gs]
+            before = byKey old
+            now = byKey new
+            onTarget privilege = privilege <> " on " <> onObject
+            -- Granted anew, or given the grant option it lacked.
+            needsGrant grantable = \case
+                Nothing -> True
+                Just had -> grantable && not had
+         in [ step [] ("revoke " <> onTarget privilege <> " from " <> granteeSql grantee)
+            | ((grantee, privilege), _) <- Map.toList (before `Map.difference` now)
+            ]
+                <> [ step [] ("revoke grant option for " <> onTarget privilege <> " from " <> granteeSql grantee)
+                   | ((grantee, privilege), (True, False)) <- Map.toList (Map.intersectionWith (,) before now)
+                   ]
+                <> [ step [] ("grant " <> onTarget privilege <> " to " <> granteeSql grantee <> (if grantable then " with grant option" else ""))
+                   | ((grantee, privilege), grantable) <- Map.toList now
+                   , needsGrant grantable (Map.lookup (grantee, privilege) before)
+                   ]
 
 
-comment :: Context -> ObjectKey -> Change -> [Step]
-comment ctx key change = case (target, change) of
+comment :: Context -> ObjectKey -> Change Definition -> [Step]
+comment ctx key change = case (target, printed <$> change) of
     (Nothing, _) -> []
     (Just _, Dropped _) | key.object `Set.member` ctx.droppedObjects -> []
     (Just subject, Dropped _) -> [step (subject <> " is null")]
@@ -669,49 +687,16 @@ commentRank :: Int
 commentRank = 16
 
 
-data ColumnDef = ColumnDef
-    { colType :: Text
-    , collation :: Maybe Text
-    , notNull :: Bool
-    , notNullValid :: Bool
-    , notNullName :: Maybe Text
-    , identity :: Maybe Text
-    , identityOptions :: [Text]
-    , generated :: Maybe (Text, Text)
-    , defaultExpr :: Maybe Text
-    , rewritesOnAdd :: Bool
-    }
-    deriving stock (Eq, Show)
-
-
-parseColumn :: Text -> ColumnDef
-parseColumn = foldl' add (ColumnDef "" Nothing False False Nothing Nothing [] Nothing Nothing False) . T.lines
-  where
-    add c line
-        | Just t <- T.stripPrefix "type " line = c{colType = t}
-        | Just x <- T.stripPrefix "collate " line = c{collation = Just x}
-        | Just x <- T.stripPrefix "not null" line =
-            let (valid, named) = maybe (True, x) (False,) (T.stripPrefix " not valid" x)
-             in c{notNull = True, notNullValid = valid, notNullName = T.stripPrefix " constraint " named}
-        | line == "rewrites the table when added" = c{rewritesOnAdd = True}
-        | Just x <- T.stripPrefix "identity options " line = c{identityOptions = T.splitOn ", " x}
-        | Just x <- T.stripPrefix "identity " line = c{identity = Just x}
-        | Just x <- T.stripPrefix "generated " line = let (kind, expr) = T.breakOn " " x in c{generated = Just (kind, T.drop 1 expr)}
-        | Just x <- T.stripPrefix "default " line = c{defaultExpr = Just x}
-        | otherwise = c
-
-
+-- | The column's declaration after its name, as @add column@ and @create table@ take it.
 columnSql :: ColumnDef -> Text
 columnSql c =
     T.unwords
-        $ catMaybes
-            [ Just c.colType
-            , ("collate " <>) <$> c.collation
-            , (\(kind, e) -> "generated always as (" <> e <> ") " <> kind) <$> c.generated
-            , (\kind -> [i|generated #{kind} as identity|] <> identityOptionsSql c.identityOptions) <$> c.identity
-            , if c.notNull then Just (maybe "" (\n -> [i|constraint #{quoteIdent n} |]) c.notNullName <> "not null") else Nothing
-            , ("default " <>) <$> c.defaultExpr
-            ]
+        $ [typeText c.colType]
+        <> ["collate " <> quoted co | Just co <- [c.collation]]
+        <> ["generated always as (" <> e <> ") " <> storageSql storage | Just (storage, e) <- [generatedOf c]]
+        <> ["generated " <> identityKindSql kind <> " as identity" <> identityOptionsSql options | IdentityColumn kind options <- [c.value]]
+        <> [maybe "" (\n -> "constraint " <> quoted n <> " ") (notNullName c) <> "not null" | isNotNull c]
+        <> ["default " <> e | Just e <- [defaultExpr c]]
 
 
 identityOptionsSql :: [Text] -> Text

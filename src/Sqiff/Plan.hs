@@ -13,19 +13,20 @@ import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import Sqiff.Body (BodyCheck)
-import Sqiff.Diff (Change (..))
+import Sqiff.Definition
+import Sqiff.Diff (Change (..), Changes, invert)
 import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Recipe
 
 
 -- | @fromEdges@ come from the database being changed; @toEdges@ and @checks@ from the desired one.
-plan :: Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> [Edge] -> Map ObjectKey Change -> [Step]
+plan :: Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> [Edge] -> Changes -> [Step]
 plan = planWith id
 
 
 -- | 'plan' with the context adjusted first.
-planWith :: (Context -> Context) -> Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> [Edge] -> Map ObjectKey Change -> [Step]
+planWith :: (Context -> Context) -> Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> [Edge] -> Changes -> [Step]
 planWith adjust checks fromSchema toSchema fromEdges toEdges changes =
     map snd
         $ L.sortOn
@@ -49,10 +50,10 @@ planWith adjust checks fromSchema toSchema fromEdges toEdges changes =
 
 -- | @checks@ were made against @toSchema@'s definitions; @fromEdges@ come from the
 -- database being changed.
-context :: Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> Map ObjectKey Change -> Context
+context :: Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> Changes -> Context
 context checks fromSchema toSchema fromEdges changes =
     Context
-        { bodyChecks = Map.intersectionWith (,) toSchema checks
+        { bodyChecks = Map.intersectionWith (,) (Map.map printed toSchema) checks
         , withDependents = Set.fromList [e.referenced | e <- fromEdges]
         , recreatedViews =
             Map.fromList
@@ -69,16 +70,14 @@ context checks fromSchema toSchema fromEdges changes =
                 [ t
                 | (k, def) <- Map.toList fromSchema <> Map.toList toSchema
                 , k.aspect == Definition
-                , any ("partition by " `T.isPrefixOf`) (T.lines def)
+                , any ("partition by " `T.isPrefixOf`) (T.lines (printed def))
                 , Table t <- [k.object]
                 ]
         , droppedColumns = Set.fromList [(t, c) | (Column t c, Dropped _) <- definitions]
         , retypedColumns =
             Set.fromList
                 [ (t, c)
-                | (Column t c, Changed old new) <- definitions
-                , let o = parseColumn old
-                      n = parseColumn new
+                | (Column t c, Changed (ColumnDefinition o) (ColumnDefinition n)) <- definitions
                 , o.colType /= n.colType || o.collation /= n.collation
                 ]
         , viewsAround = Map.empty
@@ -86,29 +85,21 @@ context checks fromSchema toSchema fromEdges changes =
         , newTableColumns =
             Map.fromListWith
                 (flip (<>))
-                [(t, [(c, parseColumn def)]) | (Column t c, Added def) <- definitions, t `Set.member` tablesWith isAdded]
+                [(t, [(c, def)]) | (Column t c, Added (ColumnDefinition def)) <- definitions, t `Set.member` tablesWith isAdded]
         }
   where
     definitions = [(k.object, change) | (k, change) <- Map.toList changes, k.aspect == Definition]
     indexesOn v =
-        [ def
+        [ printed def
         | (k, def) <- Map.toList toSchema
         , k.aspect == Definition
         , k `Map.notMember` changes
-        , [i| ON #{qualified v} |] `T.isInfixOf` def
+        , [i| ON #{qualified v} |] `T.isInfixOf` printed def
         , Index _ <- [k.object]
         ]
     tablesWith p = Set.fromList [t | (Table t, change) <- definitions, p change]
     isAdded = \case Added _ -> True; _ -> False
     isDropped = \case Dropped _ -> True; _ -> False
-
-
--- | The change that undoes this one.
-invert :: Change -> Change
-invert = \case
-    Added new -> Dropped new
-    Dropped old -> Added old
-    Changed old new -> Changed new old
 
 
 -- | Kahn's algorithm over @(x, y)@ pairs meaning x comes after y. Ties go to the smaller

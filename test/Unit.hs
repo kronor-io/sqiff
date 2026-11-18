@@ -7,6 +7,8 @@
 -- (docs/codex-review.md); they are expected to fail until the bug is fixed.
 module Unit (tests) where
 
+import Data.Aeson (FromJSON)
+import Data.Aeson qualified as Aeson
 import Hedgehog (Gen, forAll, property, (===))
 import Hedgehog.Gen qualified as Gen
 import Hedgehog.Range qualified as Range
@@ -16,16 +18,17 @@ import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import Sqiff.Config (fill, match)
 import Sqiff.ConnectionString (connectionString, fromPairs, libpqText, redacted)
+import Sqiff.Definition
 import Sqiff.Diff (Change (..), diff)
-import Sqiff.Identifier (identifier, qname, quoteIdent)
+import Sqiff.Identifier (identifier, qname, quoteIdent, typeName)
 import Sqiff.Model (Address (..), Aspect (..), ObjectId (..), ObjectKey (..), fromAddress, toAddress)
 import Sqiff.Plan (invert, topoOrder)
-import Sqiff.Recipe (ColumnDef (..), parseColumn)
+import Sqiff.Rewrite (fileDrift)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
 import Sqiff.Sqitch (SqitchPlan (..), parsePlan, tidyIndex)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.ExpectedFailure (expectFailBecause)
-import Test.Tasty.HUnit (testCase, (@?=))
+import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
 import Test.Tasty.Hedgehog (testProperty)
 
 
@@ -291,24 +294,43 @@ diffing =
 columns :: TestTree
 columns =
     testGroup
-        "parseColumn"
-        [ testCase "reads every field" do
-            let c = parseColumn (T.unlines ["type integer", "collate \"C\"", "not null constraint t_x_not_null", "default 42"])
-            c.colType @?= "integer"
-            c.collation @?= Just "\"C\""
-            c.notNull @?= True
-            c.notNullValid @?= True
-            c.notNullName @?= Just "t_x_not_null"
-            c.defaultExpr @?= Just "42"
-        , testCase "reads NOT VALID"
-            $ (parseColumn "type text\nnot null not valid").notNullValid
-            @?= False
-        , expectFailBecause "the description is newline-delimited, so a default with a newline is cut and its rest read as fields"
-            $ testCase "known bug: a multi-line default survives" do
-                let c = parseColumn (T.unlines ["type text", "default 'a\ntype b'::text"])
-                c.colType @?= "text"
-                c.defaultExpr @?= Just "'a\ntype b'::text"
+        "definitions"
+        [ testCase "a column decodes and prints as before" do
+            c <- decode @ColumnDef "{\"type\": \"integer\", \"collation\": \"C\", \"not_null\": {\"validated\": true, \"name\": \"x_nn\"}, \"expression\": \"42\"}"
+            printed (ColumnDefinition c) @?= T.intercalate "\n" ["type integer", "collate \"C\"", "not null constraint x_nn", "default 42"]
+        , testCase "NOT VALID, identity and its options" do
+            c <- decode @ColumnDef "{\"type\": \"bigint\", \"not_null\": {\"validated\": false}, \"identity\": \"by default\", \"identity_options\": [\"increment by 5\"]}"
+            c.nullability @?= NotNull NotValidated Nothing
+            c.value @?= IdentityColumn ByDefault ["increment by 5"]
+            printed (ColumnDefinition c) @?= "type bigint\nnot null not valid\nidentity by default\nidentity options increment by 5"
+        , testCase "a generated column" do
+            c <- decode @ColumnDef "{\"type\": \"int\", \"generated\": \"stored\", \"expression\": \"(a + 1)\"}"
+            c.value @?= GeneratedColumn Stored "(a + 1)"
+        , testCase "a multi-line default stays whole" do
+            c <- decode @ColumnDef "{\"type\": \"text\", \"expression\": \"'a\\ntype b'::text\"}"
+            c.colType @?= typeName "text"
+            c.value @?= PlainColumn (Just "'a\ntype b'::text")
+        , testCase "identity and generated together are refused"
+            $ isLeft (Aeson.eitherDecodeStrict @ColumnDef "{\"type\": \"int\", \"identity\": \"always\", \"generated\": \"stored\", \"expression\": \"1\"}")
+            @?= True
+        , testCase "a role name with a space stays whole" do
+            acl <- decode @Acl "[{\"grantee\": \"report readers\", \"privilege\": \"SELECT\", \"grantable\": false}, {\"grantee\": null, \"privilege\": \"USAGE\", \"grantable\": true}]"
+            acl @?= ExplicitAcl (Set.fromList [Grant (Role (identifier "report readers")) "SELECT" False, Grant Public "USAGE" True])
+            printed (AclDefinition acl) @?= "public USAGE with grant option\nreport readers SELECT"
+        , testCase "drift ignores validity but not the words \"not valid\" in a comment" do
+            let key o = ObjectKey Comment o
+                table = Table (qname "public" "t")
+                column validity = ColumnDefinition (ColumnDef (typeName "int") Nothing (NotNull validity Nothing) (PlainColumn Nothing) False)
+                columnKey = ObjectKey Definition (Column (qname "public" "t") (identifier "c"))
+            Map.keys (fileDrift Set.empty (Map.fromList [(key table, Printed "is not valid")]) (Map.fromList [(key table, Printed "is")])) @?= [key table]
+            fileDrift Set.empty (Map.fromList [(columnKey, column NotValidated)]) (Map.fromList [(columnKey, column Validated)]) @?= Map.empty
+        , testCase "no ACL is the default, an empty one is not" do
+            decode "null" >>= (@?= DefaultAcl)
+            decode "[]" >>= (@?= ExplicitAcl Set.empty)
         ]
+  where
+    decode :: FromJSON a => ByteString -> IO a
+    decode = either (assertFailure . ("does not decode: " <>)) pure . Aeson.eitherDecodeStrict
 
 
 formatting :: TestTree

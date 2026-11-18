@@ -1,0 +1,5 @@
+changed table public.t (privileges)
+  - analyst SELECT
+  - reader SELECT with grant option
+  + reader SELECT
+0 added, 0 dropped, 1 changed

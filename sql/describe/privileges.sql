@@ -23,18 +23,21 @@ select
     acl.objid,
     0 as objsubid,
     case when acl.classid = 'pg_class'::regclass then acl.objid end as relid,
-    coalesce(
-        (
-            select string_agg(g.line, E'\n' order by g.line)
-            from (
-                select
-                    case when x.grantee = 0 then 'public' else pg_get_userbyid(x.grantee) end
-                    || ' '
-                    || x.privilege_type
-                    || case when x.is_grantable then ' with grant option' else '' end as line
+    -- JSON null for the defaults, else every grant, the owner's included.
+    case
+        when acl.acl is null then 'null'
+        else coalesce(
+            (
+                select jsonb_agg(
+                    jsonb_build_object(
+                        'grantee', case when x.grantee = 0 then null else pg_get_userbyid(x.grantee) end,
+                        'privilege', x.privilege_type,
+                        'grantable', x.is_grantable
+                    )
+                )
                 from aclexplode(acl.acl) x
-            ) g
-        ),
-        'default'
-    ) as definition
+            ),
+            '[]'::jsonb
+        )::text
+    end as definition
 from acl

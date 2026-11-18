@@ -39,6 +39,7 @@ module Sqiff.Model (
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
+import Sqiff.Definition (Definition)
 import Sqiff.Identifier
 
 
@@ -231,8 +232,8 @@ definitionKey :: ObjectId -> ObjectKey
 definitionKey = ObjectKey Definition
 
 
--- | Each object's aspects, as the catalog prints them.
-type Schema = Map ObjectKey Text
+-- | Each object's aspects, as the catalog describes them.
+type Schema = Map ObjectKey Definition
 
 
 -- | @dependent@ needs @referenced@ to exist, as recorded in @pg_depend@ or seen in a

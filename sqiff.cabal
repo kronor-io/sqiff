@@ -28,6 +28,7 @@ library
     Sqiff.Catalog
     Sqiff.Config
     Sqiff.ConnectionString
+    Sqiff.Definition
     Sqiff.Diff
     Sqiff.Folder
     Sqiff.Git
@@ -93,6 +94,7 @@ test-suite sqiff-test
   ghc-options:        -threaded -rtsopts -with-rtsopts=-N4
   build-tool-depends: sqiff:sqiff
   build-depends:
+    , aeson
     , base
     , bytestring
     , containers

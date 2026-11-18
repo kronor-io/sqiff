@@ -33,7 +33,8 @@ import Hasql.TH (singletonStatement, vectorStatement)
 import RIO
 import RIO.Map qualified as Map
 import Sqiff.Catalog (Partitions (..), describeOn, errorText, failWith, serverError)
-import Sqiff.Diff (Change (..), diff)
+import Sqiff.Definition (Definition (..), mapText, printed)
+import Sqiff.Diff (Change (..), Changes, diff)
 import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Timing (timed)
@@ -156,7 +157,7 @@ firstFailure conn statements = do
 data TableEdit = TableEdit
     { current :: Schema
     , desired :: Schema
-    , changes :: Map ObjectKey Change
+    , changes :: Changes
     , ignored :: [(ObjectKey, Text)]
     -- ^ Differences left out, with the reason.
     }
@@ -310,20 +311,21 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
 
     moveBack k = k{object = mapQNames (\q -> if q.schema == aside then q{schema = table.schema} else q) k.object}
 
-    restore = T.replace asideRef tableSchemaRef
+    restore = mapText (T.replace asideRef tableSchemaRef)
 
     belongsTo q k def = case k.object of
         Table t -> t == q
-        Index _ -> any (`T.isInfixOf` def) [[i| ON #{qualified q} |], [i| ON ONLY #{qualified q} |]]
+        Index _ -> any (`T.isInfixOf` printed def) [[i| ON #{qualified q} |], [i| ON ONLY #{qualified q} |]]
         Sequence _ -> False
         o -> owningTable o == Just q
 
     keepSettings current k def = case (k.object, k.aspect, Map.lookup k current) of
         (Table _, Definition, Just old) ->
-            let settings = filter (\l -> l `elem` ["row level security", "force row level security"] || "with (" `T.isPrefixOf` l) (T.lines old)
-                missing = filter (`notElem` T.lines def) settings
-                hasOptions = any ("with (" `T.isPrefixOf`) (T.lines def)
-             in T.intercalate "\n" (T.lines def <> filter (\l -> not ("with (" `T.isPrefixOf` l && hasOptions)) missing)
+            let settings = filter (\l -> l `elem` ["row level security", "force row level security"] || "with (" `T.isPrefixOf` l) (T.lines (printed old))
+                lines' = T.lines (printed def)
+                missing = filter (`notElem` lines') settings
+                hasOptions = any ("with (" `T.isPrefixOf`) lines'
+             in Printed (T.intercalate "\n" (lines' <> filter (\l -> not ("with (" `T.isPrefixOf` l && hasOptions)) missing))
         _ -> def
 
     leftOut k c

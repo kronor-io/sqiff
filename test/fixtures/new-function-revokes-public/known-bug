@@ -1,1 +1,0 @@
-a new object's privileges are planned from an empty ACL, so the default EXECUTE for PUBLIC is never revoked (Recipe privileges)

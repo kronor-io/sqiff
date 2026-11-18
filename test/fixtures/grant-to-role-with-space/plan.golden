@@ -1,5 +1,5 @@
 -- table public.t
-grant readers SELECT on table public.t to report;
+grant SELECT on table public.t to "report readers";
 
 -- table public.t
 grant DELETE on table public.t to sqiff;

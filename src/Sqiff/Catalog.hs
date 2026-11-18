@@ -40,6 +40,7 @@ module Sqiff.Catalog (
     tempTableStatements,
 ) where
 
+import Data.Aeson qualified as Aeson
 import Data.FileEmbed (embedDir, embedFile, makeRelativeToProject)
 import Data.Functor.Contravariant (contramap)
 import Data.String.Interpolate (i)
@@ -61,6 +62,7 @@ import RIO.Text qualified as T
 import RIO.Text.Partial qualified as TP
 import RIO.Vector qualified as V
 import Sqiff.ConnectionString (ConnectionString, libpqText)
+import Sqiff.Definition (Definition (..))
 import Sqiff.Identifier (Identifier, QName (..), identifier, nameText, qname)
 import Sqiff.Model
 import Sqiff.Timing (timed)
@@ -167,9 +169,11 @@ describeOn conns excluded partitions onlyTable = do
     describeOne conn ((file, body), parity) =
         timed [i|describeQuery #{name} #{maybe "" show parity}|] do
             rows <- run conn (excluded, partitions == IncludePartitions, onlyTable, parity) (describeStatement body)
+            definitions <- for rows \(_, object, text) ->
+                either (\e -> failWith [i|the catalog's description of #{render object} does not parse: #{e}|]) (pure . (ObjectKey (aspectOf name) object,)) (decodeDefinition name text)
             evaluate
                 $ force
-                    ( Map.fromList [(ObjectKey (aspectOf name) object, definition) | (_, object, definition) <- rows]
+                    ( Map.fromList definitions
                     , Map.fromList [(ids, object) | (ids, object, _) <- rows]
                     )
       where
@@ -183,6 +187,13 @@ describeOn conns excluded partitions onlyTable = do
         "privileges" -> Privileges
         "comment" -> Comment
         _ -> Definition
+
+    -- The column and privilege queries describe their objects as JSON; the others print them.
+    decodeDefinition :: String -> Text -> Either String Definition
+    decodeDefinition = \case
+        "column" -> fmap ColumnDefinition . Aeson.eitherDecodeStrict . encodeUtf8
+        "privileges" -> fmap AclDefinition . Aeson.eitherDecodeStrict . encodeUtf8
+        _ -> Right . Printed
 
     wrap body =
         [i|

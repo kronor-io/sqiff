@@ -1,1 +1,0 @@
-the column description is newline-delimited, so a default with a newline is cut and its rest read as fields (column.sql, Recipe parseColumn)

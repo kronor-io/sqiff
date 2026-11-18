@@ -1,0 +1,6 @@
+-- table public.t
+revoke SELECT on table public.t from analyst;
+
+-- table public.t
+revoke grant option for SELECT on table public.t from reader;
+

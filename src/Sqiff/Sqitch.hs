@@ -39,6 +39,7 @@ import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import Sqiff.Catalog (errorText, failWith)
 import Sqiff.Config (Names (..), fill)
+import Sqiff.Definition
 import Sqiff.Diff (Change (..))
 import Sqiff.Identifier
 import Sqiff.Model
@@ -146,7 +147,7 @@ units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: 
             | isAdded s.change -> Unit AddChange n (createNote s) Conventional [s] []
         _ -> Unit AddChange (groupKey s) (note (verb s) s) Migration [s] []
 
-    createNote s = case (s.object, s.change) of
+    createNote s = case (s.object, printed <$> s.change) of
         (Index ix, Added def) | Just t <- indexTableName def -> let table = dotted (QName ix.schema (identifier t)); name = nameText ix.name in [S.i|add_index: add index #{table}.#{name}|]
         _ -> note "create" s
 
@@ -166,12 +167,11 @@ units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: 
 
     refill s
         | Column t c <- s.object
-        , Added def <- s.change
-        , let p = parseColumn def
-        , p.notNull && isNothing p.defaultExpr && isNothing p.identity && isNothing p.generated =
+        , Added (ColumnDefinition p) <- s.change
+        , failsOnRows p =
             let table = qualified t
                 column = quoted c
-                definition = columnSql p{notNull = False}
+                definition = columnSql p{nullability = Nullable}
              in s
                     { sql = [S.i|alter table #{table} add column #{column} #{definition}|]
                     , hazards = [MayFail "the column comes back nullable and empty, since its values were dropped"]
@@ -224,7 +224,7 @@ units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: 
 conventionalName :: Names -> Step -> Maybe Text
 conventionalName names s
     | s.key.aspect /= Definition = Nothing
-    | otherwise = case (s.object, s.change) of
+    | otherwise = case (s.object, printed <$> s.change) of
         (Table t, Added _) | s.rank == 4 -> Just (path names.table t)
         (Routine Aggregate _ _, _) -> Nothing
         (Routine _ q _, Added _) -> Just (path names.function q)
@@ -266,7 +266,7 @@ shapeOf u = case u.deploy of
     [s]
         | u.placement == Conventional
         , Index ix <- s.object
-        , Added def <- s.change
+        , Added def <- printed <$> s.change
         , Just t <- indexTableName def ->
             AddIndexShape (QName ix.schema (identifier t)) ix.name
         | u.placement == Migration
@@ -432,9 +432,9 @@ verifyScript header steps =
     check s = case s.object of
         Column t col
             | gone s -> [notExists [S.i|select from pg_attribute where attrelid = #{reg t} and attname = #{sqlLiteral c} and not attisdropped|] [S.i|column #{c} is still on #{qualified t}|]]
-            | Changed old new <- s.change
-            , let ty = (parseColumn new).colType
-            , (parseColumn old).colType /= ty ->
+            | Changed (ColumnDefinition old) (ColumnDefinition new) <- s.change
+            , let ty = typeText new.colType
+            , old.colType /= new.colType ->
                 [ let message = sqlLiteral [S.i|#{c} is not #{ty}|]
                    in [S.i|assert (select atttypid from pg_attribute where attrelid = #{reg t} and attname = #{sqlLiteral c}) = #{sqlLiteral ty}::regtype, #{message};|]
                 ]

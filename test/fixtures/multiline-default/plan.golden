@@ -1,3 +1,4 @@
 -- table column public.t.note
-alter table public.t add column note line two'::text default 'line one;
+alter table public.t add column note text default 'line one
+type line two'::text;
 

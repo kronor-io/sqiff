@@ -83,8 +83,19 @@ Guiding rules:
     error. Use `quoted` / `qualified` for SQL and `nameText` / `dotted` for messages.
   - The catalog never describes foreign tables, operators, casts, rules or collations,
     so those paths stay `Unknown` and are effectively dead. Phase 3 can delete them.
-  - `ColumnDef.notNullName`, ACL role names and the `Change` payloads are still `Text`.
-    They become typed in Phase 2.
+- [x] **Phase 2 (part 1):** typed definitions for columns and privileges. `Schema` maps
+  keys to a `Definition` (`ColumnDefinition`, `AclDefinition`, or `Printed` text for the
+  other kinds), and `Change a` is polymorphic. The column and privilege queries return
+  JSON, decoded once in `Sqiff.Catalog`. A description that does not decode is an error.
+  `printed` renders the old text, so `diff` output is unchanged.
+  - Fixed: role names with spaces, multi-line defaults, PUBLIC `EXECUTE` on new
+    functions, grant-option removal (`revoke grant option for`), null vs. empty ACLs, and
+    `fileDrift` ignoring "not valid" inside comments.
+  - Found: grants have no grantor, so a grant option another role has used cannot be
+    revoked (`test/fixtures/grant-option-removed`).
+  - Still printed text: indexes, constraints, views, tables, routines and types. Their
+    recipes still re-read SQL (`" ON "`, `"FOREIGN KEY "`, `"partition by "`). Typing them
+    is part 2.
 
 ## Phases (each one builds, passes tests, and ships on its own)
 

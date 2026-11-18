@@ -15,6 +15,7 @@ import RIO.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExis
 import RIO.FilePath (joinPath, takeDirectory, (<.>), (</>))
 import RIO.Map qualified as Map
 import Sqiff.Catalog (failWith)
+import Sqiff.Definition (printed)
 import Sqiff.Model (Address (..), Aspect (..), ObjectKey (..), Schema, toAddress)
 
 
@@ -37,7 +38,7 @@ writeFolder existing root schema = do
     for_ (Map.toList schema) \(key, definition) -> do
         let path = root </> objectPath key
         createDirectoryIfMissing True (takeDirectory path)
-        writeFileUtf8 path (definition <> "\n")
+        writeFileUtf8 path (printed definition <> "\n")
     writeFileUtf8 (root </> marker) "Written by sqiff describe --out; --replace clears this folder.\n"
 
 

@@ -22,7 +22,8 @@ import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Vector qualified as V
 import Sqiff.Catalog (errorText, failWith, qualifiedNames)
-import Sqiff.Model (Address (..), Aspect (..), ObjectKey (..), fromAddress, isRoutine, toAddress)
+import Sqiff.Definition (Definition, printed)
+import Sqiff.Model (Address (..), Aspect (..), ObjectKey (..), Schema, fromAddress, isRoutine, toAddress)
 
 
 data BodyCheck
@@ -39,14 +40,14 @@ data BodyCheck
 
 -- | Checks every function in @schema@ that has a SQL-standard body; needs a database
 -- that accepts writes.
-checkBodies :: Connection.Connection -> Map ObjectKey Text -> IO (Map ObjectKey BodyCheck)
+checkBodies :: Connection.Connection -> Schema -> IO (Map ObjectKey BodyCheck)
 checkBodies conn schema = qualifiedNames conn do
     sqlBodyFunctions <-
         if any (isRoutine . (.object)) (Map.keys schema)
             then toList <$> run sqlBodies ()
             else pure []
     let keys = Set.fromList [definitionKey (toList names) (toList args) kind | (names, args, kind) <- sqlBodyFunctions]
-    Map.traverseWithKey roundTrip (Map.restrictKeys schema keys)
+    Map.traverseWithKey (\k -> roundTrip k . printed) (Map.restrictKeys schema keys)
   where
     definitionKey names args kind = ObjectKey Definition (fromAddress (Address kind names args))
 
@@ -112,8 +113,8 @@ repair def =
 
 -- | Two definitions are the same object when the texts match, or when the desired one
 -- reprints as the current one: that is what recreating it from its printed text gives.
-sameDefinition :: Map ObjectKey BodyCheck -> ObjectKey -> Text -> Text -> Bool
+sameDefinition :: Map ObjectKey BodyCheck -> ObjectKey -> Definition -> Definition -> Bool
 sameDefinition checks k current desired =
     current == desired || case Map.lookup k checks of
-        Just (Reprints p) -> current == p
+        Just (Reprints p) -> printed current == p
         _ -> False
