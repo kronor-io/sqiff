@@ -66,7 +66,7 @@ data Connected = Connected
 withDatabase :: Scope -> ConnectionString -> (IO Connected -> IO a) -> IO a
 withDatabase scope db = onDemand \use ->
     withConnections db describeConnections \(conn :| extra) ->
-        withAsync (either (const Nothing) id <$> tryAny (withConnection db tempTableStatements)) \tempTables -> do
+        withAsync (withConnection db tempTableStatements) \tempTables -> do
             (schema, addresses) <- describeOn (conn : extra) scope.excluded scope.partitions Nothing
             use Connected{conn, extra, schema, addresses, tempTableScript = wait tempTables}
 

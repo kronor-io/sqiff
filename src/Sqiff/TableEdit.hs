@@ -31,9 +31,10 @@ import Hasql.Connection qualified as Connection
 import Hasql.Session qualified as Session
 import Hasql.TH (singletonStatement, vectorStatement)
 import RIO
+import RIO.List qualified as L
 import RIO.Map qualified as Map
 import Sqiff.Catalog (Partitions (..), describeOn)
-import Sqiff.Connection (errorText, failWith, serverError)
+import Sqiff.Connection (errorText, failWith, inRolledBackTransaction, serverError)
 import Sqiff.Definition (Definition (..), IndexDef (..), TableDef (..), mapNames, mapText)
 import Sqiff.Diff (Change (..), Changes, diff)
 import Sqiff.Identifier
@@ -99,10 +100,17 @@ typeChangeFacts conn old new =
         altered <- Connection.use conn (Session.script [i|alter table pg_temp.sqiff_retype alter column c type #{new} using c::#{new}|])
         after <- fileNode
         domain <- Connection.use conn (Session.statement new isDomain)
-        pure case (made, before, altered, after, domain) of
-            (Right (), Right b, Right (), Right a, Right d) -> Just (TypeChange (if a /= b then RewritesFiles else KeepsFiles) (if d then DomainType else PlainType))
-            _ -> Nothing
+        case (made, before, altered, after, domain) of
+            (Right (), Right b, Right (), Right a, Right d) -> pure (Just (TypeChange (if a /= b then RewritesFiles else KeepsFiles) (if d then DomainType else PlainType)))
+            results -> do
+                -- PostgreSQL refusing the probe means the facts are unknown; losing the
+                -- connection is an error.
+                let errors = lefts' results
+                for_ (L.find (isNothing . serverError) errors) \e -> failWith [i|the type change check failed: #{errorText e}|]
+                pure Nothing
   where
+    lefts' (a, b, c, d, e) = catMaybes [leftOf a, leftOf b, leftOf c, leftOf d, leftOf e]
+    leftOf = either Just (const Nothing)
     fileNode =
         Connection.use conn
             $ Session.statement
@@ -120,9 +128,7 @@ typeChangeFacts conn old new =
 
 -- | Runs @action@ in a transaction that is always rolled back.
 rolledBack :: Connection.Connection -> Text -> IO a -> IO a
-rolledBack conn label action = do
-    Connection.use conn (Session.script "begin") >>= either (\e -> failWith [i|#{label} could not start: #{errorText e}|]) pure
-    action `finally` void (Connection.use conn (Session.script "rollback"))
+rolledBack = inRolledBackTransaction
 
 
 -- | The table's column names in the table's order.
@@ -214,8 +220,7 @@ withEditedTable conn baseline table statements beforeEdit afterEdit = snd <$> ed
 editTable :: Describing -> Connection.Connection -> Baseline -> QName -> [Text] -> IO b -> (b -> IO a) -> IO (TableEdit, a)
 editTable describing conn baseline table statements beforeEdit afterEdit = do
     (current, desired, afterResult) <-
-        ( do
-            script "begin"
+        inRolledBackTransaction conn "the table comparison" do
             xact <- currentXact
             script "set local lock_timeout = '5s'"
             exists <-
@@ -246,8 +251,6 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             desired <- timed "tableEdit.desired" $ build xact "as edited" statements
             afterResult <- timed "tableEdit.after" $ afterEdit beforeResult
             pure (current, desired, afterResult)
-        )
-            `finally` void (Connection.use conn (Session.script "rollback"))
     let kept = case baseline of
             BaseFile _ -> desired
             LiveTable _ _ -> Map.mapWithKey (keepSettings current) desired

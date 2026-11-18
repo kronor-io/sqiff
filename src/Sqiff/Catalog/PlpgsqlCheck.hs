@@ -36,7 +36,7 @@ import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import RIO.Text.Partial qualified as TP
 import Sqiff.Catalog.Rows
-import Sqiff.Connection (errorText, failWith, qualifiedNames, run)
+import Sqiff.Connection (errorText, failWith, inRolledBackTransaction, qualifiedNames, run, serverError)
 import Sqiff.Sql (doBlock, literal)
 import Sqiff.Timing (timed)
 
@@ -72,7 +72,8 @@ bodyUses conns@(conn :| _) excluded only madeTempTables =
 
 
 -- | The statements temp_tables.sql runs on a connection without temp tables; 'Nothing'
--- when it fails or plpgsql_check is not installed.
+-- when PostgreSQL refuses the script, so the script itself is run instead, or when
+-- plpgsql_check is not installed. Losing the connection is an error.
 tempTableStatements :: Connection.Connection -> IO (Maybe Text)
 tempTableStatements conn =
     timed "tempTableStatements"
@@ -81,12 +82,14 @@ tempTableStatements conn =
             Nothing -> pure Nothing
             Just extSchema -> do
                 result <-
-                    Connection.use conn do
-                        Session.script "begin"
+                    inRolledBackTransaction conn "the temp table script" $ Connection.use conn do
                         Session.script (TP.replace "@extschema@" extSchema (decodeUtf8Lenient plpgsqlTempTablesScript))
                         Session.statement () [singletonStatement| select coalesce(current_setting('sqiff.temp_tables', true), '') :: text |]
-                _ <- Connection.use conn (Session.script "rollback")
-                pure (either (const Nothing) (Just . ("set client_min_messages = error;\n" <>)) result)
+                case result of
+                    Right statements -> pure (Just ("set client_min_messages = error;\n" <> statements))
+                    Left e
+                        | isJust (serverError e) -> pure Nothing
+                        | otherwise -> failWith [i|the temp table script failed: #{errorText e}|]
 
 
 -- | A PL/pgSQL function plpgsql_check can analyse: its oid, name, trigger table and

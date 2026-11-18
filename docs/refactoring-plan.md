@@ -283,6 +283,17 @@ Guiding rules:
   - `--replace` writes the new export beside the old one and swaps it in when it is
     complete, so a failure leaves the old export as it was.
 
+- [x] **Failed probes and cleanups are no longer read as absence (Codex 24).**
+  - `inRolledBackTransaction` runs every rolled-back check: the table comparison, the
+    type-change and foreign-key probes, and the temp-table script.
+    - When the check succeeds, a failed rollback is an error.
+    - When it fails, its own error is reported.
+  - The type-change probe and the temp-table script still return "unknown" when
+    PostgreSQL refuses them, and sqiff falls back. Losing the connection now fails the
+    command. Opening the temp-table connection is no longer wrapped in `tryAny`.
+  - Body checks keep their per-body rollback. An exception there ends the command and
+    releases the connection.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

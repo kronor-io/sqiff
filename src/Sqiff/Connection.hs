@@ -10,6 +10,7 @@ module Sqiff.Connection (
     connect,
     withConnection,
     withConnections,
+    inRolledBackTransaction,
     run,
     qualifiedNames,
     errorText,
@@ -52,6 +53,20 @@ connect conninfo =
         Errors.CompatibilityConnectionError t -> t
         Errors.OtherConnectionError t -> t
     firstLine = T.takeWhile (/= '\n')
+
+
+-- | Runs @action@ in a transaction that is always rolled back; @label@ names it in errors.
+-- When @action@ succeeds the rollback must too, as the connection's state is unknown
+-- otherwise. When @action@ fails, its error is the one that counts.
+inRolledBackTransaction :: Connection.Connection -> Text -> IO a -> IO a
+inRolledBackTransaction conn label action = do
+    script "begin" "could not start"
+    result <- action `onException` tryAny (Connection.use conn (Session.script "rollback"))
+    script "rollback" "could not be rolled back"
+    pure result
+  where
+    script :: Text -> Text -> IO ()
+    script sql failed = Connection.use conn (Session.script sql) >>= either (\e -> failWith [i|#{label} #{failed}: #{errorText e}|]) pure
 
 
 -- | Runs @action@ with a connection that is released when it returns or fails.
