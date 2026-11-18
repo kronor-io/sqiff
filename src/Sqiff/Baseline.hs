@@ -1,84 +1,96 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE NoFieldSelectors #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | A scratch PostgreSQL holding the schema a revision's sqitch plan produces, run from a
--- git worktree at that revision.
+-- git worktree at that revision with the revision's own compose file.
 module Sqiff.Baseline (ensureBaseline) where
 
+import Crypto.Hash (SHA256 (..), hashWith)
+import Data.Char (isDigit)
 import Data.String.Interpolate (i)
+import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import RIO
 import RIO.Directory (XdgDirectory (..), createDirectoryIfMissing, doesDirectoryExist, doesFileExist, doesPathExist, findExecutable, getXdgDirectory, removeDirectoryRecursive, removeFile)
 import RIO.FilePath (takeDirectory, (</>))
-import RIO.Text qualified as T
+import RIO.Map qualified as Map
 import Sqiff.Catalog (failWith)
-import Sqiff.Git (Repo, findRepo, git, resolveCommit)
+import Sqiff.Config (BaselineConfig (..), DeployStep (..), SqitchPlace (..))
+import Sqiff.Git (Repo, commonDir, findRepo, git, resolveCommit)
 import System.Environment (getEnvironment)
-import System.Process.Typed (ProcessConfig, nullStream, proc, readProcess, runProcess, setEnv, setStdin, setStdout, useHandleOpen)
+import System.Process.Typed (ProcessConfig, nullStream, proc, readProcess, runProcess, setEnv, setStdin, setStdout, setWorkingDir, useHandleOpen)
 
 
-composeProject :: Text
-composeProject = "sqiff-baseline"
-
-
-port :: Int
-port = 5542
-
-
-connInfo :: Text
-connInfo = [i|host=localhost port=#{port} user=kronor dbname=kronor|]
-
-
+-- | Where one repository's baseline lives; its worktrees and jj workspaces share it.
 data Paths = Paths
-    { checkout :: FilePath
+    { project :: Text
+    , checkout :: FilePath
     , stateFile :: FilePath
     }
 
 
 -- | Makes sure the baseline database holds the schema of @rev@'s sqitch plan and
 -- returns its connection string.
-ensureBaseline :: Text -> IO Text
-ensureBaseline rev = do
+ensureBaseline :: BaselineConfig -> Text -> IO Text
+ensureBaseline cfg rev = do
     for_ ["docker", "git"] \tool -> do
         found <- findExecutable tool
         when (isNothing found) $ failWith [i|#{tool} is not on PATH; the baseline database needs it|]
-    cache <- getXdgDirectory XdgCache "sqiff"
-    let p = Paths{checkout = cache </> "checkout", stateFile = cache </> "baseline-commit"}
     repo <- findRepo "."
+    key <- T.take 12 . tshow . hashWith SHA256 . encodeUtf8 . T.pack <$> commonDir repo
+    cache <- getXdgDirectory XdgCache ("sqiff" </> T.unpack key)
+    let p = Paths{project = "sqiff-" <> key, checkout = cache </> "checkout", stateFile = cache </> "baseline-commit"}
     commit <- resolveCommit repo rev
     recorded <- doesFileExist p.stateFile >>= bool (pure Nothing) (Just . T.strip <$> readFileUtf8 p.stateFile)
     hasCheckout <- doesPathExist (p.checkout </> ".git")
-    running <- if hasCheckout then isRunning p else pure False
+    running <- if hasCheckout then isRunning cfg p else pure False
     if recorded == Just commit && running
-        then pure connInfo
+        then connInfo cfg p
         else do
             note [i|bringing the baseline database to #{T.take 12 commit} (#{rev})|]
             whenM (doesFileExist p.stateFile) $ removeFile p.stateFile
-            checkoutAt repo p commit
-            start p
-            stale <- staleDeploy p
+            checkoutAt cfg repo p commit
+            start cfg p
+            stale <- staleDeploy cfg p
             when stale do
                 note "the deployed changes are not all in this revision's plan; rebuilding from scratch"
-                compose p ["down", "-v"]
-                start p
-            hasStatecharts <- doesFileExist (p.checkout </> "statecharts" </> "sqitch.plan")
-            when hasStatecharts $ sqitchIn p ["--chdir", "statecharts", "deploy"]
-            sqitchIn p ["deploy", "--mode", "change", "kronor"]
-            sqitchIn p ["deploy", "--mode", "change", "dev"]
+                compose cfg p ["down", "-v"]
+                start cfg p
+            for_ cfg.deploy \step -> do
+                present <- maybe (pure True) (doesPathExist . (p.checkout </>)) step.ifExists
+                when present $ sqitchIn cfg p step.args
             writeFileUtf8 p.stateFile (commit <> "\n")
-            pure connInfo
+            connInfo cfg p
 
 
 note :: Text -> IO ()
 note message = TIO.hPutStrLn stderr ("sqiff: " <> message)
 
 
+-- | The connection string for the port Docker published the service on.
+connInfo :: BaselineConfig -> Paths -> IO Text
+connInfo cfg p = do
+    port <- publishedPort cfg p
+    let (user, database) = (cfg.user, cfg.database)
+    pure [i|host=localhost port=#{port} user=#{user} dbname=#{database}|]
+
+
+publishedPort :: BaselineConfig -> Paths -> IO Text
+publishedPort cfg p = do
+    let containerPort = cfg.containerPort
+    (code, out, err) <- readCompose cfg p ["port", T.unpack cfg.service, show containerPort]
+    case T.breakOnEnd ":" out of
+        (_, port) | code == ExitSuccess, not (T.null port), T.all isDigit port -> pure port
+        _ -> failWith [i|the baseline service publishes no port for #{containerPort}: #{out}#{err}|]
+
+
 -- | Creates the git worktree at @commit@, or moves it there. A checkout that is not a
 -- git worktree is stopped and replaced; the database volume stays.
-checkoutAt :: Repo -> Paths -> Text -> IO ()
-checkoutAt repo p commit =
+checkoutAt :: BaselineConfig -> Repo -> Paths -> Text -> IO ()
+checkoutAt cfg repo p commit =
     doesPathExist (p.checkout </> ".git") >>= \case
         True -> do
             let args = ["-C", p.checkout, "checkout", "--quiet", "--force", "--detach", T.unpack commit]
@@ -88,7 +100,7 @@ checkoutAt repo p commit =
             let checkout = p.checkout
             whenM (doesDirectoryExist checkout) do
                 note [i|replacing #{checkout} with a git worktree|]
-                whenM (doesFileExist (p.checkout </> "docker-compose.yaml")) $ compose p ["down"]
+                whenM (doesFileExist (p.checkout </> cfg.composeFile)) $ compose cfg p ["down"]
                 removeDirectoryRecursive p.checkout
             createDirectoryIfMissing True (takeDirectory p.checkout)
             git repo ["worktree", "prune"]
@@ -97,72 +109,89 @@ checkoutAt repo p commit =
 
 -- | Starts the server and waits until it accepts connections over TCP, which it does
 -- once the init scripts are done.
-start :: Paths -> IO ()
-start p = do
-    compose p ["up", "-d", "postgres"]
+start :: BaselineConfig -> Paths -> IO ()
+start cfg p = do
+    compose cfg p ["up", "-d", service]
     awaitReady (0 :: Int)
   where
+    service = T.unpack cfg.service
+    project = p.project
     awaitReady n = do
-        (code, _, _) <- readCompose p ["exec", "-T", "postgres", "pg_isready", "-q", "-h", "127.0.0.1"]
+        (code, _, _) <- readCompose cfg p ["exec", "-T", service, "pg_isready", "-q", "-h", "127.0.0.1"]
         unless (code == ExitSuccess) do
-            (_, state, _) <- readCompose p ["ps", "-a", "--format", "{{.State}}", "postgres"]
+            (_, state, _) <- readCompose cfg p ["ps", "-a", "--format", "{{.State}}", service]
             when (T.strip state `elem` ["exited", "dead"] || n >= 900)
-                $ failWith [i|the baseline server did not come up; see docker compose -p #{composeProject} logs postgres|]
-            when (n == 5) $ note [i|waiting for the baseline server (docker compose -p #{composeProject} logs -f postgres)|]
+                $ failWith [i|the baseline server did not come up; see docker compose -p #{project} logs #{service}|]
+            when (n == 5) $ note [i|waiting for the baseline server (docker compose -p #{project} logs -f #{service})|]
             threadDelay 2_000_000
             awaitReady (n + 1)
 
 
 -- | Whether sqitch reports deployed changes that the checkout's plan does not have.
-staleDeploy :: Paths -> IO Bool
-staleDeploy p = do
-    (_, out, err) <- readCompose p ["exec", "-T", "postgres", "sqitch", "status"]
-    pure ("Cannot find" `T.isInfixOf` (out <> err))
+staleDeploy :: BaselineConfig -> Paths -> IO Bool
+staleDeploy cfg p = do
+    (_, out, err) <- readProcess . quiet =<< sqitchProc cfg p ["status"]
+    pure ("Cannot find" `T.isInfixOf` decode (out <> err))
 
 
-sqitchIn :: Paths -> [String] -> IO ()
-sqitchIn p args = do
-    env <- composeEnv
-    code <- runProcess (toStderr (setEnv env (composeProc p (["exec", "-T", "postgres", "sqitch"] <> args))))
+sqitchIn :: BaselineConfig -> Paths -> [Text] -> IO ()
+sqitchIn cfg p args = do
+    code <- runProcess . toStderr =<< sqitchProc cfg p args
     case code of
         ExitSuccess -> pure ()
-        ExitFailure n -> failWith [i|sqitch #{unwords args} failed in the baseline container with exit code #{n}|]
+        ExitFailure n -> failWith [i|sqitch #{T.unwords args} failed for the baseline database with exit code #{n}|]
 
 
-isRunning :: Paths -> IO Bool
-isRunning p = do
-    (code, out, _) <- readCompose p ["ps", "--status", "running", "-q", "postgres"]
+-- | sqitch in the service, or on this machine in the checkout with libpq's variables
+-- pointing at the published port.
+sqitchProc :: BaselineConfig -> Paths -> [Text] -> IO (ProcessConfig () () ())
+sqitchProc cfg p args = case cfg.sqitch of
+    InService -> do
+        env <- composeEnv cfg
+        pure (setEnv env (composeProc cfg p (["exec", "-T", T.unpack cfg.service, "sqitch"] <> map T.unpack args)))
+    OnHost -> do
+        port <- publishedPort cfg p
+        env <- getEnvironment
+        let ours = [("PGHOST", "localhost"), ("PGPORT", T.unpack port), ("PGUSER", T.unpack cfg.user), ("PGDATABASE", T.unpack cfg.database)]
+            others = filter ((`notElem` (["PGSERVICE", "PGHOSTADDR"] <> map fst ours)) . fst) env
+        pure (setEnv (ours <> others) (setWorkingDir p.checkout (quiet (proc "sqitch" (map T.unpack args)))))
+
+
+isRunning :: BaselineConfig -> Paths -> IO Bool
+isRunning cfg p = do
+    (code, out, _) <- readCompose cfg p ["ps", "--status", "running", "-q", T.unpack cfg.service]
     pure (code == ExitSuccess && not (T.null (T.strip out)))
 
 
-compose :: Paths -> [String] -> IO ()
-compose p args = do
-    env <- composeEnv
-    code <- runProcess (toStderr (setEnv env (composeProc p args)))
+compose :: BaselineConfig -> Paths -> [String] -> IO ()
+compose cfg p args = do
+    env <- composeEnv cfg
+    code <- runProcess (toStderr (setEnv env (composeProc cfg p args)))
+    let project = p.project
     case code of
         ExitSuccess -> pure ()
-        ExitFailure n -> failWith [i|docker compose -p #{composeProject} #{unwords args} failed with exit code #{n}|]
+        ExitFailure n -> failWith [i|docker compose -p #{project} #{unwords args} failed with exit code #{n}|]
 
 
-readCompose :: Paths -> [String] -> IO (ExitCode, Text, Text)
-readCompose p args = do
-    env <- composeEnv
-    (code, out, err) <- readProcess (quiet (setEnv env (composeProc p args)))
+readCompose :: BaselineConfig -> Paths -> [String] -> IO (ExitCode, Text, Text)
+readCompose cfg p args = do
+    env <- composeEnv cfg
+    (code, out, err) <- readProcess (quiet (setEnv env (composeProc cfg p args)))
     pure (code, decode out, decode err)
 
 
--- | The checkout's own compose file, so image, command, init scripts and the @/repo@
--- mount all come from the revision being built.
-composeProc :: Paths -> [String] -> ProcessConfig () () ()
-composeProc p args = proc "docker" (["compose", "-p", T.unpack composeProject, "-f", p.checkout </> "docker-compose.yaml"] <> args)
+-- | The checkout's own compose file, so image, command, init scripts and mounts all come
+-- from the revision being built.
+composeProc :: BaselineConfig -> Paths -> [String] -> ProcessConfig () () ()
+composeProc cfg p args = proc "docker" (["compose", "-p", T.unpack p.project, "-f", p.checkout </> cfg.composeFile] <> args)
 
 
--- | The caller's environment with the baseline's port, without a dev slot's compose
--- settings, and with pg_partman's background worker off.
-composeEnv :: IO [(String, String)]
-composeEnv = do
+-- | The caller's environment with the configured variables, the port variable (0 lets
+-- Docker pick a free port), and without a dev stack's compose settings.
+composeEnv :: BaselineConfig -> IO [(String, String)]
+composeEnv cfg = do
     env <- getEnvironment
-    let ours = [("KRONOR_PG_PORT", show port), ("KRONOR_PG_PARTMAN_BGW_DBNAME", "")]
+    let ours = [(T.unpack k, T.unpack v) | (k, v) <- Map.toList cfg.environment] <> [(T.unpack v, show cfg.port) | v <- maybeToList cfg.portVariable]
         dropped = map fst ours <> ["COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES"]
     pure (ours <> filter ((`notElem` dropped) . fst) env)
 

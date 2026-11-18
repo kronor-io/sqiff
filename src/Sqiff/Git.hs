@@ -4,7 +4,7 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Reading revisions with git, also from a jj workspace that has no @.git@ of its own.
-module Sqiff.Git (Repo (..), findRepo, showFile, resolveCommit, git) where
+module Sqiff.Git (Repo (..), findRepo, showFile, resolveCommit, commonDir, git) where
 
 import Data.String.Interpolate (i)
 import RIO
@@ -66,6 +66,15 @@ resolveCommit repo rev = do
     case code of
         ExitSuccess -> pure (decode out)
         ExitFailure _ -> failWith [i|#{rev} names no commit|]
+
+
+-- | The git directory every worktree and jj workspace of the repository shares.
+commonDir :: Repo -> IO FilePath
+commonDir repo = do
+    (code, out, err) <- readProcess (gitProc repo ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    case code of
+        ExitSuccess -> canonicalizePath (T.unpack (decode out))
+        ExitFailure _ -> failWith [i|git rev-parse --git-common-dir: #{decode err}|]
 
 
 -- | Runs git on the repository; its error output goes into the failure.

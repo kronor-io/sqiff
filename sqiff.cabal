@@ -26,6 +26,7 @@ library
     Sqiff.Baseline
     Sqiff.Body
     Sqiff.Catalog
+    Sqiff.Config
     Sqiff.Diff
     Sqiff.Folder
     Sqiff.Git
@@ -39,6 +40,7 @@ library
     Sqiff.Timing
 
   build-depends:
+    , aeson
     , base
     , bytestring
     , containers
@@ -54,6 +56,7 @@ library
     , time
     , typed-process
     , vector
+    , yaml
 
 executable sqiff
   import:         shared

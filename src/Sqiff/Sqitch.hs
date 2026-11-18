@@ -38,6 +38,7 @@ import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), errorText, failWith, render)
+import Sqiff.Config (Names (..), fill)
 import Sqiff.Diff (Change (..))
 import Sqiff.Object
 import Sqiff.Plan (invert)
@@ -98,7 +99,7 @@ parsePlan text =
             | entryName l `Set.member` visited = fromEnd seenTag visited ls
             | otherwise = (entryName l, seenTag) : fromEnd seenTag (Set.insert (entryName l) visited) ls
      in SqitchPlan
-            { project = fromMaybe "kronor" (listToMaybe (mapMaybe (T.stripPrefix "%project=") lines'))
+            { project = fromMaybe "" (listToMaybe (mapMaybe (T.stripPrefix "%project=") lines'))
             , changes = [entryName l | l <- entries, not (isTag l)]
             , tagged = Set.fromList [n | (n, True) <- fromEnd False Set.empty (reverse entries)]
             }
@@ -133,12 +134,12 @@ deployedChanges conn project =
 
 -- | Groups ordered steps into changes: conventional paths for steps that pass
 -- @conventional@, reworks of changes the plan has, and migrations for the rest.
-units :: (Step -> Bool) -> Context -> SqitchPlan -> UTCTime -> [Step] -> [Unit]
-units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (claimReverts Set.empty (foldr (merge . single) [] steps))
+units :: Names -> (Step -> Bool) -> Context -> SqitchPlan -> UTCTime -> [Step] -> [Unit]
+units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (claimReverts Set.empty (foldr (merge . single) [] steps))
   where
     existing = Set.fromList sqitchPlan.changes
 
-    single s = case if conventional s then conventionalName s else Nothing of
+    single s = case if conventional s then conventionalName names s else Nothing of
         Just n
             | n `Set.member` existing -> Unit ReworkChange n (note "update" s) Conventional [s] []
             | isAdded s.change -> Unit AddChange n (createNote s) Conventional [s] []
@@ -179,20 +180,19 @@ units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (
     nameMigrations _ [] = []
     nameMigrations i (u : rest)
         | u.placement == Migration =
-            let stamp = formatTime defaultTimeLocale "%Y/%m/%Y-%m-%d-%H%M%S" (addUTCTime (fromIntegral i) now)
+            let stamp = T.pack (formatTime defaultTimeLocale (T.unpack names.migrationStamp) (addUTCTime (fromIntegral i) now))
                 description = describe u
                 template = maybe "migration" fst (templateOf u)
-                slugged = slug description
-             in u{changeName = [S.i|migrations/#{stamp}-#{slugged}|], note = [S.i|#{template}: #{description}|]} : nameMigrations (i + 1) rest
+             in u{changeName = fill names.migration [("stamp", stamp), ("slug", slug description)], note = [S.i|#{template}: #{description}|]} : nameMigrations (i + 1) rest
         | otherwise = u : nameMigrations i rest
 
     describe u = case shapeOf u of
         AddColumnShape t c _ -> let table = dotted t in [S.i|add column #{table}.#{c}|]
         ValidateShape t c -> let table = dotted t in [S.i|validate constraint #{table}.#{c}|]
         _ ->
-            let names = nubOrd [fromMaybe (render s.address) (L.lastMaybe s.address.objectNames) | s <- u.deploy]
-                joined = T.intercalate "-" names
-                suffix = if names == maybeToList (L.lastMaybe (T.split (== '.') u.changeName)) then "" else [S.i|.#{joined}|] :: Text
+            let objects = nubOrd [fromMaybe (render s.address) (L.lastMaybe s.address.objectNames) | s <- u.deploy]
+                joined = T.intercalate "-" objects
+                suffix = if objects == maybeToList (L.lastMaybe (T.split (== '.') u.changeName)) then "" else [S.i|.#{joined}|] :: Text
                 v = verbOf u
                 name = u.changeName
              in [S.i|#{v} #{name}#{suffix}|] :: Text
@@ -219,28 +219,26 @@ units conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (
         Nothing -> T.intercalate "." s.address.objectNames
 
 
--- | Where kronor keeps a new object of this kind, for the steps that create or replace one.
-conventionalName :: Step -> Maybe Text
-conventionalName s
+-- | Where the project keeps a new object of this kind, for the steps that create or replace one.
+conventionalName :: Names -> Step -> Maybe Text
+conventionalName names s
     | s.key.aspect /= Definition = Nothing
     | otherwise = case (s.object, s.change) of
-        (Table t, Added _) | s.rank == 4 -> Just (path t "table")
+        (Table t, Added _) | s.rank == 4 -> Just (path names.table t)
         (Routine Aggregate _ _, _) -> Nothing
-        (Routine _ q _, Added _) -> Just (path q "function")
-        (Routine _ q _, Changed _ _) -> Just (path q "function")
-        (View v, Added _) -> Just (path v "view")
-        (View v, Changed _ _) -> Just (path v "view")
-        (MaterializedView v, Added _) | s.phase == CreatePhase -> Just (path v "view")
+        (Routine _ q _, Added _) -> Just (path names.function q)
+        (Routine _ q _, Changed _ _) -> Just (path names.function q)
+        (View v, Added _) -> Just (path names.view v)
+        (View v, Changed _ _) -> Just (path names.view v)
+        (MaterializedView v, Added _) | s.phase == CreatePhase -> Just (path names.view v)
         (Trigger t n, Added _) -> Just (triggerPath t n)
         (Trigger t n, Changed _ _) | "CREATE OR REPLACE TRIGGER" `T.isPrefixOf` s.sql -> Just (triggerPath t n)
-        (Index ix, Added def) | Just t <- indexTableName def -> let (schema, name) = (ix.schema, ix.name) in Just [S.i|#{schema}/table/#{t}/index/#{name}|]
-        (Type t, Added _) | [schema, name] <- T.splitOn "." t -> Just [S.i|#{schema}/type/#{name}|]
+        (Index ix, Added def) | Just t <- indexTableName def -> Just (fill names.index [("schema", ix.schema), ("table", t), ("name", ix.name)])
+        (Type t, Added _) | [schema, name] <- T.splitOn "." t -> Just (fill names.type_ [("schema", schema), ("name", name)])
         _ -> Nothing
   where
-    path :: QName -> Text -> Text
-    path q kind' = let (schema, name) = (q.schema, q.name) in [S.i|#{schema}/#{kind'}/#{name}|]
-    triggerPath :: QName -> Text -> Text
-    triggerPath t n = let (schema, table) = (t.schema, t.name) in [S.i|#{schema}/trigger/#{table}/#{n}|]
+    path pattern q = fill pattern [("schema", q.schema), ("name", q.name)]
+    triggerPath t n = fill names.trigger [("schema", t.schema), ("table", t.name), ("name", n)]
 
 
 -- | The unquoted name of the table an index definition is on.
@@ -253,7 +251,7 @@ indexTableName def =
             _ -> Nothing
 
 
--- | The changes kronor's own templates in @_dev/sqitch/templates@ cover.
+-- | The changes create-migration's templates cover.
 data Shape
     = -- | The table, the column, and the column's type and options.
       AddColumnShape QName Text Text
@@ -495,11 +493,11 @@ requireSqitch = do
 
 
 -- | Writes each change with @sqitch add@ or @sqitch rework@, from create-migration's
--- template where the project has one, adding a tag first when a rework needs one.
-writeUnits :: FilePath -> FilePath -> SqitchPlan -> Text -> [Unit] -> IO ()
-writeUnits root topDir sqitchPlan tag us = do
+-- templates in @templateDir@ when it is set, adding a tag first when a rework needs one.
+writeUnits :: Maybe FilePath -> FilePath -> FilePath -> SqitchPlan -> Text -> [Unit] -> IO ()
+writeUnits templateDir' root topDir sqitchPlan tag us = do
     requireSqitch
-    templates <- doesDirectoryExist templateDir
+    templates <- maybe (pure False) doesDirectoryExist templateDir
     when (any (\u -> u.kind == ReworkChange && u.changeName `Set.notMember` sqitchPlan.tagged) us)
         $ sqitch ["tag", tag, "-n", "sqiff: before the changes it writes"]
     for_ us \u -> do
@@ -537,9 +535,9 @@ writeUnits root topDir sqitchPlan tag us = do
                 when (u.kind == AddChange) (revert >> verify)
   where
     sqitch = runSqitch root
-    templateDir = root </> "_dev" </> "sqitch" </> "templates"
+    templateDir = (root </>) <$> templateDir'
     templateArgs (template, vars) =
-        ["--template", template, "--template-directory", T.pack templateDir] <> concat [["-s", [S.i|#{k}=#{v}|]] | (k, v) <- vars]
+        ["--template", template] <> foldMap (\d -> ["--template-directory", T.pack d]) templateDir <> concat [["-s", [S.i|#{k}=#{v}|]] | (k, v) <- vars]
     scriptPath dir u = root </> topDir </> dir </> T.unpack u.changeName <.> "sql"
     script dir header steps u
         | null steps = writeFileUtf8 (scriptPath dir u) [S.i|#{header}\n\n-- Nothing to revert.\n|]

@@ -1,3 +1,4 @@
+{-# LANGUAGE DisambiguateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
@@ -26,6 +27,7 @@ import RIO.Text.Partial qualified as TP
 import Sqiff.Baseline (ensureBaseline)
 import Sqiff.Body (BodyCheck, checkBodies, sameDefinition)
 import Sqiff.Catalog (Address (..), Addresses, Aspect (..), Edge (..), ObjectKey (..), Partitions (..), PlFunction (..), PlFunctions (..), Schema, Skipped, UserError (..), analyseBodies, bodyErrors, bodyUses, connect, dependenciesFrom, dependenciesOn, describeOn, edgesBetween, failWith, notChecked, plpgsqlFunctions, relationColumns, render, tempTableStatements)
+import Sqiff.Config (Config (..), Layout (..), Names (..), fill, loadConfig, match, sqitchLayout)
 import Sqiff.Diff (BodyText (..), Change (..), affected, bodiesToAnalyse, bodyText, dependentsBy, diff, reachedFrom)
 import Sqiff.Folder (Existing (..), writeFolder)
 import Sqiff.Git (Repo, findRepo, showFile)
@@ -37,7 +39,6 @@ import Sqiff.Script (splitStatements, withoutTransactionControl)
 import Sqiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), deployedChanges, moveToEnd, parsePlan, plannedChanges, readPlan, requireSqitch, reworkEdited, units, writeUnits)
 import Sqiff.TableEdit (Baseline (..), Drops (..), Live (..), TableEdit (..), TableRewrite (..), TargetType (..), TypeChange (..), aside, columnOrder, compareTable, firstFailure, foreignKeyError, readOnly, requireScratch, typeChangeFacts, withEditedTable)
 import Sqiff.Timing (measure, timed)
-import System.Environment (lookupEnv)
 
 
 data Scope = Scope
@@ -184,19 +185,19 @@ routineWords schema = do
     Map.fromList . concat <$> pooledMapConcurrently split parts
 
 
--- | How 'dependentsIn' describes the database.
-dependentsScope :: Scope
-dependentsScope = Scope{excluded = ["hdb_catalog"], partitions = SkipPartitions, bodyCheck = SkipBodyChecks}
+-- | How 'dependentsIn' describes the database, leaving out @excluded@ schemas.
+dependentsScope :: [Text] -> Scope
+dependentsScope excluded = Scope{excluded, partitions = SkipPartitions, bodyCheck = SkipBodyChecks}
 
 
 -- | For each dropped or changed definition, its dependents by @pg_depend@ and PL/pgSQL
 -- bodies, and the other functions whose text names it.
-dependentsIn :: IO (Connected, Map Address BodyText) -> Map ObjectKey Change -> IO Dependents
-dependentsIn described changes
+dependentsIn :: [Text] -> IO (Connected, Map Address BodyText) -> Map ObjectKey Change -> IO Dependents
+dependentsIn excluded described changes
     | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty [] (pure Nothing))
     | otherwise = do
         (connected@(Connected conn _ schema _ made), split_) <- timed "deps.describeDatabase" described
-        (edges, notes) <- timed "deps.reachableEdges" $ reachableEdges "--db" dependentsScope starts connected (pure split_)
+        (edges, notes) <- timed "deps.reachableEdges" $ reachableEdges "--db" (dependentsScope excluded) starts connected (pure split_)
         for_ notes (TIO.hPutStrLn stderr)
         let known = Set.fromList [k.address | k <- Map.keys schema, k.aspect == Definition]
             exact = affected known edges changes
@@ -340,27 +341,22 @@ describeConnections = 4
 data Connected = Connected Connection.Connection [Connection.Connection] Schema Addresses (IO (Maybe Text))
 
 
--- | @local@ names the dev stack's database, on @KRONOR_PG_PORT@ (5432 when unset).
-resolveDb :: Text -> IO Text
-resolveDb = \case
-    "local" -> do
-        port <- fromMaybe "5432" <$> lookupEnv "KRONOR_PG_PORT"
-        pure [i|host=localhost port=#{port} user=kronor dbname=kronor|]
-    db -> pure db
-
-
 -- | A connection to the database the table command edits in rolled-back transactions.
 connectScratch :: Text -> IO Connection.Connection
-connectScratch name = do
-    conn <- connect =<< resolveDb name
-    requireScratch name conn
+connectScratch db = do
+    conn <- connect db
+    requireScratch (shown db) conn
     pure conn
+
+
+-- | A connection string as messages name it; the empty one is libpq's environment.
+shown :: Text -> Text
+shown db = if T.null db then "the database PGHOST, PGPORT and PGDATABASE name" else db
 
 
 -- | A database's schema over 'describeConnections' connections.
 describeDatabase :: Scope -> Text -> IO Connected
-describeDatabase scope name = do
-    db <- resolveDb name
+describeDatabase scope db = do
     tempTables <- async (either (const Nothing) id <$> tryAny (bracket (connect db) Connection.release tempTableStatements))
     (conn, extra) <- concurrently (connect db) (replicateConcurrently (describeConnections - 1) (connect db))
     (schema, addresses) <- describeOn (conn : extra) scope.excluded scope.partitions Nothing
@@ -369,10 +365,10 @@ describeDatabase scope name = do
 
 -- | Reads both databases at the same time, then the edges each command needs, given what
 -- differs, alongside the body checks; the edges of @--to@ only for 'ForPlan'.
-readBoth :: Scope -> Source -> Text -> Purpose -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
-readBoth scope from toDb purpose = do
+readBoth :: Config -> Scope -> Source -> Text -> Purpose -> IO ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
+readBoth config scope from toDb purpose = do
     toDescribed <- async (timed "describe --to" $ describeDatabase scope toDb)
-    fromDb <- timed "connInfoOf" $ connInfoOf from
+    fromDb <- timed "connInfoOf" $ connInfoOf config from
     (fromDatabase@(Connected _ _ fromSchema _ _), toDatabase@(Connected _ _ toSchema _ _)) <-
         timed "readBoth.describe" $ concurrently (timed "describe --from" $ describeDatabase scope fromDb) (wait toDescribed)
     let plainChanges = diff (\_ a b -> a == b) fromSchema toSchema
@@ -394,7 +390,7 @@ readBoth scope from toDb purpose = do
 bodyChecks :: Scope -> Text -> Schema -> Map ObjectKey Change -> IO (Map ObjectKey BodyCheck)
 bodyChecks scope toDb toSchema plainChanges
     | scope.bodyCheck == CheckBodies =
-        bracket (connect =<< resolveDb toDb) Connection.release \conn ->
+        bracket (connect toDb) Connection.release \conn ->
             timed "bodyChecks" $ checkBodies conn (Map.restrictKeys toSchema addedOrChanged)
     | otherwise = pure Map.empty
   where
@@ -414,10 +410,10 @@ source s
     | otherwise = Database s
 
 
-connInfoOf :: Source -> IO Text
-connInfoOf = \case
+connInfoOf :: Config -> Source -> IO Text
+connInfoOf config = \case
     Database db -> pure db
-    BaselineAt rev -> ensureBaseline rev
+    BaselineAt rev -> ensureBaseline config.baseline rev
 
 
 data Command
@@ -434,8 +430,8 @@ data TableOptions = TableOptions
     , drops :: Drops
     , base :: Text
     , project :: FilePath
-    , top :: FilePath
-    , planPath :: FilePath
+    , top :: Maybe FilePath
+    , planPath :: Maybe FilePath
     , tableTag :: Maybe Text
     , renames :: [(Text, Text)]
     , sameTypeSwap :: SameTypeSwap
@@ -466,8 +462,8 @@ data SameTypeSwap = AskIfRename | DropAndAdd
 
 data SqitchOptions = SqitchOptions
     { projectDir :: FilePath
-    , topDir :: FilePath
-    , planFile :: FilePath
+    , topDir :: Maybe FilePath
+    , planFile :: Maybe FilePath
     , tag :: Maybe Text
     , dryRun :: Bool
     }
@@ -479,8 +475,8 @@ main =
         . handle (\(UserError message) -> TIO.hPutStrLn stderr [i|sqiff: #{message}|] >> exitWith (ExitFailure 2))
         $ O.execParser (O.info (commandParser O.<**> O.helper) O.fullDesc)
         >>= \case
-            Describe name out replace scope -> do
-                db <- resolveDb name
+            Describe db out replace scope' -> do
+                scope <- (`withConfigured` scope') <$> loadConfig "."
                 conns <- timed "describe.connect" $ replicateConcurrently describeConnections (connect db)
                 (schema, _) <- timed "describe.describeOn" $ describeOn conns scope.excluded scope.partitions Nothing
                 case out of
@@ -488,8 +484,10 @@ main =
                     Nothing ->
                         for_ (Map.toList (Map.fromListWith (+) [(k.address.objectType, 1 :: Int) | k <- Map.keys schema])) \(kind, n) ->
                             TIO.putStrLn [i|#{n}\t#{kind}|]
-            Diff from toDb scope -> do
-                ((fromSchema, edges), (toSchema, _), checks) <- timed "readBoth" $ readBoth scope from toDb ForDiff
+            Diff from toDb scope' -> do
+                config <- loadConfig "."
+                let scope = withConfigured config scope'
+                ((fromSchema, edges), (toSchema, _), checks) <- timed "readBoth" $ readBoth config scope from toDb ForDiff
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     known = Set.fromList [k.address | k <- Map.keys fromSchema, k.aspect == Definition]
                     affectedBy = affected known edges changes
@@ -500,20 +498,25 @@ main =
                 for_ (Map.toList changes) \(key, change) -> report key change (dependentsOf key)
                 TIO.putStrLn (summary changes)
                 unless (Map.null changes) $ exitWith (ExitFailure 1)
-            Plan from toDb scope -> do
-                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope from toDb ForPlan
+            Plan from toDb scope' -> do
+                config <- loadConfig "."
+                let scope = withConfigured config scope'
+                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth config scope from toDb ForPlan
                 let steps = plan checks fromSchema toSchema fromEdges toEdges (diff (sameDefinition checks) fromSchema toSchema)
                 measure "plan.planRender" (T.length (T.unlines (map renderStep steps)))
                 for_ steps (TIO.putStrLn . renderStep)
-            Sqitch from toDb scope opts -> do
-                unless opts.dryRun requireSqitch
-                sqitchPlan <- readPlan (opts.projectDir </> opts.planFile)
-                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth scope from toDb ForPlan
+            Sqitch from toDb scope' opts -> do
+                requireSqitch
+                config <- loadConfig opts.projectDir
+                let scope = withConfigured config scope'
+                layout <- layoutOf opts.projectDir opts.topDir opts.planFile
+                sqitchPlan <- readPlan (opts.projectDir </> layout.planFile)
+                ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth config scope from toDb ForPlan
                 now <- getCurrentTime
                 let changes = diff (sameDefinition checks) fromSchema toSchema
                     steps = plan checks fromSchema toSchema fromEdges toEdges changes
                     inverseCtx = context Map.empty toSchema fromSchema toEdges (Map.map invert changes)
-                    written = units (const True) inverseCtx sqitchPlan now steps
+                    written = units config.names (const True) inverseCtx sqitchPlan now steps
                     tagName = fromMaybe (defaultTag now) opts.tag
                 measure "sqitch.planUnits" (sum [length u.deploy + length u.revert | u <- written])
                 if opts.dryRun
@@ -523,12 +526,23 @@ main =
                             changeName = u.changeName
                             note = u.note
                         TIO.putStrLn [i|#{kind}\t#{changeName}\t#{count} statements\t#{note}|]
-                    else writeUnits opts.projectDir opts.topDir sqitchPlan tagName written
+                    else writeUnits config.templates opts.projectDir layout.topDir sqitchPlan tagName written
             TableFile file db opts -> tableCommand file db opts
   where
     unexpected e = case fromException e of
         Just code -> throwIO (code :: ExitCode)
         Nothing -> TIO.hPutStrLn stderr [i|sqiff: #{displayException e}|] >> exitWith (ExitFailure 2)
+    withConfigured :: Config -> Scope -> Scope
+    withConfigured config scope = scope{excluded = config.excludeSchemas <> scope.excluded}
+
+
+-- | sqitch's top directory and plan file in @root@, unless both are given.
+layoutOf :: FilePath -> Maybe FilePath -> Maybe FilePath -> IO Layout
+layoutOf root top planFile = case (top, planFile) of
+    (Just topDir, Just given) -> pure Layout{topDir, planFile = given}
+    _ -> do
+        found <- sqitchLayout root
+        pure Layout{topDir = fromMaybe found.topDir top, planFile = fromMaybe found.planFile planFile}
 
 
 -- | What the table command works on: its options, the deploy file before and after the
@@ -539,6 +553,8 @@ data TableEnv = TableEnv
     , file :: FilePath
     , root :: FilePath
     , repo :: Repo
+    , config :: Config
+    , layout :: Layout
     , sqitchChange :: Text
     , table :: QName
     , statements :: [Text]
@@ -588,15 +604,18 @@ data Findings = Findings
 -- writes it with sqitch.
 tableCommand :: FilePath -> Text -> TableOptions -> IO ()
 tableCommand file db opts = do
-    when (opts.output == WriteMigration) requireSqitch
-    (root, absFile, changeName, table) <- locateTable file opts
+    requireSqitch
+    root <- makeAbsolute opts.project
+    config <- loadConfig root
+    layout <- layoutOf root opts.top opts.planPath
+    (absFile, changeName, table) <- locateTable config.names layout root file
     statements <- parseFile file "" =<< readFileUtf8 absFile
-    let describeWithWords = describeDatabase dependentsScope db >>= \c@(Connected _ _ schema _ _) -> (c,) <$> routineWords schema
+    let describeWithWords = describeDatabase (dependentsScope config.excludeSchemas) db >>= \c@(Connected _ _ schema _ _) -> (c,) <$> routineWords schema
         migrating = opts.fileMode == MigrateToFile
     early <- if migrating && (opts.compareWith == LiveDatabase || not (null opts.renames)) then Just <$> async describeWithWords else pure Nothing
     repo <- findRepo root
     original <- timed "table.baseFile" $ showFile repo opts.base absFile
-    let env = TableEnv{opts, db, file, root, repo, sqitchChange = changeName, table, statements, original}
+    let env = TableEnv{opts, db, file, root, repo, config, layout, sqitchChange = changeName, table, statements, original}
     if migrating
         then do
             described <- case early of
@@ -615,17 +634,17 @@ rewriteFromDatabase = do
     env <- ask
     let opts = env.opts
         table = env.table
-        deployDir = env.root </> opts.top </> "deploy"
+        deployDir = env.root </> env.layout.topDir </> "deploy"
     unless (null opts.renames) $ failWith "--rename works with the file comparison, not --rewrite-file"
     current <- readFileUtf8 env.file
     conn <- liftIO (connectScratch env.db)
     (live, liveConn) <- case opts.liveFrom of
         Nothing -> pure (SameDatabase, conn)
         Just name -> liftIO do
-            c <- connect =<< resolveDb name
+            c <- connect name
             readOnly c
             pure (OtherDatabase c, c)
-    let liveDb = fromMaybe env.db opts.liveFrom
+    let liveDb = shown (fromMaybe env.db opts.liveFrom)
     order <- liftIO (columnOrder liveConn table)
     when (null order) $ failWith [i|#{qualified table} is not in #{liveDb}; there is nothing to rewrite the file from|]
     for_ opts.liveFrom \_ -> do
@@ -636,7 +655,7 @@ rewriteFromDatabase = do
     edit <- timed "rewrite.compare" $ liftIO (compareTable conn (LiveTable live ReportDrops) table env.statements)
     ownFiles <-
         fmap Set.fromList
-            . filterM (\n -> doesFileExist (deployDir </> T.unpack table.schema </> "table" </> T.unpack table.name </> "index" </> T.unpack n <.> "sql"))
+            . filterM (\n -> doesFileExist (deployDir </> T.unpack (fill env.config.names.index [("schema", table.schema), ("table", table.name), ("name", n)]) <.> "sql"))
             $ [n | k <- Map.keys edit.current, Index q <- [fromAddress k.address], let n = q.name]
     let path = env.file
     rewrite <- either (\e -> failWith [i|#{path}: #{e}|]) pure (rewriteFile table ownFiles order edit.current edit.desired current)
@@ -660,8 +679,8 @@ rewriteFromDatabase = do
             | not (null still) -> let n = length still in failWith [i|the rewritten file still differs from the table in #{n} places; nothing written|]
             | rewrite.text == current -> say "nothing to write: the file matches the table"
             | otherwise -> do
-                sqitchPlan <- liftIO (readPlan (env.root </> opts.planPath))
-                basePlan <- liftIO (parsePlan <$> showFile env.repo opts.base (env.root </> opts.planPath))
+                sqitchPlan <- liftIO (readPlan (env.root </> env.layout.planFile))
+                basePlan <- liftIO (parsePlan <$> showFile env.repo opts.base (env.root </> env.layout.planFile))
                 now <- liftIO getCurrentTime
                 let changeName = env.sqitchChange
                     entries p = length (filter (== changeName) p.changes)
@@ -670,7 +689,7 @@ rewriteFromDatabase = do
                 if entries sqitchPlan > entries basePlan
                     then say [i|rewrote #{changeName}; the branch already reworks it|]
                     else do
-                        liftIO $ reworkEdited env.root opts.top sqitchPlan tagName changeName [i|sqiff: #{changeName} as the database has it|] current PreviousFileRuns
+                        liftIO $ reworkEdited env.root env.layout.topDir sqitchPlan tagName changeName [i|sqiff: #{changeName} as the database has it|] current PreviousFileRuns
                         say [i|rewrote and reworked #{changeName}|]
 
 
@@ -678,8 +697,7 @@ rewriteFromDatabase = do
 undeployedTouching :: Connection.Connection -> RIO TableEnv [Text]
 undeployedTouching live = do
     env <- ask
-    let opts = env.opts
-        deployDir = env.root </> opts.top </> "deploy"
+    let deployDir = env.root </> env.layout.topDir </> "deploy"
         needle = T.toLower (qualified env.table)
         touching name = do
             let path = deployDir </> T.unpack name <.> "sql"
@@ -690,7 +708,7 @@ undeployedTouching live = do
                     splitStatements <$> readFileUtf8 path <&> \case
                         Left _ -> Just [i|#{name} (its statements could not be read)|]
                         Right statements -> bool Nothing (Just name) (any (changesTableIn needle) statements)
-    planText <- readFileUtf8 (env.root </> opts.planPath)
+    planText <- readFileUtf8 (env.root </> env.layout.planFile)
     deployed <- liftIO (deployedChanges live (parsePlan planText).project)
     when (Set.null deployed) $ failWith "the live database's sqitch registry has no changes of this project"
     let pending = nubOrd [name | c@(name, _) <- plannedChanges planText, c `Set.notMember` deployed]
@@ -721,18 +739,22 @@ changesTableIn needle statement = case ws of
     named = any (\(_, rest) -> maybe True (\(c, _) -> not (isAlphaNum c || c == '_')) (T.uncons (T.drop (T.length needle) rest))) (TP.breakOnAll needle (T.toLower statement))
 
 
--- | The project root, the file's absolute path, its sqitch change and its table.
-locateTable :: FilePath -> TableOptions -> IO (FilePath, FilePath, Text, QName)
-locateTable file opts = do
-    root <- makeAbsolute opts.project
+-- | The file's absolute path, its sqitch change and its table, by the table name pattern.
+locateTable :: Names -> Layout -> FilePath -> FilePath -> IO (FilePath, Text, QName)
+locateTable names layout root file = do
     absFile <- makeAbsolute file
-    let deployDir = root </> opts.top </> "deploy"
+    let deployDir = root </> layout.topDir </> "deploy"
         relative = T.pack (makeRelative deployDir absFile)
+        pattern = names.table
     changeName <- maybe (failWith [i|#{file} is not under #{deployDir}|]) pure (T.stripSuffix ".sql" relative)
-    table <- case T.split (== '/') changeName of
-        [s, "table", t] | not ("@" `T.isInfixOf` t) -> pure (QName s t)
-        _ -> failWith [i|#{file} is not a table's own deploy file (<schema>/table/<name>.sql)|]
-    pure (root, absFile, changeName, table)
+    table <- case match pattern changeName of
+        Just values
+            | Just s <- lookup "schema" values
+            , Just t <- lookup "name" values
+            , not ("@" `T.isInfixOf` t) ->
+                pure (QName s t)
+        _ -> failWith [i|#{file} is not a table's own deploy file (#{pattern}.sql under #{deployDir})|]
+    pure (absFile, changeName, table)
 
 
 -- | A deploy file's statements; @label@ names the version in a parse error.
@@ -776,7 +798,7 @@ compareAndReport described = do
     conn <- timed "table.connect" $ liftIO (connectScratch env.db)
     edit <- timed "table.compare1" $ liftIO (compareTable conn baseline table env.statements)
     let renamedFrom = Set.fromList [columnAddress table old | (old, _) <- opts.renames]
-    deps <- timed "table.dependentsIn" $ liftIO (dependentsIn described (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom)))
+    deps <- timed "table.dependentsIn" $ liftIO (dependentsIn env.config.excludeSchemas described (edit.changes <> Map.fromSet (const (Dropped "")) (Set.map (ObjectKey Definition) renamedFrom)))
     bodies <- bodyResultsFor conn baseline deps
     let retyped = retypedColumns edit
     foreignKeyBreaks <- liftIO (foreignKeyBreaksFor conn deps retyped)
@@ -799,11 +821,11 @@ branchChangesFor = do
     if opts.compareWith == LiveDatabase
         then pure []
         else do
-            current <- liftIO (readPlan (root </> opts.planPath))
-            basePlan <- liftIO (parsePlan <$> showFile env.repo opts.base (root </> opts.planPath))
+            current <- liftIO (readPlan (root </> env.layout.planFile))
+            basePlan <- liftIO (parsePlan <$> showFile env.repo opts.base (root </> env.layout.planFile))
             let before = Set.fromList basePlan.changes
-            for (filter (\n -> n `Set.notMember` before && forTable env.table n) (nubOrd current.changes)) \n -> do
-                script <- readFileUtf8 (root </> opts.top </> "deploy" </> T.unpack n <.> "sql")
+            for (filter (\n -> n `Set.notMember` before && forTable env.config.names env.table n) (nubOrd current.changes)) \n -> do
+                script <- readFileUtf8 (root </> env.layout.topDir </> "deploy" </> T.unpack n <.> "sql")
                 (n,) . replayable <$> either (\e -> failWith [i|#{n}: #{e}|]) pure ((withoutTransactionControl <=< splitStatements) script)
 
 
@@ -921,7 +943,7 @@ findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames
     withViews c = c{viewsAround = Map.map snd around}
     aroundOf addr = fold [members | (t, c, a, _) <- retyped, a == addr, Just (members, _) <- [Map.lookup (t, c) around]]
     foreignKeysFor addr = Map.findWithDefault [] addr ev.foreignKeyBreaks
-    renameHazard = MayFail "breaks running code and Hasura metadata that still use the old name; kronor renames over two deploys with create-migration rename-column-step-1 and rename-column-step-2"
+    renameHazard = MayFail ("breaks running code that still uses the old name" <> foldMap ("; " <>) env.config.renameHint)
     renameSteps =
         [ Step DropPhase (-1) addr (Column table new) (renameSql table (old, new)) Shared [renameHazard] (ObjectKey Definition addr) (Changed def def)
         | (old, new) <- ev.pendingRenames
@@ -1033,8 +1055,8 @@ writeMigration conn baseline edit f = do
         let n = length f.blocking
         failWith [i|#{n} dependencies on what the edit drops or retypes; change or drop the dependents first|]
     unless (null f.renameLike) $ failWith "a column is dropped and another added with the same type; say whether it is a rename with --rename or --drop-and-add"
-    sqitchPlan <- timed "write.readPlan" $ liftIO (readPlan (root </> opts.planPath))
-    basePlan <- timed "write.basePlan" $ liftIO (parsePlan <$> showFile env.repo opts.base (root </> opts.planPath))
+    sqitchPlan <- timed "write.readPlan" $ liftIO (readPlan (root </> env.layout.planFile))
+    basePlan <- timed "write.basePlan" $ liftIO (parsePlan <$> showFile env.repo opts.base (root </> env.layout.planFile))
     now <- liftIO getCurrentTime
     let inverseCtx = f.withViews (context Map.empty edit.desired edit.current [] (Map.map invert edit.changes))
         renameBack =
@@ -1045,7 +1067,7 @@ writeMigration conn baseline edit f = do
             | any (`elem` f.renameSteps) u.deploy = u{revert = u.revert <> renameBack}
             | otherwise = u
         isIndex s = case s.object of Index _ -> True; _ -> False
-        written = map withRenameBack (units isIndex inverseCtx sqitchPlan now f.steps)
+        written = map withRenameBack (units env.config.names isIndex inverseCtx sqitchPlan now f.steps)
         tagName = fromMaybe (defaultTag now) opts.tableTag
         entries p = length (filter (== changeName) p.changes)
         alreadyReworked = entries sqitchPlan > entries basePlan
@@ -1054,13 +1076,13 @@ writeMigration conn baseline edit f = do
     let baseRev = opts.base
     for_ oldFileFails \err ->
         say [i|the file at #{baseRev} fails on the edited table (#{err}); the rework's revert does nothing and the migrations revert the table|]
-    timed "write.writeUnits" $ liftIO (writeUnits root opts.top sqitchPlan tagName written)
+    timed "write.writeUnits" $ liftIO (writeUnits env.config.templates root env.layout.topDir sqitchPlan tagName written)
     unless alreadyReworked do
-        afterUnits <- liftIO (readPlan (root </> opts.planPath))
+        afterUnits <- liftIO (readPlan (root </> env.layout.planFile))
         timed "write.reworkEdited"
             . liftIO
-            $ reworkEdited root opts.top afterUnits tagName changeName [i|sqiff: #{changeName} as edited|] env.original (maybe PreviousFileRuns (const PreviousFileFails) oldFileFails)
-    when alreadyReworked . liftIO $ moveToEnd (root </> opts.planPath) changeName
+            $ reworkEdited root env.layout.topDir afterUnits tagName changeName [i|sqiff: #{changeName} as edited|] env.original (maybe PreviousFileRuns (const PreviousFileFails) oldFileFails)
+    when alreadyReworked . liftIO $ moveToEnd (root </> env.layout.planFile) changeName
     for_ written \u -> let name = u.changeName in say [i|added #{name}|]
     say
         ( if alreadyReworked
@@ -1069,13 +1091,13 @@ writeMigration conn baseline edit f = do
         )
 
 
--- | Whether a sqitch change is about the table, by the names create-migration and
--- sqiff give: <schema>/table/<table>/index/…, or <schema>.<table> in a migration's name.
-forTable :: QName -> Text -> Bool
-forTable t n =
+-- | Whether a sqitch change is about the table, by the names sqiff gives: one of its
+-- indexes, or <schema>.<table> in a migration's name.
+forTable :: Names -> QName -> Text -> Bool
+forTable names t n =
     let (schema, name) = (t.schema, t.name)
         key = [i|#{schema}.#{name}|] :: Text
-        indexes = [i|#{schema}/table/#{name}/index/|] :: Text
+        indexes = fill names.index [("schema", schema), ("table", name), ("name", "")]
         padded = [i|#{n}-|] :: Text
      in indexes `T.isPrefixOf` n || any (`T.isInfixOf` padded) [[i|#{before}#{key}#{after}|] | before <- ["-", "/" :: Text], after <- [".", "-" :: Text]]
 
@@ -1110,29 +1132,39 @@ commandParser =
     tableParser =
         TableFile
             <$> O.strArgument (O.metavar "FILE" <> O.help "The table's deploy file, for example database/deploy/runtime/table/payment.sql")
-            <*> O.strOption (O.long "db" <> O.metavar "CONNINFO|local" <> O.help "A database with the table as it is now; changes are rolled back. local is the dev stack's database")
+            <*> dbOption "db" "A database with the table as it is now; changes are rolled back"
             <*> ( TableOptions
                     <$> O.flag PrintMigration WriteMigration (O.long "write" <> O.help "Add the migration with sqitch and rework the table's change")
                     <*> O.flag FileAtBase LiveDatabase (O.long "against-database" <> O.help "Compare with the live table instead of the file at --base; shows drift too")
                     <*> O.flag ReportDrops AllowDrops (O.long "allow-drops" <> O.help "With --against-database, drop columns and constraints that are not in the file")
                     <*> O.strOption (O.long "base" <> O.metavar "REV" <> O.value "master" <> O.help "Git revision with the file before your edit")
-                    <*> O.strOption (O.long "project" <> O.metavar "DIR" <> O.value ".")
-                    <*> O.strOption (O.long "top-dir" <> O.metavar "DIR" <> O.value "database")
-                    <*> O.strOption (O.long "plan-file" <> O.metavar "FILE" <> O.value "database/sqitch.plan")
+                    <*> projectOption
+                    <*> topDirOption
+                    <*> planFileOption
                     <*> O.optional (O.strOption (O.long "tag" <> O.metavar "NAME" <> O.help "Tag to add when the rework needs one"))
                     <*> O.many (O.option (O.eitherReader renameArg) (O.long "rename" <> O.metavar "OLD:NEW" <> O.help "Column OLD is renamed to NEW; repeat for more columns"))
                     <*> O.flag AskIfRename DropAndAdd (O.long "drop-and-add" <> O.help "A column dropped and one added with the same type are not a rename")
                     <*> O.flag MigrateToFile RewriteFromDatabase (O.long "rewrite-file" <> O.help "Print the file rewritten to create the table as --db has it; with --write, write it and rework the change")
-                    <*> O.optional (O.strOption (O.long "live-from" <> O.metavar "CONNINFO|local" <> O.help "With --rewrite-file, read the table from this database, read-only, instead of --db; --db still builds the file"))
+                    <*> O.optional (O.strOption (O.long "live-from" <> O.metavar "CONNINFO" <> O.help "With --rewrite-file, read the table from this database, read-only, instead of --db; --db still builds the file"))
                 )
     renameArg s = case T.split (== ':') (T.pack s) of
         [old, new] | not (T.null old), not (T.null new) -> Right (old, new)
         _ -> Left "expected OLD:NEW"
+    dbOption name help =
+        O.strOption
+            ( O.long name
+                <> O.metavar "CONNINFO"
+                <> O.value ""
+                <> O.help (help <> "; left out, libpq's PGHOST, PGPORT, PGUSER, PGDATABASE or PGSERVICE name it")
+            )
+    projectOption = O.strOption (O.long "project" <> O.metavar "DIR" <> O.value "." <> O.help "Where sqitch.conf and sqiff.yaml are")
+    topDirOption = O.optional (O.strOption (O.long "top-dir" <> O.metavar "DIR" <> O.help "sqitch's top directory; sqitch config's core.top_dir when left out"))
+    planFileOption = O.optional (O.strOption (O.long "plan-file" <> O.metavar "FILE" <> O.help "sqitch's plan; sqitch config's core.plan_file when left out"))
     sqitchOptions =
         SqitchOptions
-            <$> O.strOption (O.long "project" <> O.metavar "DIR" <> O.value "." <> O.help "Where sqitch.conf is")
-            <*> O.strOption (O.long "top-dir" <> O.metavar "DIR" <> O.value "database")
-            <*> O.strOption (O.long "plan-file" <> O.metavar "FILE" <> O.value "database/sqitch.plan")
+            <$> projectOption
+            <*> topDirOption
+            <*> planFileOption
             <*> O.optional (O.strOption (O.long "tag" <> O.metavar "NAME" <> O.help "Tag to add when a rework needs one"))
             <*> O.switch (O.long "dry-run" <> O.help "List the changes without writing them")
     twoDatabases constructor =
@@ -1141,24 +1173,22 @@ commandParser =
                 source
                 ( O.strOption
                     ( O.long "from"
-                        <> O.metavar "CONNINFO|local|master|rev:REV"
-                        <> O.help "The database to change; master or rev:REV builds or updates the baseline database at that revision and uses it; local is the dev stack's database"
+                        <> O.metavar "CONNINFO|master|rev:REV"
+                        <> O.help "The database to change; master or rev:REV builds or updates the baseline database at that revision and uses it"
                     )
                 )
-            <*> O.strOption (O.long "to" <> O.metavar "CONNINFO|local" <> O.help "The database with the desired schema; local is the dev stack's database")
+            <*> dbOption "to" "The database with the desired schema"
             <*> scopeParser
     describeParser =
         Describe
-            <$> O.strOption (O.long "db" <> O.metavar "CONNINFO|local" <> O.help "local is the dev stack's database")
+            <$> dbOption "db" "The database to read"
             <*> O.optional (O.strOption (O.long "out" <> O.metavar "DIR"))
             <*> O.flag KeepExisting ReplaceOwn (O.long "replace" <> O.help "Clear --out first, if sqiff wrote it")
             <*> scopeParser
     diffParser = twoDatabases Diff
     scopeParser =
         Scope
-            <$> fmap
-                ("hdb_catalog" :)
-                (O.many (O.strOption (O.long "exclude-schema" <> O.metavar "SCHEMA" <> O.help "Leave this schema out; Hasura's hdb_catalog always is")))
+            <$> O.many (O.strOption (O.long "exclude-schema" <> O.metavar "SCHEMA" <> O.help "Leave this schema out, besides sqiff.yaml's exclude-schemas"))
             <*> O.flag SkipPartitions IncludePartitions (O.long "include-partitions" <> O.help "Also compare partitions and their columns")
             <*> O.flag
                 CheckBodies
