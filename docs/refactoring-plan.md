@@ -294,6 +294,18 @@ Guiding rules:
   - Body checks keep their per-body rollback. An exception there ends the command and
     releases the connection.
 
+- [x] **Baseline locking and cache identity (Codex 22).**
+  - `withBaseline` replaces `ensureBaseline` and keeps a lock in the baseline's cache
+    folder for as long as the command uses the database:
+    - It brings the database up to date under an exclusive lock, then uses it under a
+      shared one, checking again after switching locks.
+    - Runs that need the same revision share it; one that needs another waits, and says
+      so.
+  - The state file records the commit and a hash of the deploy settings from
+    `sqiff.yaml` (compose file, service, user, database, environment, sqitch steps;
+    not the password). A change in those settings rebuilds from an empty volume.
+  - Not run against Docker here; only built.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

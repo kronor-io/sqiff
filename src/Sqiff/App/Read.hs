@@ -16,7 +16,7 @@ module Sqiff.App.Read (
     readBoth,
     reachableEdges,
     routineWords,
-    connInfoOf,
+    withSource,
 ) where
 
 import Data.String.Interpolate (i)
@@ -29,7 +29,7 @@ import RIO.NonEmpty (nonEmpty)
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import Sqiff.App.Env (AppEnv (..), BodyChecks (..), Scope (..), Source (..), note)
-import Sqiff.Baseline (ensureBaseline)
+import Sqiff.Baseline (withBaseline)
 import Sqiff.Body (BodyCheck, checkBodies)
 import Sqiff.Catalog (Addresses, CatalogId (..), dependenciesFrom, dependenciesOn, describeOn, edgesBetween, pgClass, pgProc)
 import Sqiff.Catalog.PlpgsqlCheck (PlFunction (..), PlFunctions (..), Skipped, analyseBodies, bodyUses, plpgsqlFunctions, tempTableStatements)
@@ -220,8 +220,7 @@ readBoth from toDb purpose = do
     env <- ask
     let scope = env.scope
     liftIO $ withDatabase scope toDb \describeTo -> withAsync (timed "describe --to" describeTo) \toDescribed -> do
-        fromDb <- timed "connInfoOf" $ connInfoOf env.config from
-        withDatabase scope fromDb \describeFrom -> do
+        withSource env.config from \fromDb -> withDatabase scope fromDb \describeFrom -> do
             (fromDatabase, toDatabase) <-
                 timed "readBoth.describe" $ concurrently (timed "describe --from" describeFrom) (wait toDescribed)
             let fromSchema = fromDatabase.schema
@@ -256,7 +255,9 @@ bodyChecks scope toDb toSchema plainChanges
     addedOrChanged = Map.keysSet (Map.filter (\case Dropped _ -> False; _ -> True) plainChanges)
 
 
-connInfoOf :: Config -> Source -> IO ConnectionString
-connInfoOf config = \case
-    Database db -> pure db
-    BaselineAt rev -> ensureBaseline config.baseline rev
+-- | Runs @action@ with the database @--from@ names, holding the baseline for it when that
+-- is what it names.
+withSource :: Config -> Source -> (ConnectionString -> IO a) -> IO a
+withSource config source action = case source of
+    Database db -> action db
+    BaselineAt rev -> timed "baseline" (withBaseline config.baseline rev action)
