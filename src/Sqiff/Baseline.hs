@@ -127,7 +127,9 @@ checkoutAt cfg repo common p commit =
 
 
 -- | Starts the server and waits until it accepts connections over TCP, which it does
--- once the init scripts are done.
+-- once the init scripts are done: the image's temporary server for them listens on the
+-- Unix socket only. The check runs in the container, so it asks its loopback, on the
+-- port the server listens on there.
 start :: BaselineConfig -> Paths -> IO ()
 start cfg p = do
     compose cfg p ["up", "-d", service]
@@ -136,7 +138,7 @@ start cfg p = do
     service = T.unpack cfg.service
     project = p.project
     awaitReady n = do
-        (code, _, _) <- readCompose cfg p ["exec", "-T", service, "pg_isready", "-q", "-h", "127.0.0.1"]
+        (code, _, _) <- readCompose cfg p ["exec", "-T", service, "pg_isready", "-q", "-h", "127.0.0.1", "-p", show cfg.containerPort]
         unless (code == ExitSuccess) do
             (_, state, _) <- readCompose cfg p ["ps", "-a", "--format", "{{.State}}", service]
             when (T.strip state `elem` ["exited", "dead"] || n >= 900)
