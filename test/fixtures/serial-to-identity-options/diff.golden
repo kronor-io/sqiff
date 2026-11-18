@@ -1,0 +1,11 @@
+dropped sequence public.t_id_seq
+  depended on by:
+    table constraint public.t.t_pkey
+changed table column public.t.id
+  - default nextval('public.t_id_seq'::regclass)
+  - rewrites the table when added
+  + identity always
+  + identity options increment by 5, start with 100, cache 10
+  depended on by:
+    table constraint public.t.t_pkey
+0 added, 1 dropped, 1 changed
