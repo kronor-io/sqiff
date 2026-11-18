@@ -48,7 +48,7 @@ import Sqiff.Sqitch (PreviousFile (..), moveToEnd, requireSqitch, reworkEdited, 
 import Sqiff.Sqitch.Check (Tagging (..))
 import Sqiff.Sqitch.Layout (Layout (..), Script (..), findLayout, planPath, scriptPath)
 import Sqiff.Sqitch.Plan (SqitchPlan (..), parsePlan, readPlan)
-import Sqiff.Sqitch.Units (Unit (..), units)
+import Sqiff.Sqitch.Units (Unit (..), slug, units)
 import Sqiff.Sql (replaceInCode)
 import Sqiff.TableEdit (Baseline (..), Live (..), TableEdit (..), TypeChange (..), aside, compareTable, firstFailure, foreignKeyError, typeChangeFacts, withEditedTable)
 import Sqiff.Timing (measure, timed)
@@ -298,13 +298,20 @@ writeMigration conn baseline edit f = do
 
 
 -- | Whether a sqitch change is about the table, by the names sqiff gives: one of its
--- indexes, or <schema>.<table> in a migration's name.
+-- indexes, or <schema>.<table> in a migration's name, which is lower-cased and has other
+-- characters made dashes ('slug').
 forTable :: Names -> QName -> Text -> Bool
 forTable names t n =
-    let key = dotted t
-        indexes = fill names.index [("schema", nameText t.schema), ("table", nameText t.name), ("name", "")]
+    let indexes = fill names.index [("schema", nameText t.schema), ("table", nameText t.name), ("name", "")]
         padded = [i|#{n}-|] :: Text
-     in indexes `T.isPrefixOf` n || any (`T.isInfixOf` padded) [[i|#{before}#{key}#{after}|] | before <- ["-", "/" :: Text], after <- [".", "-" :: Text]]
+     in indexes
+            `T.isPrefixOf` n
+            || or
+                [ [i|#{before}#{key}#{after}|] `T.isInfixOf` padded
+                | key <- nubOrd [dotted t, slug (dotted t)]
+                , before <- ["-", "/" :: Text]
+                , after <- [".", "-" :: Text]
+                ]
 
 
 -- | A migration's statements as they can run inside the comparison's transaction:

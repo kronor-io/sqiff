@@ -375,6 +375,16 @@ Guiding rules:
   - The new fixture `view-column-removed` passes every round trip. `change-view` loses
     its `revert-gap`, since its revert now recreates the view.
 
+- [x] **How the `table` command recognises a table (Codex 21, in part).**
+  - Finding the branch's migrations for a table also matches the table's name as
+    migration names write it (lower-cased, other characters made dashes).
+  - The check that `--live-from` has deployed every change touching the table now also
+    recognises `drop table` (with lists), `grant` and `revoke`, quoted names, and
+    unqualified names by the table's own name. A change that may touch the table is
+    treated as one that does.
+  - Still heuristics: a quoted name with spaces splits into words, and a search path
+    other than the table's schema is not resolved.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

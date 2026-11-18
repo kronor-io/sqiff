@@ -121,7 +121,7 @@ rewriteFrom liveFrom current conn (live, liveConn) = do
 undeployedTouching :: Connection.Connection -> RIO TableEnv [Text]
 undeployedTouching live = do
     env <- ask
-    let needle = T.toLower (qualified env.table)
+    let table = env.table
         touching name = do
             let path = scriptPath env.layout Deploy name
             exists <- doesFileExist path
@@ -130,7 +130,7 @@ undeployedTouching live = do
                 else
                     splitStatements <$> readFileUtf8 path <&> \case
                         Left _ -> Just [i|#{name} (its statements could not be read)|]
-                        Right statements -> bool Nothing (Just name) (any (changesTableIn needle) statements)
+                        Right statements -> bool Nothing (Just name) (any (changesTableIn table) statements)
     planText <- readFileUtf8 (planPath env.layout)
     deployed <- liftIO (deployedChanges live (parsePlan planText).project)
     when (Set.null deployed) $ failWith "the live database's sqitch registry has no changes of this project"
@@ -138,25 +138,37 @@ undeployedTouching live = do
     catMaybes <$> traverse touching pending
 
 
--- | Whether @statement@ changes the table @needle@ (lower-case, qualified): creates or alters
--- it, or creates or comments on something of its own. A do block counts if it names the table.
-changesTableIn :: Text -> Text -> Bool
-changesTableIn needle statement = case ws of
-    "alter" : "table" : rest -> target (dropWhile (`elem` ["if", "exists", "only"]) rest)
-    "comment" : "on" : "column" : n : _ -> T.dropWhileEnd (/= '.') (bare n) == needle <> "."
-    "comment" : "on" : "table" : rest -> target rest
+-- | Whether @statement@ changes @table@: creates, alters, drops or grants on it, or creates
+-- or comments on something of its own. A do block counts if it names the table. An
+-- unqualified name counts as the table when its name matches: a change that may touch
+-- it is treated as one that does.
+changesTableIn :: QName -> Text -> Bool
+changesTableIn table statement = case ws of
+    "alter" : "table" : rest -> first (dropWhile (`elem` ["if", "exists", "only"]) rest)
+    "drop" : "table" : rest -> anyIn (dropWhile (`elem` ["if", "exists"]) rest)
+    "comment" : "on" : "column" : n : _ -> isTable (T.dropWhileEnd (== '.') (T.dropWhileEnd (/= '.') (bare n)))
+    "comment" : "on" : "table" : rest -> first rest
     "comment" : "on" : _ -> afterOn
+    verb : _ | verb `elem` ["grant", "revoke"] -> anyIn (dropWhile (== "table") (drop 1 (dropWhile (/= "on") ws)))
     "create" : rest
         | any (`elem` ["function", "procedure", "view", "materialized"]) (take 3 rest) -> False
-        | "table" `elem` take 3 rest -> target (dropWhile (`elem` ["if", "not", "exists"]) (drop 1 (dropWhile (/= "table") rest)))
+        | "table" `elem` take 3 rest -> first (dropWhile (`elem` ["if", "not", "exists"]) (drop 1 (dropWhile (/= "table") rest)))
         | otherwise -> afterOn
     "do" : _ -> named
     _ -> False
   where
     ws = T.words (T.toLower (withoutLeadingComments statement))
     bare = T.takeWhile (`notElem` ("(;," :: String))
-    target = \case
-        n : _ -> bare n == needle
+    unquoted = T.filter (/= '"')
+    qualifiedName = T.toLower (nameText table.schema <> "." <> nameText table.name)
+    plainName = T.toLower (nameText table.name)
+    isTable n = let n' = unquoted (bare n) in n' == qualifiedName || (not ("." `T.isInfixOf` n') && n' == plainName)
+    first = \case
+        n : _ -> isTable n
         [] -> False
-    afterOn = target (dropWhile (== "only") (drop 1 (dropWhile (/= "on") ws)))
-    named = any (\(_, rest) -> maybe True (\(c, _) -> not (isAlphaNum c || c == '_')) (T.uncons (T.drop (T.length needle) rest))) (TP.breakOnAll needle (T.toLower statement))
+    -- A list of names, up to the word after it.
+    anyIn = any isTable . concatMap (filter (not . T.null) . T.split (== ',')) . takeWhile (`notElem` ["to", "from", "cascade", "restrict"])
+    afterOn = first (dropWhile (== "only") (drop 1 (dropWhile (/= "on") ws)))
+    named = any mentions (nubOrd [qualifiedName, T.toLower (qualified table), plainName])
+    mentions needle = any (\(before, rest) -> boundary (T.takeEnd 1 before) && boundary (T.take 1 (T.drop (T.length needle) rest))) (TP.breakOnAll needle (T.toLower statement))
+    boundary t = maybe True (\(c, _) -> not (isAlphaNum c || c == '_' || c == '.')) (T.uncons t)

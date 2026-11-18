@@ -9,6 +9,7 @@ module Sqiff.Sqitch.Units (
     Placement (..),
     Unit (..),
     units,
+    slug,
     Shape (..),
     shapeOf,
     templateOf,

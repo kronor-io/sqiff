@@ -21,6 +21,8 @@ import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import Sqiff.App.Options (Comparison (..), MigrateOptions (..), Output (..), SameTypeSwap (..), TableFlags (..), TableMode (..), TableOptions (..), tableOptions)
+import Sqiff.App.Table (forTable)
+import Sqiff.App.Table.Rewrite (changesTableIn)
 import Sqiff.Config (fill, match)
 import Sqiff.ConnectionString (connectionString, fromPairs, libpqText, redacted)
 import Sqiff.Definition hiding (columns)
@@ -513,6 +515,36 @@ sqitchChecks =
             let object = Type (typeName "app.mood")
                 manual = Step CreatePhase 8 object "-- only adding enum values is automated" Shared [Manual "only adding enum values is automated"] (ObjectKey Definition object) (Changed (Printed "a") (Printed "b")) UndoObject
             ("raise exception" `T.isInfixOf` renderScript "-- deploy" Migration [manual]) @?= True
+        , testCase "a table's migrations are found by its name as migration names write it" do
+            let names = either error id (Aeson.eitherDecode "{}")
+                ours = forTable names (qname "App" "Big Orders")
+            ours "migrations/2026/11/2026-11-18-120000-add-column-app.big-orders.total" @?= True
+            ours "migrations/2026/11/2026-11-18-120000-add-column-app.big-ordersx" @?= False
+            ours "App/table/Big Orders/index/total_idx" @?= True
+        , testCase "which statements change a table" do
+            let changes = changesTableIn (qname "app" "orders")
+            for_
+                [ "alter table app.orders add column x int"
+                , "ALTER TABLE IF EXISTS ONLY app.orders drop column x"
+                , "drop table if exists app.other, app.orders cascade"
+                , "drop table orders"
+                , "alter table \"app\".\"orders\" add column y int"
+                , "grant select on table app.orders to reader"
+                , "revoke all on app.orders from reader"
+                , "comment on column app.orders.total is 'x'"
+                , "create index orders_total on app.orders (total)"
+                , "create table if not exists app.orders (id int)"
+                , "do $ begin perform 1 from app.orders; end $"
+                ]
+                \statement -> (statement, changes statement) @?= (statement, True)
+            for_
+                [ "alter table app.orders_archive add column x int"
+                , "drop table other.orders"
+                , "create view app.v as select * from app.orders"
+                , "grant select on app.order_lines to reader"
+                , "do $ begin perform 1 from app.orders_archive; end $"
+                ]
+                \statement -> (statement, changes statement) @?= (statement, False)
         , testCase "overloads of a new function make one change" do
             let names = either error id (Aeson.eitherDecode "{}")
                 ctx = context Map.empty Map.empty Map.empty [] Map.empty
