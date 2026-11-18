@@ -132,6 +132,13 @@ context checks fromSchema toSchema fromEdges changes =
                 , let grantsKey = k{aspect = Privileges}
                 , MaterializedView v <- [k.object]
                 ]
+        , keptComments =
+            Map.fromList
+                [ (k.object, printed def)
+                | (k, def) <- Map.toList toSchema
+                , k.aspect == Comment
+                , k `Map.notMember` changes
+                ]
         , newTables = tablesWith isAdded
         , droppedTables = tablesWith isDropped
         , partitionedTables =
@@ -159,10 +166,11 @@ context checks fromSchema toSchema fromEdges changes =
   where
     definitions = [(k.object, change) | (k, change) <- Map.toList changes, k.aspect == Definition]
     indexesOn v =
-        [ def.statement
+        [ (q, def.statement)
         | (k, IndexDefinition def) <- Map.toList toSchema
         , k.aspect == Definition
         , k `Map.notMember` changes
+        , Index q <- [k.object]
         , def.table == v
         ]
     tablesWith p = Set.fromList [t | (Table t, change) <- definitions, p change]

@@ -229,6 +229,20 @@ Guiding rules:
     their columns in different orders does not show as changed.
   - The rest of finding 28 (ownership, inheritance, range-type options) is open.
 
+- [x] **Recreated objects keep their comments (Codex 10).**
+  - A comment belongs to the object it is on, so dropping and creating an object again
+    lost it. The diff saw no comment change, so nothing restored it.
+  - The context now carries the desired database's unchanged comments (`keptComments`).
+    Every recipe that drops and recreates an object restores those of what it dropped:
+    - a materialized view, its columns and its indexes
+    - an index rebuilt under a temporary name or dropped and created again
+    - table constraints, with their index, and domain constraints
+    - triggers and policies dropped and created again
+  - The restoring steps carry the recreated object's key, so a sqitch unit's revert
+    stays the inverse of the definition change.
+  - The new fixture `recreate-keeps-comments` loses all eight comments on the previous
+    commit.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

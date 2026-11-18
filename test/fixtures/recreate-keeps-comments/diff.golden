@@ -1,0 +1,22 @@
+changed domain constraint app.code(code_short)
+  - CHECK ((length(VALUE) < 10))
+  + CHECK ((length(VALUE) < 12))
+changed index app.orders_amount
+  - CREATE INDEX orders_amount ON app.orders USING btree (amount)
+  + CREATE INDEX orders_amount ON app.orders USING btree (amount DESC)
+changed materialized view app.totals
+  -     sum(amount) AS total
+  +     sum(amount) AS total,
+  +     count(*) AS orders
+  depended on by:
+    index app.totals_status
+changed policy app.orders.open_orders
+  - using ((status = 'open'::text))
+  + using ((status = ANY (ARRAY['open'::text, 'new'::text])))
+changed table constraint app.orders.amount_positive
+  - CHECK ((amount > (0)::numeric))
+  + CHECK ((amount >= (1)::numeric))
+changed trigger app.orders.orders_touch
+  - CREATE CONSTRAINT TRIGGER orders_touch AFTER INSERT ON app.orders NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION app.touch()
+  + CREATE CONSTRAINT TRIGGER orders_touch AFTER INSERT OR UPDATE ON app.orders NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION app.touch()
+0 added, 0 dropped, 6 changed

@@ -1,0 +1,103 @@
+-- table constraint app.orders.amount_positive
+alter table app.orders drop constraint amount_positive;
+
+-- domain constraint app.code(code_short)
+alter domain app.code drop constraint code_short;
+
+-- materialized view app.totals
+-- hazard: fails when other objects depend on it
+drop materialized view app.totals;
+
+-- materialized view app.totals
+-- hazard: holds an ACCESS EXCLUSIVE lock, which blocks reads and writes, while it runs
+create materialized view app.totals as
+SELECT status,
+    sum(amount) AS total,
+    count(*) AS orders
+   FROM app.orders
+  GROUP BY status;
+
+-- materialized view app.totals
+-- hazard: builds an index
+CREATE UNIQUE INDEX totals_status ON app.totals USING btree (status);
+
+-- table constraint app.orders.amount_positive
+alter table app.orders add constraint amount_positive CHECK ((amount >= (1)::numeric)) NOT VALID;
+
+-- table constraint app.orders.amount_positive
+-- own transaction
+alter table app.orders validate constraint amount_positive;
+
+-- domain constraint app.code(code_short)
+alter domain app.code add constraint code_short CHECK ((length(VALUE) < 12)) NOT VALID;
+
+-- domain constraint app.code(code_short)
+-- own transaction
+alter domain app.code validate constraint code_short;
+
+-- index app.orders_amount
+-- outside a transaction
+-- hazard: builds an index
+do $$
+begin
+    if exists (
+        select from pg_index
+        where indexrelid = to_regclass('app.orders_amount_new') and not indisvalid
+    ) then
+        raise exception using message = 'index app.orders_amount_new is invalid from an earlier failed build; drop it first';
+    end if;
+end
+$$;
+
+CREATE INDEX CONCURRENTLY orders_amount_new ON app.orders USING btree (amount DESC);
+
+-- index app.orders_amount
+-- outside a transaction
+drop index concurrently if exists app.orders_amount;
+
+-- index app.orders_amount
+alter index app.orders_amount_new rename to orders_amount;
+
+-- trigger app.orders.orders_touch
+drop trigger orders_touch on app.orders;
+
+-- trigger app.orders.orders_touch
+CREATE CONSTRAINT TRIGGER orders_touch AFTER INSERT OR UPDATE ON app.orders NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION app.touch();
+
+-- policy app.orders.open_orders
+drop policy open_orders on app.orders;
+
+-- policy app.orders.open_orders
+create policy open_orders on app.orders
+as permissive
+for all
+to public
+using ((status = ANY (ARRAY['open'::text, 'new'::text])));
+
+-- materialized view app.totals
+do $$ declare g text; begin for g in select distinct case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end from pg_class c cross join aclexplode(c.relacl) x where c.oid = 'app.totals'::regclass and x.grantee <> c.relowner loop execute format('revoke all on table %s from %s', 'app.totals', g); end loop; end $$;
+
+-- materialized view app.totals
+comment on index app.totals_status is 'one row per status';
+
+-- materialized view app.totals
+comment on materialized view app.totals is 'totals per status';
+
+-- materialized view app.totals
+comment on column app.totals.total is 'sum of amounts';
+
+-- table constraint app.orders.amount_positive
+comment on constraint amount_positive on app.orders is 'no free orders';
+
+-- domain constraint app.code(code_short)
+comment on constraint code_short on domain app.code is 'codes are short';
+
+-- index app.orders_amount
+comment on index app.orders_amount is 'for range scans';
+
+-- trigger app.orders.orders_touch
+comment on trigger orders_touch on app.orders is 'checks inserts';
+
+-- policy app.orders.open_orders
+comment on policy open_orders on app.orders is 'only open orders';
+

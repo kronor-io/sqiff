@@ -107,9 +107,12 @@ data Context = Context
     -- ^ Body checks, with the definition each was made for.
     , withDependents :: Set ObjectId
     -- ^ Objects that something else depends on, in the database being changed.
-    , recreatedViews :: Map QName ([Text], Maybe (ObjectKey, Definition))
-    -- ^ Materialized views dropped and created again, with the index definitions and
-    -- privileges to restore on them.
+    , recreatedViews :: Map QName ([(QName, Text)], Maybe (ObjectKey, Definition))
+    -- ^ Materialized views dropped and created again, with the indexes (name and
+    -- definition) and privileges to restore on them.
+    , keptComments :: Map ObjectId Text
+    -- ^ The desired database's comments that do not change, which an object dropped and
+    -- created again gets back.
     , viewsAround :: Map (QName, Identifier) ([Text], [Text])
     -- ^ For a column whose type changes, the statements that drop the views reading it
     -- and the ones that create them again, with their grants, indexes, triggers and comments.
@@ -212,6 +215,14 @@ definition ctx key object change = case object of
     createAt rank (txn, hazards) sql = Step CreatePhase rank object sql txn hazards key change
     remove (txn, hazards) sql = Step DropPhase (dropRank object) object sql txn hazards key change
     manual why = [create (Shared, [Manual why]) ("-- " <> why)]
+    -- The unchanged comments of what this step drops and creates again: they go with
+    -- the old object, and nothing else in the plan sets them.
+    restoreComments objects =
+        [ createAt commentRank (Shared, []) ("comment on " <> subject <> " is " <> literal text)
+        | o <- objects
+        , Just text <- [Map.lookup o ctx.keptComments]
+        , Just subject <- [commentTarget o]
+        ]
     noRecipe = [create (Shared, [Manual "no recipe for this kind of object"]) ("-- " <> T.pack (show textual))]
     -- The change as the kind of definition this recipe reads; a definition of another
     -- kind is the catalog's mistake, left to a person.
@@ -405,7 +416,7 @@ end |]
         Changed old new
             | validates old new -> [create (Own, []) (alterT <> "validate constraint " <> quoted c)]
             | validates new old -> manual "a validated constraint cannot be made NOT VALID again"
-            | otherwise -> dropConstraint old : addConstraint new
+            | otherwise -> dropConstraint old : addConstraint new <> restoreComments [TableConstraint t c, Index (QName t.schema c)]
       where
         alterT = [i|alter table #{qualified t} |]
         dropConstraint old =
@@ -446,7 +457,7 @@ end |]
         Changed old new
             | validates old new -> [validate]
             | validates new old -> manual "a validated constraint cannot be made NOT VALID again"
-            | otherwise -> remove (Shared, []) (alterD <> "drop constraint " <> quoted c) : add new
+            | otherwise -> remove (Shared, []) (alterD <> "drop constraint " <> quoted c) : add new <> restoreComments [DomainConstraint d c]
       where
         alterD = [i|alter domain #{typeText d} |]
         validate = create (Own, []) (alterD <> "validate constraint " <> quoted c)
@@ -460,11 +471,13 @@ end |]
             | def.table `Set.member` ctx.droppedTables -> []
             | def.partitioned -> [remove (Shared, [LongLock]) ("drop index " <> qualified ix)]
             | otherwise -> [remove (None, []) ("drop index concurrently " <> qualified ix)]
-        Changed old new
-            | new.partitioned || old.partitioned -> remove (Shared, [LongLock]) ("drop index " <> qualified ix) : addIndex new
-            | namesAlteredColumnOf (== old.table) old.statement ->
+        Changed old new -> replaceIndex old new <> restoreComments [Index ix]
+      where
+        replaceIndex old new
+            | new.partitioned || old.partitioned = remove (Shared, [LongLock]) ("drop index " <> qualified ix) : addIndex new
+            | namesAlteredColumnOf (== old.table) old.statement =
                 remove (None, []) ("drop index concurrently if exists " <> qualified ix) : addIndex new
-            | otherwise ->
+            | otherwise =
                 let tmp = identifier (takeBytes 59 (nameText ix.name) <> "_new")
                     oldName = quoted ix.name
                  in [ create
@@ -473,7 +486,6 @@ end |]
                     , create (None, []) ("drop index concurrently if exists " <> qualified ix)
                     , create (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
                     ]
-      where
         addIndex def
             | def.partitioned =
                 [ create (Shared, []) def.statement
@@ -560,21 +572,23 @@ end |]
             , create (Shared, [LongLock]) ("create materialized view " <> viewSql v new)
             ]
                 <> restoreOnView v
+                <> restoreComments (MaterializedView v : [o | o@(OtherColumn OfMaterializedView t _) <- Map.keys ctx.keptComments, t == v])
         Dropped _ -> [remove (Shared, []) ("drop materialized view " <> qualified v)]
 
     restoreOnView v = case Map.lookup v ctx.recreatedViews of
         Nothing -> []
         Just (indexes, grants) ->
-            [create (Shared, [IndexBuild]) def | def <- indexes]
+            [create (Shared, [IndexBuild]) def | (_, def) <- indexes]
+                <> restoreComments [Index q | (q, _) <- indexes]
                 <> [createAt privilegesRank (Shared, []) (revokeGranted (qualified v)) | isJust grants]
                 <> maybe [] (\(k, def) -> privileges k k.object (Added def)) grants
 
     trigger t n = case textual of
         Added def -> [create (Shared, []) def]
         Changed old new
-            | namesAlteredColumn t old -> [dropTrigger DropPhase, create (Shared, []) new]
+            | namesAlteredColumn t old -> [dropTrigger DropPhase, create (Shared, []) new] <> restoreComments [Trigger t n]
             | Just rest <- T.stripPrefix "CREATE TRIGGER " new -> [create (Shared, []) ("CREATE OR REPLACE TRIGGER " <> rest)]
-            | otherwise -> [dropTrigger CreatePhase, create (Shared, []) new]
+            | otherwise -> [dropTrigger CreatePhase, create (Shared, []) new] <> restoreComments [Trigger t n]
         Dropped _ -> [dropTrigger DropPhase]
       where
         dropTrigger phase =
@@ -583,8 +597,8 @@ end |]
     policy t n = case textual of
         Added def -> [createPolicy def]
         Changed old new
-            | namesAlteredColumn t old -> [remove (Shared, []) dropPolicy, createPolicy new]
-            | otherwise -> [create (Shared, []) dropPolicy, createPolicy new]
+            | namesAlteredColumn t old -> [remove (Shared, []) dropPolicy, createPolicy new] <> restoreComments [Policy t n]
+            | otherwise -> [create (Shared, []) dropPolicy, createPolicy new] <> restoreComments [Policy t n]
         Dropped _ -> [remove (Shared, []) dropPolicy]
       where
         dropPolicy = "drop policy " <> quoted n <> " on " <> qualified t
@@ -642,7 +656,7 @@ privileges key object change = case (target, traverse asAcl change) of
 
 
 comment :: Context -> ObjectKey -> Change Definition -> [Step]
-comment ctx key change = case (target, printed <$> change) of
+comment ctx key change = case (commentTarget key.object, printed <$> change) of
     (Nothing, _) -> []
     (Just _, Dropped _) | key.object `Set.member` ctx.droppedObjects -> []
     (Just subject, Dropped _) -> [step (subject <> " is null")]
@@ -650,26 +664,30 @@ comment ctx key change = case (target, printed <$> change) of
     (Just subject, Changed _ new) -> [step (subject <> " is " <> literal new)]
   where
     step sql = Step CreatePhase commentRank key.object ("comment on " <> sql) Shared [] key change
-    target = case key.object of
-        Table t -> Just ("table " <> qualified t)
-        View t -> Just ("view " <> qualified t)
-        MaterializedView t -> Just ("materialized view " <> qualified t)
-        Column t c -> Just ("column " <> qualified t <> "." <> quoted c)
-        OtherColumn OfView t c -> Just ("column " <> qualified t <> "." <> quoted c)
-        OtherColumn OfMaterializedView t c -> Just ("column " <> qualified t <> "." <> quoted c)
-        Index ix -> Just ("index " <> qualified ix)
-        Sequence s -> Just ("sequence " <> qualified s)
-        TableConstraint t c -> Just ("constraint " <> quoted c <> " on " <> qualified t)
-        DomainConstraint d c -> Just ("constraint " <> quoted c <> " on domain " <> typeText d)
-        Trigger t n -> Just ("trigger " <> quoted n <> " on " <> qualified t)
-        Policy t n -> Just ("policy " <> quoted n <> " on " <> qualified t)
-        Routine Function q args -> Just [i|function #{qualified q}(#{argList args})|]
-        Routine Procedure q args -> Just [i|procedure #{qualified q}(#{argList args})|]
-        Routine Aggregate q args -> Just [i|aggregate #{qualified q}(#{argList args})|]
-        Type t -> Just ("type " <> typeText t)
-        Schema s -> Just ("schema " <> quoted s)
-        Extension e -> Just ("extension " <> quoted e)
-        _ -> Nothing
+
+
+-- | What @comment on@ names the object as.
+commentTarget :: ObjectId -> Maybe Text
+commentTarget = \case
+    Table t -> Just ("table " <> qualified t)
+    View t -> Just ("view " <> qualified t)
+    MaterializedView t -> Just ("materialized view " <> qualified t)
+    Column t c -> Just ("column " <> qualified t <> "." <> quoted c)
+    OtherColumn OfView t c -> Just ("column " <> qualified t <> "." <> quoted c)
+    OtherColumn OfMaterializedView t c -> Just ("column " <> qualified t <> "." <> quoted c)
+    Index ix -> Just ("index " <> qualified ix)
+    Sequence s -> Just ("sequence " <> qualified s)
+    TableConstraint t c -> Just ("constraint " <> quoted c <> " on " <> qualified t)
+    DomainConstraint d c -> Just ("constraint " <> quoted c <> " on domain " <> typeText d)
+    Trigger t n -> Just ("trigger " <> quoted n <> " on " <> qualified t)
+    Policy t n -> Just ("policy " <> quoted n <> " on " <> qualified t)
+    Routine Function q args -> Just [i|function #{qualified q}(#{argList args})|]
+    Routine Procedure q args -> Just [i|procedure #{qualified q}(#{argList args})|]
+    Routine Aggregate q args -> Just [i|aggregate #{qualified q}(#{argList args})|]
+    Type t -> Just ("type " <> typeText t)
+    Schema s -> Just ("schema " <> quoted s)
+    Extension e -> Just ("extension " <> quoted e)
+    _ -> Nothing
 
 
 -- | A routine's argument types, as its signature lists them.
