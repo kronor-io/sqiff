@@ -1,0 +1,1 @@
+plan has no recipe for the views on a retyped column: the view handling (viewsAroundTypeChanges) lives in the table command only, so plan's Context.viewsAround is always empty

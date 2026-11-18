@@ -1,0 +1,6 @@
+changed table column public.t.amount
+  - type integer
+  + type bigint
+  depended on by:
+    view public.v
+0 added, 0 dropped, 1 changed

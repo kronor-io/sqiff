@@ -1,0 +1,6 @@
+-- table column public.t.score
+alter table public.t add column score numeric(10,2);
+
+-- table column public.t.status
+alter table public.t add column status text not null default 'new'::text;
+

@@ -1,0 +1,27 @@
+-- table public.t
+grant SELECT on table public.t to reader;
+
+-- table public.t
+grant DELETE on table public.t to sqiff;
+
+-- table public.t
+grant INSERT on table public.t to sqiff;
+
+-- table public.t
+grant MAINTAIN on table public.t to sqiff;
+
+-- table public.t
+grant REFERENCES on table public.t to sqiff;
+
+-- table public.t
+grant SELECT on table public.t to sqiff;
+
+-- table public.t
+grant TRIGGER on table public.t to sqiff;
+
+-- table public.t
+grant TRUNCATE on table public.t to sqiff;
+
+-- table public.t
+grant UPDATE on table public.t to sqiff;
+

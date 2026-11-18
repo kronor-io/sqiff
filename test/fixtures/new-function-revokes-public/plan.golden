@@ -1,0 +1,9 @@
+-- function public.secret
+CREATE OR REPLACE FUNCTION public.secret()
+ RETURNS integer
+ LANGUAGE sql
+AS $function$ select 42 $function$;
+
+-- function public.secret
+grant EXECUTE on function public.secret() to sqiff;
+

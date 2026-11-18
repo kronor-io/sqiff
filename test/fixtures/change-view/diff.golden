@@ -1,0 +1,5 @@
+changed view public.v
+  -     a
+  +     a,
+  +     b
+0 added, 0 dropped, 1 changed

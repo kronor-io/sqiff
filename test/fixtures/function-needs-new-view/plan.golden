@@ -1,0 +1,13 @@
+-- function public.total
+CREATE OR REPLACE FUNCTION public.total()
+ RETURNS bigint
+ LANGUAGE sql
+ STABLE
+AS $function$ select sum(a) from public.v $function$;
+
+-- view public.v
+create view public.v as
+SELECT id,
+    a
+   FROM public.t;
+

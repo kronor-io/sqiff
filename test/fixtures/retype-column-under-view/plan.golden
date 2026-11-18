@@ -1,0 +1,6 @@
+-- table column public.t.amount
+-- hazard: may rewrite the table
+-- hazard: holds an ACCESS EXCLUSIVE lock, which blocks reads and writes, while it runs
+-- hazard: fails when an existing value does not convert to the new type
+alter table public.t alter column amount type bigint using amount::bigint;
+

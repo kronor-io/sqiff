@@ -1,0 +1,13 @@
+-- table app.account
+create table app.account (
+    created_at timestamp with time zone not null default now(),
+    email text not null,
+    id bigint generated always as identity not null
+);
+
+-- table constraint app.account.account_email_key
+alter table app.account add constraint account_email_key UNIQUE (email);
+
+-- table constraint app.account.account_pkey
+alter table app.account add constraint account_pkey PRIMARY KEY (id);
+

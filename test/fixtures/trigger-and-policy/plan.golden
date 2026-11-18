@@ -1,0 +1,13 @@
+-- trigger public.t.t_touch
+CREATE TRIGGER t_touch BEFORE UPDATE ON public.t FOR EACH ROW EXECUTE FUNCTION public.touch();
+
+-- policy public.t.own
+create policy own on public.t
+as permissive
+for all
+to public
+using ((owner = CURRENT_USER));
+
+-- table public.t
+alter table public.t enable row level security;
+

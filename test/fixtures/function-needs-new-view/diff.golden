@@ -1,0 +1,5 @@
+added   function public.total
+added   view public.v
+added   function public.total (privileges)
+added   view public.v (privileges)
+4 added, 0 dropped, 0 changed

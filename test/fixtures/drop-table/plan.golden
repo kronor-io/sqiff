@@ -1,0 +1,4 @@
+-- table public.gone
+-- hazard: deletes data
+drop table public.gone;
+

@@ -70,6 +70,14 @@ nix build .#sqiff
 
 Inside kronor's dev shell, `cabal build` works too: the shell's GHC already has every dependency at the versions in `cabal.project.freeze`.
 
+## Tests
+
+```bash
+cabal test
+```
+
+The unit tests are pure. The integration tests start a throwaway PostgreSQL cluster (`initdb` from `PATH`, or the directory in `SQIFF_TEST_PG_BIN`), and for each directory under `test/fixtures` they build `from.sql` and `to.sql` and compare `sqiff diff` and `sqiff plan` with the golden files. They then apply the plan to `from` and expect `diff` to find nothing left. A `known-bug` file marks a fixture that fails today and says why. Refresh golden files with `cabal test --test-options=--accept`.
+
 ## Needs at run time
 
 `git` and `sqitch`, and `docker` for `--from`. The database needs plpgsql_check for the PL/pgSQL body checks; without it they are skipped with a note.

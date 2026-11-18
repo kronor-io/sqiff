@@ -77,3 +77,35 @@ executable sqiff
     , string-interpolate
     , text
     , time
+
+test-suite sqiff-test
+  import:             shared
+  type:               exitcode-stdio-1.0
+  hs-source-dirs:     test
+  main-is:            Main.hs
+  other-modules:
+    Integration
+    Postgres
+    Unit
+
+  ghc-options:        -threaded -rtsopts -with-rtsopts=-N4
+  build-tool-depends: sqiff:sqiff
+  build-depends:
+    , base
+    , bytestring
+    , containers
+    , directory
+    , filepath
+    , hasql
+    , hedgehog
+    , rio
+    , sqiff
+    , string-interpolate
+    , tasty
+    , tasty-expected-failure
+    , tasty-golden
+    , tasty-hedgehog
+    , tasty-hunit
+    , temporary
+    , text
+    , typed-process

@@ -1,0 +1,4 @@
+-- table column public.t.legacy
+-- hazard: deletes data
+alter table public.t drop column legacy;
+

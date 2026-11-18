@@ -1,0 +1,7 @@
+-- table constraint public.t.qty_positive
+alter table public.t add constraint qty_positive CHECK ((qty > 0)) NOT VALID;
+
+-- table constraint public.t.qty_positive
+-- own transaction
+alter table public.t validate constraint qty_positive;
+

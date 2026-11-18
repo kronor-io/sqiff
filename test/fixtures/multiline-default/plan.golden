@@ -1,0 +1,3 @@
+-- table column public.t.note
+alter table public.t add column note line two'::text default 'line one;
+

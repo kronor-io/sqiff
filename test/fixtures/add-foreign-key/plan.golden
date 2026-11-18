@@ -1,0 +1,8 @@
+-- table constraint public.child.child_parent_id_fkey
+-- hazard: also locks public.parent while it runs
+alter table public.child add constraint child_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id) ON DELETE CASCADE NOT VALID;
+
+-- table constraint public.child.child_parent_id_fkey
+-- own transaction
+alter table public.child validate constraint child_parent_id_fkey;
+

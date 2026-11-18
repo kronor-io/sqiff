@@ -1,0 +1,1 @@
+ACL lines are split on the first space, so the role "report readers" becomes "report" (privileges.sql, Recipe aclParts)

@@ -1,0 +1,7 @@
+-- function public.add(integer, integer)
+CREATE OR REPLACE FUNCTION public.add(a integer, b integer)
+ RETURNS integer
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$ select a + b + 0 $function$;
+

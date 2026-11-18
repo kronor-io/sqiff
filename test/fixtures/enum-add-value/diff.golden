@@ -1,0 +1,4 @@
+changed type public.mood
+  - enum ('sad', 'happy')
+  + enum ('sad', 'ok', 'happy')
+0 added, 0 dropped, 1 changed

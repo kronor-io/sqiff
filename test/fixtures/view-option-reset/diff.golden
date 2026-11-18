@@ -1,0 +1,3 @@
+changed view public.v
+  - with (security_barrier=true)
+0 added, 0 dropped, 1 changed

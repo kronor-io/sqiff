@@ -1,0 +1,6 @@
+dropped table public.gone
+dropped table column public.gone.id
+dropped table column public.gone.note
+dropped table constraint public.gone.gone_pkey
+dropped table public.gone (privileges)
+0 added, 5 dropped, 0 changed
