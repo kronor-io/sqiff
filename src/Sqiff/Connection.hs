@@ -74,19 +74,30 @@ inRolledBackTransaction conn label action = do
 -- snapshot, exported by the first, so reads spread over them see one state of the
 -- database. The transactions are rolled back afterwards.
 withSharedSnapshot :: NonEmpty Connection.Connection -> IO a -> IO a
-withSharedSnapshot conns@(first :| rest) action = do
-    script first "begin isolation level repeatable read"
-    snapshot <-
-        ( Connection.use first (Session.statement () [singletonStatement| select pg_export_snapshot()::text |])
-            >>= either (\e -> failWith [i|could not share a snapshot: #{errorText e}|]) pure
+withSharedSnapshot conns@(exporter :| rest) action = do
+    -- The connections whose transaction started, to roll back if anything fails. When the
+    -- thread is cancelled instead, hasql has aborted them already and the connections are
+    -- about to be released.
+    started <- newIORef []
+    let begin c sql = do
+            script c sql
+            atomicModifyIORef' started (\cs -> (c : cs, ()))
+        rollbackStarted e =
+            unless (isAsyncException (e :: SomeException))
+                $ readIORef started
+                >>= traverse_ (\c -> tryAny (Connection.use c (Session.script "rollback")))
+    ( do
+            begin exporter "begin isolation level repeatable read"
+            snapshot <-
+                Connection.use exporter (Session.statement () [singletonStatement| select pg_export_snapshot()::text |])
+                    >>= either (\e -> failWith [i|could not share a snapshot: #{errorText e}|]) pure
+            for_ rest \c -> begin c [i|begin isolation level repeatable read; set transaction snapshot '#{snapshot}'|]
         )
-            `onException` rollbackAll
-    for_ rest (\c -> script c [i|begin isolation level repeatable read; set transaction snapshot '#{snapshot}'|]) `onException` rollbackAll
-    result <- action `onException` rollbackAll
+        `withException` rollbackStarted
+    result <- action `withException` rollbackStarted
     for_ conns (`script` "rollback")
     pure result
   where
-    rollbackAll = for_ conns \c -> tryAny (Connection.use c (Session.script "rollback"))
     script :: Connection.Connection -> Text -> IO ()
     script c sql = Connection.use c (Session.script sql) >>= either (\e -> failWith [i|#{sql} failed: #{errorText e}|]) pure
 

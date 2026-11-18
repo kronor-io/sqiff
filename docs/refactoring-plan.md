@@ -393,6 +393,16 @@ Guiding rules:
     PostgreSQL does.
   - The new fixture `collation-in-schema` covers it.
 
+- [x] **Owned sequences in another schema (Codex 18, second half): not possible.**
+  PostgreSQL refuses `alter sequence … owned by` across schemas ("sequence must be in
+  same schema as table it is linked to"), so moving a table aside and back cannot meet
+  one. The first half, the global `sqiff_aside.` replace, stays as Phase 4 explains.
+
+- [x] **No stray warnings when a command stops early.** When an error cancels the
+  background description, hasql aborts its transactions itself. `withSharedSnapshot` no
+  longer rolls them back again on cancellation, which printed "there is no transaction
+  in progress" once per connection. It still rolls back on ordinary errors.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**
