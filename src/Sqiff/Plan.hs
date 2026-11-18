@@ -158,6 +158,15 @@ context checks fromSchema toSchema fromEdges changes =
                 ]
         , viewsAround = Map.empty
         , droppedObjects = Set.fromList [k.object | (k, Dropped _) <- Map.toList changes, k.aspect == Definition]
+        , convertedSequences =
+            Set.fromList
+                [ s
+                | (Sequence s, change) <- definitions
+                , Just def <- [asSequence (case change of Added d -> d; Dropped d -> d; Changed _ d -> d)]
+                , Just (t, c) <- [def.ownedBy]
+                , Just (Changed (ColumnDefinition old) (ColumnDefinition new)) <- [lookup (Column t c) definitions]
+                , isJust (identityKindOf old) /= isJust (identityKindOf new)
+                ]
         , newTableColumns =
             Map.map (L.sortOn (\(_, def) -> positionNumber def.position))
                 . Map.fromListWith (flip (<>))

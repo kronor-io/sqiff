@@ -131,6 +131,9 @@ data Context = Context
     -- ^ For a column whose type changes, the statements that drop the views reading it
     -- and the ones that create them again, with their grants, indexes, triggers and comments.
     , droppedObjects :: Set ObjectId
+    , convertedSequences :: Set QName
+    -- ^ Sequences a column's change between serial and identity drops or creates, in
+    -- the one step that changes the column.
     }
 
 
@@ -519,11 +522,17 @@ end |]
             | otherwise = [builds ix $ create (None, [IndexBuild]) (concurrentBuild ix (replaceInCode " INDEX " " INDEX CONCURRENTLY " def.statement))]
 
     sequenceRecipe s = typed asSequence \case
+        -- Made by the column's change to serial; it only needs its options.
+        Added def
+            | s `Set.member` ctx.convertedSequences ->
+                [createAt sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions def <> " owned by " <> maybe "none" ownerSql def.ownedBy)]
         Added def ->
             create (Shared, []) ("create sequence " <> qualified s <> " " <> sequenceOptions def)
                 : [createAt sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " owned by " <> ownerSql o) | Just o <- [def.ownedBy]]
         Dropped def
             | Just o <- def.ownedBy, ownedByDropped o -> []
+            -- Dropped by the column's change to identity.
+            | s `Set.member` ctx.convertedSequences -> []
             | otherwise -> [remove (Shared, []) ("drop sequence " <> qualified s)]
         Changed _ new -> [createAt sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions new <> " owned by " <> maybe "none" ownerSql new.ownedBy)]
       where

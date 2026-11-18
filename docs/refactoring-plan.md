@@ -347,6 +347,17 @@ Guiding rules:
     undo: `change-view` (`create or replace view` cannot drop a column) and
     `validate-constraint` (a validated constraint stays validated).
 
+- [x] **Serial ↔ identity as one change (Codex 11).**
+  - The column's recipe already converted in one `do` block that drops or creates the
+    sequence and keeps its position. The sequence's own change ran too, and failed: the
+    drop because the column default still used it, the create because the identity's
+    sequence had the same name.
+  - The context lists the sequences such a column change makes or drops
+    (`convertedSequences`). Their recipe drops nothing, and for a serial only sets the
+    sequence's options and owner after the column's change.
+  - New fixtures `serial-to-identity` and `identity-to-serial` pass every round trip,
+    revert walk included; both failed before.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**
