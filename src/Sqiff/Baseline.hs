@@ -14,13 +14,13 @@ import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import RIO
-import RIO.Directory (XdgDirectory (..), createDirectoryIfMissing, doesDirectoryExist, doesFileExist, doesPathExist, findExecutable, getXdgDirectory, removeDirectoryRecursive, removeFile)
+import RIO.Directory (XdgDirectory (..), canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist, doesPathExist, findExecutable, getXdgDirectory, removeDirectoryRecursive, removeFile)
 import RIO.FilePath (takeDirectory, (</>))
 import RIO.Map qualified as Map
 import Sqiff.Catalog (failWith)
-import Sqiff.Config (BaselineConfig (..), DeployStep (..), SqitchPlace (..))
+import Sqiff.Config (BaselineConfig (..), DeployStep (..), Password (..), SqitchPlace (..), fill)
 import Sqiff.Git (Repo, commonDir, findRepo, git, resolveCommit)
-import System.Environment (getEnvironment)
+import System.Environment (getEnvironment, lookupEnv)
 import System.Process.Typed (ProcessConfig, nullStream, proc, readProcess, runProcess, setEnv, setStdin, setStdout, setWorkingDir, useHandleOpen)
 
 
@@ -40,7 +40,8 @@ ensureBaseline cfg rev = do
         found <- findExecutable tool
         when (isNothing found) $ failWith [i|#{tool} is not on PATH; the baseline database needs it|]
     repo <- findRepo "."
-    key <- T.take 12 . tshow . hashWith SHA256 . encodeUtf8 . T.pack <$> commonDir repo
+    common <- commonDir repo
+    let key = T.take 12 (tshow (hashWith SHA256 (encodeUtf8 (T.pack common))))
     cache <- getXdgDirectory XdgCache ("sqiff" </> T.unpack key)
     let p = Paths{project = "sqiff-" <> key, checkout = cache </> "checkout", stateFile = cache </> "baseline-commit"}
     commit <- resolveCommit repo rev
@@ -52,7 +53,7 @@ ensureBaseline cfg rev = do
         else do
             note [i|bringing the baseline database to #{T.take 12 commit} (#{rev})|]
             whenM (doesFileExist p.stateFile) $ removeFile p.stateFile
-            checkoutAt cfg repo p commit
+            checkoutAt cfg repo common p commit
             start cfg p
             stale <- staleDeploy cfg p
             when stale do
@@ -74,8 +75,16 @@ note message = TIO.hPutStrLn stderr ("sqiff: " <> message)
 connInfo :: BaselineConfig -> Paths -> IO Text
 connInfo cfg p = do
     port <- publishedPort cfg p
-    let (user, database) = (cfg.user, cfg.database)
-    pure [i|host=localhost port=#{port} user=#{user} dbname=#{database}|]
+    password <- passwordOf cfg
+    let pairs = [("host", "localhost"), ("port", port), ("user", cfg.user), ("dbname", cfg.database)] <> [("password", pw) | pw <- maybeToList password]
+    pure (T.unwords [k <> "='" <> T.replace "'" "\\'" (T.replace "\\" "\\\\" v) <> "'" | (k, v) <- pairs])
+
+
+passwordOf :: BaselineConfig -> IO (Maybe Text)
+passwordOf cfg = case cfg.password of
+    Nothing -> pure Nothing
+    Just (PasswordText pw) -> pure (Just pw)
+    Just (PasswordVariable var) -> lookupEnv (T.unpack var) >>= maybe (failWith [i|baseline.password-variable names #{var}, which is not set|]) (pure . Just . T.pack)
 
 
 publishedPort :: BaselineConfig -> Paths -> IO Text
@@ -88,10 +97,10 @@ publishedPort cfg p = do
 
 
 -- | Creates the git worktree at @commit@, or moves it there. A checkout that is not a
--- git worktree is stopped and replaced; the database volume stays.
-checkoutAt :: BaselineConfig -> Repo -> Paths -> Text -> IO ()
-checkoutAt cfg repo p commit =
-    doesPathExist (p.checkout </> ".git") >>= \case
+-- worktree of this repository is stopped and replaced; the database volume stays.
+checkoutAt :: BaselineConfig -> Repo -> FilePath -> Paths -> Text -> IO ()
+checkoutAt cfg repo common p commit =
+    ours >>= \case
         True -> do
             let args = ["-C", p.checkout, "checkout", "--quiet", "--force", "--detach", T.unpack commit]
             code <- runProcess (toStderr (proc "git" args))
@@ -105,6 +114,15 @@ checkoutAt cfg repo p commit =
             createDirectoryIfMissing True (takeDirectory p.checkout)
             git repo ["worktree", "prune"]
             git repo ["worktree", "add", "--quiet", "--detach", p.checkout, T.unpack commit]
+  where
+    ours =
+        doesPathExist (p.checkout </> ".git") >>= \case
+            False -> pure False
+            True -> do
+                (code, out, _) <- readProcess (quiet (proc "git" ["-C", p.checkout, "rev-parse", "--path-format=absolute", "--git-common-dir"]))
+                case code of
+                    ExitSuccess -> (== common) <$> canonicalizePath (T.unpack (decode out))
+                    ExitFailure _ -> pure False
 
 
 -- | Starts the server and waits until it accepts connections over TCP, which it does
@@ -130,7 +148,7 @@ start cfg p = do
 -- | Whether sqitch reports deployed changes that the checkout's plan does not have.
 staleDeploy :: BaselineConfig -> Paths -> IO Bool
 staleDeploy cfg p = do
-    (_, out, err) <- readProcess . quiet =<< sqitchProc cfg p ["status"]
+    (_, out, err) <- readProcess . quiet =<< sqitchProc cfg p cfg.status
     pure ("Cannot find" `T.isInfixOf` decode (out <> err))
 
 
@@ -143,18 +161,25 @@ sqitchIn cfg p args = do
 
 
 -- | sqitch in the service, or on this machine in the checkout with libpq's variables
--- pointing at the published port.
+-- pointing at the published port. @{host}@, @{port}@, @{user}@ and @{database}@ in the
+-- arguments are where that sqitch reaches the baseline.
 sqitchProc :: BaselineConfig -> Paths -> [Text] -> IO (ProcessConfig () () ())
-sqitchProc cfg p args = case cfg.sqitch of
-    InService -> do
-        env <- composeEnv cfg
-        pure (setEnv env (composeProc cfg p (["exec", "-T", T.unpack cfg.service, "sqitch"] <> map T.unpack args)))
-    OnHost -> do
-        port <- publishedPort cfg p
-        env <- getEnvironment
-        let ours = [("PGHOST", "localhost"), ("PGPORT", T.unpack port), ("PGUSER", T.unpack cfg.user), ("PGDATABASE", T.unpack cfg.database)]
-            others = filter ((`notElem` (["PGSERVICE", "PGHOSTADDR"] <> map fst ours)) . fst) env
-        pure (setEnv (ours <> others) (setWorkingDir p.checkout (quiet (proc "sqitch" (map T.unpack args)))))
+sqitchProc cfg p args = do
+    password <- passwordOf cfg
+    let withPassword = [("PGPASSWORD", T.unpack pw) | pw <- maybeToList password]
+        filled port = map (\a -> fill a [("host", "localhost"), ("port", port), ("user", cfg.user), ("database", cfg.database)]) args
+    case cfg.sqitch of
+        InService -> do
+            env <- composeEnv cfg
+            let passOn = concat [["-e", "PGPASSWORD"] | isJust password]
+                exec = ["exec", "-T"] <> passOn <> [T.unpack cfg.service, "sqitch"]
+            pure (setEnv (withPassword <> env) (composeProc cfg p (exec <> map T.unpack (filled (tshow cfg.containerPort)))))
+        OnHost -> do
+            port <- publishedPort cfg p
+            env <- getEnvironment
+            let ours = [("PGHOST", "localhost"), ("PGPORT", T.unpack port), ("PGUSER", T.unpack cfg.user), ("PGDATABASE", T.unpack cfg.database)] <> withPassword
+                others = filter ((`notElem` (["PGSERVICE", "PGHOSTADDR"] <> map fst ours)) . fst) env
+            pure (setEnv (ours <> others) (setWorkingDir p.checkout (quiet (proc "sqitch" (map T.unpack (filled port))))))
 
 
 isRunning :: BaselineConfig -> Paths -> IO Bool

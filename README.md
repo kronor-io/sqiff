@@ -42,11 +42,23 @@ baseline:                            # the scratch database --from master builds
   environment: {}                    # more variables for docker compose
   user: postgres
   database: postgres
+  password-variable: PG_PASSWORD     # or password: ...; left out, trust auth, PGPASSWORD or ~/.pgpass
   sqitch: host                       # host, or service to run sqitch inside the service
   deploy:                            # sqitch calls that deploy the revision
     - sqitch: [deploy]
       if-exists: sqitch.plan         # skip the call when this path is missing
+  status: [status]                   # the sqitch call that finds changes the plan no longer has
 ```
+
+In `deploy` and `status` arguments, `{host}`, `{port}`, `{user}` and `{database}` are where that sqitch reaches the baseline: the port Docker published when sqitch runs on the host, `container-port` when it runs in the service. sqitch reads `PGHOST` and `PGPORT` only for what a target's URI leaves out, so a target with a fixed URI needs one, for example:
+
+```yaml
+  deploy:
+    - sqitch: [deploy, "db:pg://{user}@{host}:{port}/{database}"]
+  status: [status, "db:pg://{user}@{host}:{port}/{database}"]
+```
+
+The password reaches sqitch as `PGPASSWORD` and sqiff's own connections in the connection string; it is never put in sqitch's arguments.
 
 Without `templates`, `--write` uses sqitch's own templates and writes the scripts itself. Each repository gets its own baseline, shared by its worktrees and jj workspaces, under `~/.cache/sqiff`.
 

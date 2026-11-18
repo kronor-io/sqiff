@@ -9,6 +9,7 @@ module Sqiff.Config (
     Config (..),
     Names (..),
     BaselineConfig (..),
+    Password (..),
     SqitchPlace (..),
     DeployStep (..),
     Layout (..),
@@ -66,9 +67,15 @@ data BaselineConfig = BaselineConfig
     , environment :: Map Text Text
     , user :: Text
     , database :: Text
+    , password :: Maybe Password
     , sqitch :: SqitchPlace
     , deploy :: [DeployStep]
+    , status :: [Text]
     }
+
+
+-- | The baseline's password, as written or from a variable in sqiff's environment.
+data Password = PasswordText Text | PasswordVariable Text
 
 
 -- | Where the baseline's sqitch runs: on this machine against the published port, or
@@ -135,7 +142,7 @@ instance FromJSON Names where
 
 instance FromJSON BaselineConfig where
     parseJSON = withObject "baseline" \o -> do
-        known ["compose-file", "service", "port-variable", "port", "container-port", "environment", "user", "database", "sqitch", "deploy"] o
+        known ["compose-file", "service", "port-variable", "port", "container-port", "environment", "user", "database", "password", "password-variable", "sqitch", "deploy", "status"] o
         composeFile <- o .:? "compose-file" .!= "docker-compose.yaml"
         service <- o .:? "service" .!= "postgres"
         portVariable <- o .:? "port-variable"
@@ -144,9 +151,14 @@ instance FromJSON BaselineConfig where
         environment <- o .:? "environment" .!= Map.empty
         user <- o .:? "user" .!= "postgres"
         database <- o .:? "database" .!= "postgres"
+        password <-
+            (,) <$> o .:? "password" <*> o .:? "password-variable" >>= \case
+                (Just _, Just _) -> fail "set password or password-variable, not both"
+                (written, variable) -> pure (PasswordText <$> written <|> PasswordVariable <$> variable)
         sqitch <- o .:? "sqitch" .!= OnHost
         deploy <- o .:? "deploy" .!= [DeployStep ["deploy"] Nothing]
-        pure BaselineConfig{composeFile, service, portVariable, port, containerPort, environment, user, database, sqitch, deploy}
+        status <- o .:? "status" .!= ["status"]
+        pure BaselineConfig{composeFile, service, portVariable, port, containerPort, environment, user, database, password, sqitch, deploy, status}
 
 
 instance FromJSON SqitchPlace where
