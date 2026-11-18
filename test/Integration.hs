@@ -17,6 +17,9 @@
 module Integration (tests) where
 
 import Data.String.Interpolate (i)
+import Hasql.Connection qualified as Connection
+import Hasql.Session qualified as Session
+import Hasql.TH (singletonStatement)
 import Postgres
 import RIO
 import RIO.ByteString.Lazy qualified as BL
@@ -25,13 +28,15 @@ import RIO.Directory (doesFileExist, listDirectory)
 import RIO.FilePath ((<.>), (</>))
 import RIO.List (sort)
 import RIO.Text qualified as T
+import Sqiff.Connection (withConnections, withSharedSnapshot)
+import Sqiff.ConnectionString (connectionString)
 import Sqiff.Script (splitStatements)
 import System.Environment (lookupEnv, setEnv)
 import System.Process.Typed (proc, readProcess, setWorkingDir)
 import Test.Tasty (TestTree, testGroup, withResource)
 import Test.Tasty.ExpectedFailure (expectFailBecause)
 import Test.Tasty.Golden (goldenVsStringDiff)
-import Test.Tasty.HUnit (assertFailure, testCase)
+import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
 
 
 fixturesDir :: FilePath
@@ -49,7 +54,23 @@ tests sqitch = do
             path <- fromMaybe "" <$> lookupEnv "PATH"
             setEnv "PATH" (bin <> ":" <> path)
             pure $ withResource (startCluster bin) stopCluster \cluster ->
-                testGroup "integration" (map (uncurry (fixture sqitch cluster)) fixtures)
+                testGroup "integration" (sharedSnapshot cluster : map (uncurry (fixture sqitch cluster)) fixtures)
+
+
+-- | Connections that share a snapshot do not see what another commits after it.
+sharedSnapshot :: IO Cluster -> TestTree
+sharedSnapshot getCluster = testCase "connections in a shared snapshot see one state" do
+    cluster <- getCluster
+    createDatabase cluster "snapshot"
+    let db = connectionString (conninfo cluster "snapshot")
+        tableCount c = Connection.use c (Session.statement () [singletonStatement| select count(*)::int8 from pg_class where relname = 'late' |]) >>= either (assertFailure . show) pure
+    withConnections db 2 \conns@(a :| bs) -> do
+        seen <- withSharedSnapshot conns do
+            runScript cluster "snapshot" "create table late ()" >>= either (assertFailure . T.unpack) pure
+            (,) <$> tableCount a <*> traverse tableCount bs
+        seen @?= (0, [0])
+        after <- tableCount a
+        after @?= 1
 
 
 -- | The reason in a fixture's @known-bug@ file, if it has one.

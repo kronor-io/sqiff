@@ -11,6 +11,7 @@ module Sqiff.Connection (
     withConnection,
     withConnections,
     inRolledBackTransaction,
+    withSharedSnapshot,
     run,
     qualifiedNames,
     errorText,
@@ -67,6 +68,27 @@ inRolledBackTransaction conn label action = do
   where
     script :: Text -> Text -> IO ()
     script sql failed = Connection.use conn (Session.script sql) >>= either (\e -> failWith [i|#{label} #{failed}: #{errorText e}|]) pure
+
+
+-- | Runs @action@ with every connection in one repeatable-read transaction on the same
+-- snapshot, exported by the first, so reads spread over them see one state of the
+-- database. The transactions are rolled back afterwards.
+withSharedSnapshot :: NonEmpty Connection.Connection -> IO a -> IO a
+withSharedSnapshot conns@(first :| rest) action = do
+    script first "begin isolation level repeatable read"
+    snapshot <-
+        ( Connection.use first (Session.statement () [singletonStatement| select pg_export_snapshot()::text |])
+            >>= either (\e -> failWith [i|could not share a snapshot: #{errorText e}|]) pure
+        )
+            `onException` rollbackAll
+    for_ rest (\c -> script c [i|begin isolation level repeatable read; set transaction snapshot '#{snapshot}'|]) `onException` rollbackAll
+    result <- action `onException` rollbackAll
+    for_ conns (`script` "rollback")
+    pure result
+  where
+    rollbackAll = for_ conns \c -> tryAny (Connection.use c (Session.script "rollback"))
+    script :: Connection.Connection -> Text -> IO ()
+    script c sql = Connection.use c (Session.script sql) >>= either (\e -> failWith [i|#{sql} failed: #{errorText e}|]) pure
 
 
 -- | Runs @action@ with a connection that is released when it returns or fails.

@@ -34,7 +34,7 @@ import Sqiff.Body (BodyCheck, checkBodies)
 import Sqiff.Catalog (Addresses, CatalogId (..), dependenciesFrom, dependenciesOn, describeOn, edgesBetween, pgClass, pgProc)
 import Sqiff.Catalog.PlpgsqlCheck (PlFunction (..), PlFunctions (..), Skipped, analyseBodies, bodyUses, plpgsqlFunctions, tempTableStatements)
 import Sqiff.Config (Config (..))
-import Sqiff.Connection (withConnection, withConnections)
+import Sqiff.Connection (withConnection, withConnections, withSharedSnapshot)
 import Sqiff.ConnectionString (ConnectionString)
 import Sqiff.Definition (printed)
 import Sqiff.Diff (BodyText (..), Change (..), Changes, bodiesToAnalyse, bodyText, dependentsBy, diff)
@@ -67,7 +67,7 @@ withDatabase :: Scope -> ConnectionString -> (IO Connected -> IO a) -> IO a
 withDatabase scope db = onDemand \use ->
     withConnections db describeConnections \(conn :| extra) ->
         withAsync (withConnection db tempTableStatements) \tempTables -> do
-            (schema, addresses) <- describeOn (conn : extra) scope.excluded scope.partitions Nothing
+            (schema, addresses) <- withSharedSnapshot (conn :| extra) $ describeOn (conn : extra) scope.excluded scope.partitions Nothing
             use Connected{conn, extra, schema, addresses, tempTableScript = wait tempTables}
 
 

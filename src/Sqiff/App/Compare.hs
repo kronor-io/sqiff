@@ -30,7 +30,7 @@ import Sqiff.App.Read (Purpose (..), describeConnections, readBoth)
 import Sqiff.Body (BodyCheck, sameDefinition)
 import Sqiff.Catalog (describeOn)
 import Sqiff.Config (Config (..))
-import Sqiff.Connection (failWith, withConnections)
+import Sqiff.Connection (failWith, withConnections, withSharedSnapshot)
 import Sqiff.ConnectionString (ConnectionString)
 import Sqiff.Definition (Definition, printed)
 import Sqiff.Diff (Change (..), Changes, affected, diff)
@@ -52,7 +52,7 @@ runDescribe :: DescribeOptions -> RIO AppEnv ()
 runDescribe opts = do
     scope <- asks (.scope)
     schema <- timed "describe.describeOn" $ withConnections opts.db describeConnections \conns ->
-        liftIO (fst <$> describeOn (toList conns) scope.excluded scope.partitions Nothing)
+        liftIO (fst <$> withSharedSnapshot conns (describeOn (toList conns) scope.excluded scope.partitions Nothing))
     case opts.out of
         Just dir -> liftIO (writeFolder opts.existing dir schema)
         Nothing ->

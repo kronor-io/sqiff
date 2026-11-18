@@ -306,6 +306,16 @@ Guiding rules:
     not the password). A change in those settings rebuilds from an empty volume.
   - Not run against Docker here; only built.
 
+- [x] **One snapshot per described database (Codex 25).**
+  - `withSharedSnapshot` starts a repeatable-read transaction on the first connection
+    and exports its snapshot; the others adopt it. `withDatabase` and `describe` read
+    the catalog inside it, so the queries spread over four connections see one state.
+  - The edges and plpgsql_check analysis that follow run outside it: the analysis
+    creates temp tables and recovers from failed statements, which one long transaction
+    would not allow. Edges whose ends were not described are dropped, as before.
+  - A test shows two connections in a shared snapshot not seeing a table another
+    connection created after it.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**
