@@ -8,6 +8,6 @@ import Writing qualified
 
 main :: IO ()
 main = do
-    integration <- Integration.tests
-    writing <- Writing.tests
-    defaultMain (testGroup "sqiff" [Unit.tests, integration, writing])
+    sqitch <- Writing.setUpSqitch
+    integration <- Integration.tests sqitch
+    defaultMain (testGroup "sqiff" [Unit.tests, integration, Writing.tests sqitch])

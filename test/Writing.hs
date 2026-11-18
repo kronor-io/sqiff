@@ -7,7 +7,7 @@
 -- | Writing changes with the real sqitch, in throwaway projects: the layout sqiff
 -- resolves is the one sqitch writes to, a failure part-way leaves the project as it was,
 -- and a rework on a day that already has sqiff's tag gets a new one.
-module Writing (tests) where
+module Writing (setUpSqitch, tests) where
 
 import Data.String.Interpolate (i)
 import Data.Time (UTCTime (..), fromGregorian)
@@ -34,22 +34,25 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (Assertion, assertBool, assertFailure, testCase, (@?=))
 
 
-tests :: IO TestTree
-tests = do
-    -- sqitch from SQIFF_TEST_SQITCH_BIN, or PATH.
+-- | Puts SQIFF_TEST_SQITCH_BIN on PATH and gives sqitch an identity and no user
+-- configuration; whether sqitch is then available.
+setUpSqitch :: IO Bool
+setUpSqitch = do
     lookupEnv "SQIFF_TEST_SQITCH_BIN" >>= traverse_ \bin -> do
         path <- fromMaybe "" <$> lookupEnv "PATH"
         setEnv "PATH" (bin <> ":" <> path)
-    -- No user configuration: the projects' own settings only.
     setEnv "SQITCH_USER_CONFIG" "/nonexistent/sqiff-test/sqitch.conf"
     setEnv "SQITCH_FULLNAME" "sqiff test"
     setEnv "SQITCH_EMAIL" "sqiff@example.invalid"
-    found <- findExecutable "sqitch"
-    pure
-        $ testGroup "sqitch writing"
-        $ case found of
-            Nothing -> [testCase "sqitch is available" (assertFailure "sqitch is neither on PATH nor in SQIFF_TEST_SQITCH_BIN")]
-            Just _ ->
+    isJust <$> findExecutable "sqitch"
+
+
+tests :: Bool -> TestTree
+tests available =
+    testGroup "sqitch writing"
+        $ if not available
+            then [testCase "sqitch is available" (assertFailure "sqitch is neither on PATH nor in SQIFF_TEST_SQITCH_BIN")]
+            else
                 [ testCase "writes where --top-dir and --plan-file say, not where sqitch.conf does" customLayout
                 , testCase "a failure part-way leaves the plan and the scripts as they were" rollsBack
                 , testCase "a second rework on the same day gets a new tag" secondTag

@@ -249,7 +249,16 @@ renderScript header placement steps =
                 <> map (\s -> if safeToIndent s.sql then indent (statement s.sql s) else statement s.sql s) group'
                 <> ["COMMIT;"]
     statement sql s =
-        T.intercalate "\n" (map ("-- " <>) (hazardNotes s) <> [tidy s sql <> if "--" `T.isPrefixOf` sql then "" else ";"])
+        T.intercalate "\n" (map ("-- " <>) (hazardNotes s) <> [tidy s sql <> if "--" `T.isPrefixOf` sql then "" else ";"] <> stopUntilWritten s)
+    -- A step sqiff cannot write stops the deploy until someone writes it, rather than
+    -- deploying as a change that does nothing.
+    stopUntilWritten s =
+        [ doBlock [S.i| begin raise exception using message = #{literal message}; end |] <> ";"
+        | "--" `T.isPrefixOf` s.sql
+        , why <- take 1 [w | Manual w <- s.hazards]
+        , let what = render s.object
+              message = [S.i|sqiff could not write this step for #{what}: #{why}; write it here and remove this block|] :: Text
+        ]
     indent = T.intercalate "\n" . map (\l -> if T.null l then l else "  " <> l) . T.lines
     safeToIndent sql = not ("$" `T.isInfixOf` sql) && all (even . T.count "'") (T.lines sql)
     tidy s sql = case T.lines sql of
@@ -329,10 +338,11 @@ tidyIndex line
 
 
 -- | A verify script that checks in the catalog what a migration's statements leave
--- behind.
+-- behind. It runs with an empty @search_path@, as sqiff reads the catalog, so names and
+-- types print as the plan has them.
 verifyScript :: Text -> [Step] -> Text
 verifyScript header steps =
-    T.intercalate "\n\n" ([header, "BEGIN;"] <> map ("    " <>) selects <> assertBlock <> ["ROLLBACK;"]) <> "\n"
+    T.intercalate "\n\n" ([header, "BEGIN;", "    set local search_path = '';"] <> map ("    " <>) selects <> assertBlock <> ["ROLLBACK;"]) <> "\n"
   where
     final = Map.elems (Map.fromList [(s.object, s) | s <- steps, s.key.aspect == Definition])
     gone :: Step -> Bool
@@ -352,34 +362,79 @@ verifyScript header steps =
         ]
     asserts = concatMap check final
     check :: Step -> [Text]
-    check s = case s.object of
+    check s
+        -- Dropped to be created again by a later change: sqitch verify runs every
+        -- change's script on the final database, where it exists again.
+        | gone s, Changed _ _ <- s.change = []
+        | otherwise = checkObject s
+    checkObject :: Step -> [Text]
+    checkObject s = case s.object of
         Column t col
             | gone s -> [notExists [S.i|select from pg_attribute where attrelid = #{reg t} and attname = #{literal c} and not attisdropped|] [S.i|column #{c} is still on #{qualified t}|]]
-            | Changed (ColumnDefinition old) (ColumnDefinition new) <- s.change
-            , let ty = typeText new.colType
-            , old.colType /= new.colType ->
-                [ let message = literal [S.i|#{c} is not #{ty}|]
-                   in [S.i|assert (select atttypid from pg_attribute where attrelid = #{reg t} and attname = #{literal c}) = #{literal ty}::regtype, #{message};|]
-                ]
+            | Just new <- asColumn =<< changed s.change ->
+                let old = asColumn =<< previous s.change
+                    differs f = fmap f old /= Just (f new)
+                    ty = typeText new.colType
+                    attribute :: Text -> Text
+                    attribute what = [S.i|(select #{what} from pg_attribute where attrelid = #{reg t} and attname = #{literal c})|]
+                 in [ [S.i|assert #{attribute "format_type(atttypid, atttypmod)"} = #{literal ty}, #{literal (c <> " is not " <> ty)};|]
+                    | differs (.colType)
+                    ]
+                        <> [ let notNull = if isNotNull new then "true" else "false" :: Text
+                                 message = c <> (if isNotNull new then " is nullable" else " is not null")
+                              in [S.i|assert #{attribute "attnotnull"} = #{notNull}, #{literal message};|]
+                           | differs isNotNull
+                           ]
+                        <> [ let name = nameText co
+                              in [S.i|assert (select collname from pg_collation where oid = #{attribute "attcollation"}) = #{literal name}, #{literal (c <> " is not collated " <> name)};|]
+                           | differs (.collation)
+                           , Just co <- [new.collation]
+                           ]
           where
             c = nameText col
         TableConstraint t con | "create unique index " `T.isInfixOf` T.toLower s.sql -> [relation s (QName t.schema con)]
         TableConstraint t con -> let c = nameText con in [presence s [S.i|select from pg_constraint where conrelid = #{reg t} and conname = #{literal c}|] [S.i|constraint #{c} on #{qualified t}|]]
         Policy t name -> let n = nameText name in [presence s [S.i|select from pg_policy where polrelid = #{reg t} and polname = #{literal n}|] [S.i|policy #{n} on #{qualified t}|]]
         Trigger t name -> let n = nameText name in [presence s [S.i|select from pg_trigger where tgrelid = #{reg t} and tgname = #{literal n} and not tgisinternal|] [S.i|trigger #{n} on #{qualified t}|]]
+        DomainConstraint d con ->
+            let c = nameText con
+                domain = literal (typeText d)
+             in [presence s [S.i|select from pg_constraint where contypid = to_regtype(#{domain}) and conname = #{literal c}|] [S.i|constraint #{c} on domain #{typeText d}|]]
         Index q -> [relation s q]
+        Table q -> [relation s q]
         View q -> [relation s q]
         MaterializedView q -> [relation s q]
         Sequence q -> [relation s q]
+        Routine _ q args ->
+            let signature = qualified q <> "(" <> T.intercalate ", " (map typeText args) <> ")"
+             in [lookupBy s "to_regprocedure" signature]
+        Type t ->
+            lookupBy s "to_regtype" (typeText t)
+                : [ [S.i|assert exists (select from pg_enum where enumtypid = to_regtype(#{literal (typeText t)}) and enumlabel = #{literal label}), #{literal ("label " <> label <> " is missing from " <> typeText t)};|]
+                  | not (gone s)
+                  , Just (TypeDefinition (EnumType labels)) <- [changed s.change]
+                  , label <- labels
+                  ]
+        Schema n -> let name = nameText n in [presence s [S.i|select from pg_namespace where nspname = #{literal name}|] [S.i|schema #{name}|]]
+        Extension e -> let name = nameText e in [presence s [S.i|select from pg_extension where extname = #{literal name}|] [S.i|extension #{name}|]]
         _ -> []
-    relation :: Step -> QName -> Text
-    relation s q =
-        let name = qualified q
-            stillThere = literal [S.i|#{name} still exists|]
+    changed = \case
+        Added d -> Just d
+        Changed _ d -> Just d
+        Dropped _ -> Nothing
+    previous = \case
+        Changed d _ -> Just d
+        _ -> Nothing
+    -- Whether a regclass-like lookup finds the object, as it should.
+    lookupBy :: Step -> Text -> Text -> Text
+    lookupBy s function name =
+        let stillThere = literal [S.i|#{name} still exists|]
             missing = literal [S.i|#{name} is missing|]
          in if gone s
-                then [S.i|assert to_regclass(#{literal name}) is null, #{stillThere};|]
-                else [S.i|assert to_regclass(#{literal name}) is not null, #{missing};|]
+                then [S.i|assert #{function}(#{literal name}) is null, #{stillThere};|]
+                else [S.i|assert #{function}(#{literal name}) is not null, #{missing};|]
+    relation :: Step -> QName -> Text
+    relation s q = lookupBy s "to_regclass" (qualified q)
     presence :: Step -> Text -> Text -> Text
     presence s query what =
         let missing = literal [S.i|#{what} is missing|]

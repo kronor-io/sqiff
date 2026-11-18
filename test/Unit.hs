@@ -27,13 +27,13 @@ import Sqiff.Graph (schedule)
 import Sqiff.Identifier (identifier, qname, quoteIdent, typeName)
 import Sqiff.Model (Address (..), Aspect (..), Edge (..), ObjectId (..), ObjectKey (..), RoutineKind (..), fromAddress, toAddress)
 import Sqiff.Plan (context, invert, topoOrder)
-import Sqiff.Recipe (Phase (..), Step (..), Txn (..))
+import Sqiff.Recipe (Hazard (..), Phase (..), Step (..), Txn (..))
 import Sqiff.Rewrite (fileDrift)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
 import Sqiff.Sqitch.Check (Tagging (..), batchProblems, changeNameProblem, chooseTag, tagNameProblem)
 import Sqiff.Sqitch.Layout (Layout (..), resolveLayout, sqitchConf)
 import Sqiff.Sqitch.Plan (SqitchPlan (..), parsePlan)
-import Sqiff.Sqitch.Units (Placement (..), Unit (..), UnitKind (..), tidyIndex, units)
+import Sqiff.Sqitch.Units (Placement (..), Unit (..), UnitKind (..), renderScript, tidyIndex, units, verifyScript)
 import Sqiff.Sql qualified as Sql
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
@@ -490,6 +490,25 @@ sqitchChecks =
             let at n = ColumnDefinition (ColumnDef (typeName "int") Nothing Nullable (PlainColumn Nothing) False (Position n))
                 key = ObjectKey Definition (Column (qname "public" "t") (identifier "a"))
             diff (\_ a b -> a == b) (Map.fromList [(key, at 1)]) (Map.fromList [(key, at 3)]) @?= Map.empty
+        , testCase "verify checks a column's full type, not only its base type" do
+            let col ty = ColumnDefinition (ColumnDef (typeName ty) Nothing Nullable (PlainColumn Nothing) False (Position 1))
+                object = Column (qname "public" "t") (identifier "a")
+                retype = Step CreatePhase 6 object "alter table public.t alter column a type character varying(20)" Shared [] (ObjectKey Definition object) (Changed (col "character varying(10)") (col "character varying(20)"))
+                script = verifyScript "-- verify" [retype]
+            ("format_type(atttypid, atttypmod)" `T.isInfixOf` script, "= 'character varying(20)'" `T.isInfixOf` script) @?= (True, True)
+        , testCase "verify checks routines, types, schemas and extensions" do
+            let made object = Step CreatePhase 1 object "create" Shared [] (ObjectKey Definition object) (Added (Printed "x"))
+                script = verifyScript "-- verify" (map made [Routine Function (qname "app" "f") [typeName "integer"], Type (typeName "app.mood"), Schema (identifier "app"), Extension (identifier "pgcrypto"), Table (qname "app" "t")])
+            for_ ["to_regprocedure('app.f(integer)') is not null", "to_regtype('app.mood') is not null", "nspname = 'app'", "extname = 'pgcrypto'", "to_regclass('app.t') is not null"] \check ->
+                (check, check `T.isInfixOf` script) @?= (check, True)
+        , testCase "verify does not expect an object dropped to be created again to be gone" do
+            let object = MaterializedView (qname "app" "mv")
+                drop' = Step DropPhase 1 object "drop materialized view app.mv" Shared [] (ObjectKey Definition object) (Changed (Printed "a") (Printed "b"))
+            ("still exists" `T.isInfixOf` verifyScript "-- verify" [drop']) @?= False
+        , testCase "a step sqiff cannot write stops the deploy" do
+            let object = Type (typeName "app.mood")
+                manual = Step CreatePhase 8 object "-- only adding enum values is automated" Shared [Manual "only adding enum values is automated"] (ObjectKey Definition object) (Changed (Printed "a") (Printed "b"))
+            ("raise exception" `T.isInfixOf` renderScript "-- deploy" Migration [manual]) @?= True
         , testCase "overloads of a new function make one change" do
             let names = either error id (Aeson.eitherDecode "{}")
                 ctx = context Map.empty Map.empty Map.empty [] Map.empty

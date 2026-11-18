@@ -12,6 +12,7 @@ module Postgres (
     startCluster,
     stopCluster,
     conninfo,
+    sqitchTarget,
     createDatabase,
     runScript,
 ) where
@@ -88,6 +89,11 @@ run cluster program args = do
 -- | The connection string for one of the cluster's databases.
 conninfo :: Cluster -> Text -> Text
 conninfo cluster db = [i|host=#{root cluster </> "socket"} user=sqiff dbname=#{db}|]
+
+
+-- | The sqitch target for one of the cluster's databases.
+sqitchTarget :: Cluster -> Text -> Text
+sqitchTarget cluster db = [i|db:pg://sqiff@/#{db}?host=#{root cluster </> "socket"}|]
 
 
 -- | Drops @db@ if it is there and creates it again, empty.

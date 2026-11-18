@@ -243,6 +243,27 @@ Guiding rules:
   - The new fixture `recreate-keeps-comments` loses all eight comments on the previous
     commit.
 
+- [x] **Verify scripts check what the migration did (Codex 27).**
+  - Verify scripts run with an empty `search_path`, as sqiff reads the catalog. Columns
+    are checked by `format_type(atttypid, atttypmod)`, so a change from `varchar(10)` to
+    `varchar(20)` is verified, along with nullability and collation.
+  - New checks for tables, routines (`to_regprocedure`), types (with an enum's labels),
+    schemas, extensions and domain constraints.
+  - Conventional changes get these checks too; they used to get an empty verify.
+  - An object dropped to be created again by a later change is not checked as gone:
+    `sqitch verify` runs every change's script on the final database.
+  - A step sqiff cannot write (a `manual:` hazard) renders with a block that raises an
+    error, so the deploy stops there until someone writes it. Before, it deployed as a
+    change that did nothing.
+  - Each fixture has a fourth test, the sqitch round trip:
+    1. `sqiff sqitch` writes the plan into a new project.
+    2. sqitch deploys it with `--verify` on a fresh copy of `from`, then runs
+       `sqitch verify`.
+    3. `diff` must then find nothing.
+  - The round trip found the absence checks that fail after a later change recreates
+    the object. By hand: the verify fails on a column still `varchar(10)` and passes once
+    it is `varchar(20)`, and a manual step stops the deploy.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

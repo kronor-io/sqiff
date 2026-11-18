@@ -151,7 +151,7 @@ writeUnits project templateDir' sqitchPlan tagging us = do
             name = u.changeName
             deploy = script Deploy [S.i|-- Deploy #{projectName}:#{name} to #{engine}|] u.deploy u
             revert = script Revert [S.i|-- Revert #{projectName}:#{name} from #{engine}|] u.revert u
-            verify = write (path Verify u) (verifyScript [S.i|-- Verify #{projectName}:#{name} on #{engine}|] (if u.placement == Migration then u.deploy else []))
+            verify = write (path Verify u) (verifyScript [S.i|-- Verify #{projectName}:#{name} on #{engine}|] u.deploy)
         case u.kind of
             AddChange -> sqitch (["add", u.changeName, "-n", u.note] <> foldMap templateArgs template)
             ReworkChange -> sqitch ["rework", u.changeName, "-n", u.note]
