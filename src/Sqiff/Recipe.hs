@@ -632,10 +632,13 @@ privileges key object change = case (target, traverse asAcl change) of
     grantsOf = \case
         ExplicitAcl grants -> grants
         DefaultAcl
-            | isRoutine object -> Set.singleton (Grant Public "EXECUTE" False)
+            | isRoutine object -> Set.singleton (Grant Public "EXECUTE" False ByOwner)
             | otherwise -> Set.empty
+    -- Grants another role gave are revoked first, and given last: a role passes on only
+    -- what it holds with the grant option. PostgreSQL takes no GRANTED BY but the
+    -- current role's, so those statements run as that role.
     grantChanges onObject old new =
-        let byKey gs = Map.fromList [((g.grantee, g.privilege), g.grantable) | g <- Set.toList gs]
+        let byKey gs = Map.fromList [((g.grantor, g.grantee, g.privilege), g.grantable) | g <- Set.toList gs]
             before = byKey old
             now = byKey new
             onTarget privilege = privilege <> " on " <> onObject
@@ -643,16 +646,25 @@ privileges key object change = case (target, traverse asAcl change) of
             needsGrant grantable = \case
                 Nothing -> True
                 Just had -> grantable && not had
-         in [ step [] ("revoke " <> onTarget privilege <> " from " <> granteeSql grantee)
-            | ((grantee, privilege), _) <- Map.toList (before `Map.difference` now)
-            ]
-                <> [ step [] ("revoke grant option for " <> onTarget privilege <> " from " <> granteeSql grantee)
-                   | ((grantee, privilege), (True, False)) <- Map.toList (Map.intersectionWith (,) before now)
-                   ]
-                <> [ step [] ("grant " <> onTarget privilege <> " to " <> granteeSql grantee <> (if grantable then " with grant option" else ""))
-                   | ((grantee, privilege), grantable) <- Map.toList now
-                   , needsGrant grantable (Map.lookup (grantee, privilege) before)
-                   ]
+            byOthersFirst = L.sortOn (\((grantor, _, _), _) -> grantor == ByOwner)
+            revokes =
+                byOthersFirst
+                    $ [ (k, "revoke " <> onTarget privilege <> " from " <> granteeSql grantee)
+                      | (k@(_, grantee, privilege), _) <- Map.toList (before `Map.difference` now)
+                      ]
+                    <> [ (k, "revoke grant option for " <> onTarget privilege <> " from " <> granteeSql grantee)
+                       | (k@(_, grantee, privilege), (True, False)) <- Map.toList (Map.intersectionWith (,) before now)
+                       ]
+            grants =
+                L.sortOn (\((grantor, _, _), _) -> grantor /= ByOwner)
+                    $ [ (k, "grant " <> onTarget privilege <> " to " <> granteeSql grantee <> (if grantable then " with grant option" else ""))
+                      | (k@(_, grantee, privilege), grantable) <- Map.toList now
+                      , needsGrant grantable (Map.lookup k before)
+                      ]
+            asGrantor ((grantor, _, _), sql) = case grantor of
+                ByOwner -> step [] sql
+                ByRole r -> step [] (doBlock [i| begin set local role #{quoted r}; #{sql}; reset role; end |])
+         in map asGrantor (revokes <> grants)
 
 
 comment :: Context -> ObjectKey -> Change Definition -> [Step]

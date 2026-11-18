@@ -70,6 +70,7 @@ module Sqiff.Definition (
     -- * Privileges
     Acl (..),
     Grant (..),
+    Grantor (..),
     Grantee (..),
     aclText,
     granteeSql,
@@ -656,7 +657,15 @@ data Grant = Grant
     , privilege :: Text
     -- ^ As @aclexplode@ names it, such as @SELECT@.
     , grantable :: Bool
+    , grantor :: Grantor
     }
+    deriving stock (Eq, Ord, Show, Generic)
+    deriving anyclass (NFData)
+
+
+-- | Who gave a grant: the object's owner, whoever that is in each database, or another
+-- role, which passes on a privilege it holds with the grant option.
+data Grantor = ByOwner | ByRole Identifier
     deriving stock (Eq, Ord, Show, Generic)
     deriving anyclass (NFData)
 
@@ -672,13 +681,20 @@ granteeSql = \case
     Role r -> quoted r
 
 
--- | One line per grant, in order: @role PRIVILEGE[ with grant option]@.
+-- | One line per grant, in order: @role PRIVILEGE[ with grant option][ granted by role]@.
 aclText :: Acl -> Text
 aclText = \case
     DefaultAcl -> "default"
     ExplicitAcl grants -> T.intercalate "\n" (L.sort (map line (Set.toList grants)))
   where
-    line g = granteeText g.grantee <> " " <> g.privilege <> (if g.grantable then " with grant option" else "")
+    line g =
+        granteeText g.grantee
+            <> " "
+            <> g.privilege
+            <> (if g.grantable then " with grant option" else "")
+            <> case g.grantor of
+                ByOwner -> ""
+                ByRole r -> " granted by " <> nameText r
     granteeText = \case
         Public -> "public"
         Role r -> nameText r
@@ -699,3 +715,4 @@ instance FromJSON Grant where
             .: "privilege"
             <*> o
             .: "grantable"
+            <*> (maybe ByOwner (ByRole . identifier) <$> o .:? "grantor")

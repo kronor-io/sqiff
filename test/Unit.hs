@@ -358,7 +358,7 @@ columns =
             @?= True
         , testCase "a role name with a space stays whole" do
             acl <- decode @Acl "[{\"grantee\": \"report readers\", \"privilege\": \"SELECT\", \"grantable\": false}, {\"grantee\": null, \"privilege\": \"USAGE\", \"grantable\": true}]"
-            acl @?= ExplicitAcl (Set.fromList [Grant (Role (identifier "report readers")) "SELECT" False, Grant Public "USAGE" True])
+            acl @?= ExplicitAcl (Set.fromList [Grant (Role (identifier "report readers")) "SELECT" False ByOwner, Grant Public "USAGE" True ByOwner])
             printed (AclDefinition acl) @?= "public USAGE with grant option\nreport readers SELECT"
         , testCase "drift ignores validity but not the words \"not valid\" in a comment" do
             let key o = ObjectKey Comment o
@@ -531,8 +531,8 @@ sqitchChecks =
             l <- either (assertFailure . T.unpack) pure (resolveLayout "/p" (Just "alt") Nothing [("core.top_dir", "db"), ("core.deploy_dir", "db/d")] [])
             (l.topDir, l.planFile, l.deployDir) @?= ("alt", "alt/sqitch.plan", "alt/deploy")
         , testCase "sqitch runs with the layout pinned for the core, the engine and the target" do
-            let local = [("core.engine", "pg"), ("core.top_dir", "db"), ("engine.pg.target", "prod"), ("target.prod.uri", "db:pg://h/x")]
-            l <- either (assertFailure . T.unpack) pure (resolveLayout "/p" (Just "alt") Nothing local local)
+            let settings = [("core.engine", "pg"), ("core.top_dir", "db"), ("engine.pg.target", "prod"), ("target.prod.uri", "db:pg://h/x")]
+            l <- either (assertFailure . T.unpack) pure (resolveLayout "/p" (Just "alt") Nothing settings settings)
             let conf = sqitchConf l
             for_ ["[core]", "[engine \"pg\"]", "[target \"prod\"]", "\ttop_dir = \"alt\"", "\turi = \"db:pg://h/x\""] \line ->
                 (line, line `T.isInfixOf` conf) @?= (line, True)

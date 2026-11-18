@@ -1,0 +1,3 @@
+-- table public.u
+do $$ begin set local role reader; grant SELECT on table public.u to analyst; reset role; end $$;
+

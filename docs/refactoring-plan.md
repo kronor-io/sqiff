@@ -264,6 +264,16 @@ Guiding rules:
     the object. By hand: the verify fails on a column still `varchar(10)` and passes once
     it is `varchar(20)`, and a manual step stops the deploy.
 
+- [x] **Grants record their grantor (the last known bug, Codex 4/5).**
+  - `Grant` has a `grantor`: `ByOwner`, or `ByRole r` for a privilege another role
+    passed on. Owners need not match between databases.
+  - PostgreSQL accepts `GRANTED BY` only for the current role, so a grant or revoke on
+    behalf of another role runs as that role, in a `do` block with `set local role`.
+  - Other roles' grants are revoked before the owner's and granted after them.
+  - `grant-option-removed` passes, and its `known-bug` file is gone. The new fixture
+    `grant-by-other-role` covers giving a grant as another role.
+  - Not handled: chains deeper than one role (A passes to B, B to C) when revoking.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**
