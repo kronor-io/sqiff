@@ -131,6 +131,9 @@ data Context = Context
     -- ^ For a column whose type changes, the statements that drop the views reading it
     -- and the ones that create them again, with their grants, indexes, triggers and comments.
     , droppedObjects :: Set ObjectId
+    , viewDependents :: Map QName ([Text], [Text])
+    -- ^ For a view whose columns change other than at the end, the statements that drop
+    -- what depends on it and the ones that create those again.
     , convertedSequences :: Set QName
     -- ^ Sequences a column's change between serial and identity drops or creates, in
     -- the one step that changes the column.
@@ -232,13 +235,16 @@ definition ctx key object change = case object of
     createAt rank (txn, hazards) sql = Step CreatePhase rank object sql txn hazards key change UndoObject
     remove (txn, hazards) sql = Step DropPhase (dropRank object) object sql txn hazards key change UndoObject
     undoneBy steps s = s{undo = UndoBy steps}
+    -- A step another recipe makes, as part of this one: what restores an object created
+    -- again goes with that, so its migration leaves the object whole.
+    asPartOfThis s = s{rank = createRank object, key, change, undo = UndoBy []}
     -- A concurrent build is reverted by dropping what it built.
     builds index = undoneBy [create (None, []) ("drop index concurrently if exists " <> qualified index)]
     manual why = [create (Shared, [Manual why]) ("-- " <> why)]
     -- The unchanged comments of what this step drops and creates again: they go with
     -- the old object, and nothing else in the plan sets them.
     restoreComments objects =
-        [ undoneBy [] (createAt commentRank (Shared, []) ("comment on " <> subject <> " is " <> literal text))
+        [ undoneBy [] (create (Shared, []) ("comment on " <> subject <> " is " <> literal text))
         | o <- objects
         , Just text <- [Map.lookup o ctx.keptComments]
         , Just subject <- [commentTarget o]
@@ -589,11 +595,19 @@ end |]
 
     viewRecipe v = typed asView \case
         Added def -> [create (Shared, []) ("create view " <> viewSql v def)]
-        Changed _ new ->
-            [ create
-                (Shared, [MayFail "fails when a column is removed, renamed or retyped; then drop and recreate it with its dependents"])
-                ("create or replace view " <> viewSql v new)
-            ]
+        Changed old new
+            | extendsColumns old new -> [create (Shared, []) ("create or replace view " <> viewSql v new)]
+            -- create or replace view keeps the columns as they were, adding any at the
+            -- end; otherwise the view, and what depends on it, go and come back.
+            | otherwise ->
+                let (dropDependents, createDependents) = Map.findWithDefault ([], []) v ctx.viewDependents
+                 in map (create (Shared, [])) dropDependents
+                        <> [ create (Shared, [MayFail "fails when other objects depend on the view; then drop them first"]) ("drop view " <> qualified v)
+                           , create (Shared, []) ("create view " <> viewSql v new)
+                           ]
+                        <> restoreOnView v
+                        <> restoreComments (View v : [o | o@(OtherColumn OfView t _) <- Map.keys ctx.keptComments, t == v])
+                        <> map (create (Shared, [])) createDependents
         Dropped _ -> [remove (Shared, []) ("drop view " <> qualified v)]
 
     materializedView v = typed asView \case
@@ -613,8 +627,8 @@ end |]
         Just (indexes, grants) ->
             [create (Shared, [IndexBuild]) def | (_, def) <- indexes]
                 <> restoreComments [Index q | (q, _) <- indexes]
-                <> [createAt privilegesRank (Shared, []) (revokeGranted (qualified v)) | isJust grants]
-                <> maybe [] (\(k, def) -> privileges k k.object (Added def)) grants
+                <> [create (Shared, []) (revokeGranted (qualified v)) | isJust grants]
+                <> maybe [] (\(k, def) -> map asPartOfThis (privileges k k.object (Added def))) grants
 
     trigger t n = case textual of
         Added def -> create (Shared, []) def : restoreComments [Trigger t n]

@@ -118,6 +118,11 @@ units names conventional inverseCtx forward sqitchPlan now steps = nameMigration
                         ]
         -- The migrations holding steps of each object change that its inverse undoes.
         objectUnits = Map.fromListWith (<>) [(s.key, Set.singleton n) | (n, u) <- zip [0 :: Int ..] us, s <- u.deploy, s.undo == UndoObject]
+        -- The first migration with the step that creates or drops the object itself.
+        mainUnits = Map.fromListWith min [(s.key, n) | (n, u) <- zip [0 :: Int ..] us, s <- u.deploy, s.undo == UndoObject, s.rank == createRank s.object || s.rank == dropRank s.object]
+        -- Whether an object's change drops the old object in the drop phase and creates
+        -- the new one in the create phase, so each part has its own inverse.
+        dropThenCreate = Map.map (== Set.fromList [DropPhase, CreatePhase]) $ Map.fromListWith (<>) [(s.key, Set.singleton s.phase) | u <- us, s <- u.deploy, s.undo == UndoObject]
         revertOf n u = concat [undoKey n u (filter ((== k) . (.key)) u.deploy) k | k <- reverse (nubOrd (map (.key) u.deploy))]
         -- The key's steps here, undone last to first; a run of steps the object's
         -- inverse undoes gets it once.
@@ -133,10 +138,11 @@ units names conventional inverseCtx forward sqitchPlan now steps = nameMigration
             | Map.lookup k objectUnits == Just (Set.singleton n) = recipe ctx k (invert change)
             -- The migration with the object's own drop, or create, reverts it; one that only
             -- sets its grants, indexes or comments can be deployed again as it is.
-            | Changed old _ <- change, all ((== DropPhase) . (.phase)) mine = if any (\x -> x.rank == dropRank x.object) mine then recipe ctx k (Added old) else []
-            | Changed _ new <- change, all ((== CreatePhase) . (.phase)) mine = if any (\x -> x.rank == createRank x.object) mine then recipe ctx k (Dropped new) else []
-            -- Otherwise the last migration with a part of it reverts it all.
-            | Just n == (Map.lookup k objectUnits >>= Set.lookupMax) = recipe ctx k (invert change)
+            | Map.findWithDefault False k dropThenCreate, Changed old _ <- change, all ((== DropPhase) . (.phase)) mine = if any (\x -> x.rank == dropRank x.object) mine then recipe ctx k (Added old) else []
+            | Map.findWithDefault False k dropThenCreate, Changed _ new <- change, all ((== CreatePhase) . (.phase)) mine = if any (\x -> x.rank == createRank x.object) mine then recipe ctx k (Dropped new) else []
+            -- Otherwise the migration with its main step reverts it all, or the last with
+            -- a part of it when none has one.
+            | Just n == (Map.lookup k mainUnits <|> (Map.lookup k objectUnits >>= Set.lookupMax)) = recipe ctx k (invert change)
             | otherwise = []
 
     refill s

@@ -38,7 +38,7 @@ import Sqiff.Folder (writeFolder)
 import Sqiff.Model
 import Sqiff.Plan (context, cycleMessage, invert, planWith, renderStep)
 import Sqiff.Recipe (Step)
-import Sqiff.Recreate (withViewsAround)
+import Sqiff.Recreate (withViewsAround, withViewsReplaced)
 import Sqiff.Sqitch (withProject, writeUnits)
 import Sqiff.Sqitch.Check (Tagging (..), batchProblems)
 import Sqiff.Sqitch.Layout (findLayout, planPath)
@@ -97,7 +97,10 @@ runSqitch from toDb opts = do
     let inverse = Map.map invert planned.changes
         -- A retype's views are the same on both sides, so its revert recreates them
         -- around the column as the plan does.
-        inverseCtx = withViewsAround planned.fromSchema planned.fromEdges planned.changes (context Map.empty planned.toSchema planned.fromSchema planned.toEdges inverse)
+        inverseCtx =
+            withViewsReplaced planned.fromSchema planned.toEdges inverse
+                . withViewsAround planned.fromSchema planned.fromEdges planned.changes
+                $ context Map.empty planned.toSchema planned.fromSchema planned.toEdges inverse
         written = units config.names (const True) inverseCtx planned.changes sqitchPlan now planned.steps
         tagging = Tagging{given = opts.tag, now}
     measure "sqitch.planUnits" (sum [length u.deploy + length u.revert | u <- written])
@@ -130,7 +133,7 @@ planBoth :: Source -> ConnectionString -> RIO AppEnv Planned
 planBoth from toDb = do
     ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth from toDb ForPlan
     let changes = diff (sameDefinition checks) fromSchema toSchema
-    steps <- either (failWith . cycleMessage) pure (planWith (withViewsAround fromSchema fromEdges changes) (checks :: Map ObjectKey BodyCheck) fromSchema toSchema fromEdges toEdges changes)
+    steps <- either (failWith . cycleMessage) pure (planWith (withViewsReplaced toSchema fromEdges changes . withViewsAround fromSchema fromEdges changes) (checks :: Map ObjectKey BodyCheck) fromSchema toSchema fromEdges toEdges changes)
     pure Planned{fromSchema, fromEdges, toSchema, toEdges, changes, steps}
 
 

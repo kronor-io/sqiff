@@ -358,6 +358,23 @@ Guiding rules:
   - New fixtures `serial-to-identity` and `identity-to-serial` pass every round trip,
     revert walk included; both failed before.
 
+- [x] **A view that loses, renames or retypes a column is created again.**
+  - A view's description records its columns (name and type, `ViewColumns`). Like a
+    column's position, they never make two views differ.
+  - When the new columns extend the old ones, the plan keeps `create or replace view`.
+    Otherwise it drops every dependent (views, materialized views, routines that hold
+    them), drops and creates the view, restores its grants and comments, and creates the
+    dependents again as the desired database has them, except ones the plan drops.
+  - A recreation's restore steps (indexes, grants, comments) take the object's create
+    rank and the recreation's key. They stay in its migration, so deploying or reverting
+    that migration leaves the object whole.
+  - In a split change, a migration's revert follows the drop and create phases only when
+    the change has both. Otherwise the migration with the object's main step reverts it.
+  - Views created again restore grants only when they have explicit ones, which drops
+    the no-op "revoke what was granted" blocks from several goldens.
+  - The new fixture `view-column-removed` passes every round trip. `change-view` loses
+    its `revert-gap`, since its revert now recreates the view.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

@@ -14,6 +14,3 @@ SELECT id,
 -- hazard: builds an index
 CREATE INDEX mv_a ON public.mv USING btree (a);
 
--- materialized view public.mv
-do $$ declare g text; begin for g in select distinct case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end from pg_class c cross join aclexplode(c.relacl) x where c.oid = 'public.mv'::regclass and x.grantee <> c.relowner loop execute format('revoke all on table %s from %s', 'public.mv', g); end loop; end $$;
-

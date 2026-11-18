@@ -51,6 +51,9 @@ module Sqiff.Definition (
     PartitionOf (..),
     tableText,
     ViewDef (..),
+    ViewColumns (..),
+    viewColumns,
+    extendsColumns,
     viewText,
     withOptions,
 
@@ -442,9 +445,32 @@ data ViewDef = ViewDef
     -- ^ Nothing when the view has no options at all.
     , query :: Text
     -- ^ As @pg_get_viewdef@ prints it.
+    , columns :: ViewColumns
     }
     deriving stock (Eq, Show, Generic)
     deriving anyclass (NFData)
+
+
+-- | A view's columns, names and types in order. They follow from its query, so they are
+-- not part of its definition: every list equals every other, as a view over a retyped
+-- column is not itself changed. A recipe reads them with 'viewColumns'.
+newtype ViewColumns = ViewColumns [(Identifier, TypeName)]
+    deriving stock (Show)
+    deriving newtype (NFData)
+
+
+instance Eq ViewColumns where
+    _ == _ = True
+
+
+viewColumns :: ViewDef -> [(Identifier, TypeName)]
+viewColumns v = let ViewColumns cs = v.columns in cs
+
+
+-- | Whether @new@ keeps @old@'s columns as they are, adding any at the end, which is what
+-- @create or replace view@ allows.
+extendsColumns :: ViewDef -> ViewDef -> Bool
+extendsColumns old new = viewColumns old `L.isPrefixOf` viewColumns new
 
 
 viewText :: ViewDef -> Text
@@ -513,7 +539,14 @@ instance FromJSON TableDef where
 
 
 instance FromJSON ViewDef where
-    parseJSON = withObject "view" \o -> ViewDef <$> o .:? "options" <*> o .: "query"
+    parseJSON = withObject "view" \o -> do
+        columns <- o .:? "columns" .!= []
+        ViewDef
+            <$> o
+            .:? "options"
+            <*> o
+            .: "query"
+            <*> pure (ViewColumns [(identifier n, typeName t) | (n, t) <- columns])
 
 
 instance FromJSON IndexDef where

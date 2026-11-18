@@ -126,11 +126,11 @@ context checks fromSchema toSchema fromEdges changes =
         , withDependents = Set.fromList [e.referenced | e <- fromEdges]
         , recreatedViews =
             Map.fromList
-                [ (v, (indexesOn v, (grantsKey,) <$> Map.lookup grantsKey toSchema))
+                [ (v, (indexesOn v, (grantsKey,) <$> mfilter explicit (Map.lookup grantsKey toSchema)))
                 | (k, Changed _ _) <- Map.toList changes
                 , k.aspect == Definition
                 , let grantsKey = k{aspect = Privileges}
-                , MaterializedView v <- [k.object]
+                , Just v <- [case k.object of MaterializedView v -> Just v; View v -> Just v; _ -> Nothing]
                 ]
         , keptComments =
             Map.fromList
@@ -158,6 +158,7 @@ context checks fromSchema toSchema fromEdges changes =
                 ]
         , viewsAround = Map.empty
         , droppedObjects = Set.fromList [k.object | (k, Dropped _) <- Map.toList changes, k.aspect == Definition]
+        , viewDependents = Map.empty
         , convertedSequences =
             Set.fromList
                 [ s
@@ -182,6 +183,10 @@ context checks fromSchema toSchema fromEdges changes =
         , Index q <- [k.object]
         , def.table == v
         ]
+    -- A view created again starts with the default privileges.
+    explicit = \case
+        AclDefinition (ExplicitAcl _) -> True
+        _ -> False
     tablesWith p = Set.fromList [t | (Table t, change) <- definitions, p change]
     isAdded = \case Added _ -> True; _ -> False
     isDropped = \case Dropped _ -> True; _ -> False

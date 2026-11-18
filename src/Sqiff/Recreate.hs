@@ -9,6 +9,7 @@
 module Sqiff.Recreate (
     viewsAroundTypeChanges,
     withViewsAround,
+    withViewsReplaced,
     retypedIn,
     standardBody,
 ) where
@@ -19,8 +20,8 @@ import RIO
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import Sqiff.Definition
-import Sqiff.Diff (Change (..), Changes, affected)
-import Sqiff.Graph (topoOrder)
+import Sqiff.Diff (Change (..), Changes, affected, dependentsBy)
+import Sqiff.Graph (reachedFrom, topoOrder)
 import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Plan (context)
@@ -35,6 +36,14 @@ withViewsAround schema edges changes ctx =
   where
     known = Set.fromList [k.object | k <- Map.keys schema, k.aspect == Definition]
     exact = affected known edges changes
+
+
+-- | Adds to the context what to drop and create again around each view whose columns
+-- change, by what depends on it in the database being changed (@edges@), as the desired
+-- one (@toSchema@) has it.
+withViewsReplaced :: Schema -> [Edge] -> Changes -> Context -> Context
+withViewsReplaced toSchema edges changes ctx =
+    ctx{viewDependents = viewsToRecreate toSchema edges changes}
 
 
 -- | The columns whose type or collation changes, with their identities.
@@ -53,12 +62,12 @@ retypedIn changes =
 viewsAroundTypeChanges :: Map ObjectId (Set ObjectId) -> Schema -> [Edge] -> [(QName, Identifier, ObjectId)] -> Map (QName, Identifier) (Set ObjectId, ([Text], [Text]))
 viewsAroundTypeChanges exact schema edges retyped =
     Map.fromList
-        [ ((t, c), (members, (map dropStatement (reverse order), concatMap createAgain order)))
+        [ ((t, c), (members, (map dropStatement (reverse order), concatMap (createAgain schema) order)))
         | (t, c, column) <- retyped
         , let closure = Map.findWithDefault Set.empty column exact
               onColumn = Set.filter (\a -> isPolicyOrTrigger a && any (\e -> e.dependent == a && e.referenced == column) edges) closure
-              members = held column closure (Set.filter isView closure <> onColumn)
-              order = topoOrder members [(d, r) | e <- edges, let d = relationOf e.dependent, let r = relationOf e.referenced, d `Set.member` members, r `Set.member` members]
+              members = held schema edges column closure (Set.filter isView closure <> onColumn)
+              order = inDependencyOrder edges members
         , not (Set.null members)
         ]
   where
@@ -66,41 +75,79 @@ viewsAroundTypeChanges exact schema edges retyped =
         Policy{} -> True
         Trigger{} -> True
         _ -> False
-    -- Adds the routines whose definitions hold the column or one of the members, until
-    -- no more do.
-    held column closure members =
-        let views = Set.filter isView members
-            holds r = case printed <$> Map.lookup (definitionKey r) schema of
-                Just def
-                    | standardBody def -> any (\e -> e.dependent == r && (e.referenced == column || relationOf e.referenced `Set.member` members)) edges
-                    | otherwise -> any (\v -> qualifiedName v `T.isInfixOf` signature def) views
-                Nothing -> False
-            more = Set.filter (\r -> isRoutine r && r `Set.notMember` members && holds r) closure
-         in if Set.null more then members else held column closure (members <> more)
+
+
+-- | For each view whose columns change other than by new ones at the end, which
+-- @create or replace view@ refuses, the statements that drop what depends on it in the
+-- database being changed, and the ones that create those again as @toSchema@ has them;
+-- one the plan drops is not created again.
+viewsToRecreate :: Schema -> [Edge] -> Changes -> Map QName ([Text], [Text])
+viewsToRecreate toSchema edges changes =
+    Map.fromList
+        [ (v, (map (dropWith " if exists") (reverse order), concatMap (createAgain toSchema) (filter wanted order)))
+        | (k, Changed (ViewDefinition old) (ViewDefinition new)) <- Map.toList changes
+        , k.aspect == Definition
+        , View v <- [k.object]
+        , not (extendsColumns old new)
+        , -- Every dependent, changed ones included: they go before the view does.
+        let closure = reachedFrom (dependentsBy edges) (Set.singleton k.object)
+            order = inDependencyOrder edges (held toSchema edges k.object closure (Set.filter isView closure))
+        ]
+  where
+    wanted a = definitionKey a `Map.member` toSchema
+
+
+-- | The members in the order they can be created, by the relations they depend on.
+inDependencyOrder :: [Edge] -> Set ObjectId -> [ObjectId]
+inDependencyOrder edges members =
+    topoOrder members [(d, r) | e <- edges, let d = relationOf e.dependent, let r = relationOf e.referenced, d `Set.member` members, r `Set.member` members]
+
+
+-- | @members@ and the routines whose definitions hold @start@ or one of them, until no
+-- more do.
+held :: Schema -> [Edge] -> ObjectId -> Set ObjectId -> Set ObjectId -> Set ObjectId
+held schema edges start closure members =
+    let views = Set.filter isView members
+        holds r = case printed <$> Map.lookup (definitionKey r) schema of
+            Just def
+                | standardBody def -> any (\e -> e.dependent == r && (e.referenced == start || relationOf e.referenced `Set.member` members)) edges
+                | otherwise -> any (\v -> qualifiedName v `T.isInfixOf` signature def) views
+            Nothing -> False
+        more = Set.filter (\r -> isRoutine r && r `Set.notMember` members && holds r) closure
+     in if Set.null more then members else held schema edges start closure (members <> more)
+  where
     signature = T.unlines . takeWhile (\l -> not ("AS " `T.isPrefixOf` T.stripStart l || "BEGIN ATOMIC" `T.isInfixOf` l)) . T.lines
+
+
+-- | The statements that create @a@ as @schema@ has it, with its grants, indexes, triggers
+-- and comments.
+createAgain :: Schema -> ObjectId -> [Text]
+createAgain schema a =
+    concat
+        [ [revokeGranted (qualifiedName a) | aspect == Privileges, isView a] <> stepsFor key (Added def)
+        | aspect <- [Definition, Privileges]
+        , let key = ObjectKey aspect a
+        , Just def <- [Map.lookup key schema]
+        , -- A view created again starts with the default privileges.
+        aspect == Definition || not (isDefault def)
+        ]
+        <> [ printed def
+           | (k, def) <- Map.toList schema
+           , k.aspect == Definition
+           , case k.object of
+                Index _ | IndexDefinition ix <- def -> isRelation a == Just ix.table
+                Trigger t _ -> isRelation a == Just t
+                _ -> False
+           ]
+        <> concat
+            [ stepsFor k (Added def)
+            | (k, def) <- Map.toList schema
+            , k.aspect == Comment
+            , k.object == a || (relationOf k.object == a && k.object /= a)
+            ]
+  where
     ctx0 = context Map.empty Map.empty Map.empty [] Map.empty
     stepsFor key c = map (.sql) (recipe ctx0 key c)
-    createAgain a =
-        concat
-            [ [revokeGranted (qualifiedName a) | aspect == Privileges, isView a] <> stepsFor key (Added def)
-            | aspect <- [Definition, Privileges]
-            , let key = ObjectKey aspect a
-            , Just def <- [Map.lookup key schema]
-            ]
-            <> [ printed def
-               | (k, def) <- Map.toList schema
-               , k.aspect == Definition
-               , case k.object of
-                    Index _ | IndexDefinition ix <- def -> isRelation a == Just ix.table
-                    Trigger t _ -> isRelation a == Just t
-                    _ -> False
-               ]
-            <> concat
-                [ stepsFor k (Added def)
-                | (k, def) <- Map.toList schema
-                , k.aspect == Comment
-                , k.object == a || (relationOf k.object == a && k.object /= a)
-                ]
 
 
 -- | The relation a column belongs to; any other object is its own.
@@ -123,16 +170,28 @@ qualifiedName object = case (toAddress object).objectNames of
 
 -- | The statement that drops a view, routine, policy or trigger around a type change.
 dropStatement :: ObjectId -> Text
-dropStatement object = case object of
+dropStatement = dropWith ""
+
+
+-- | 'dropStatement' with @ifExists@ after the kind of object.
+dropWith :: Text -> ObjectId -> Text
+dropWith ifExists object = case object of
     Routine _ q args ->
-        let keyword = (toAddress object).objectType
-            list = T.intercalate ", " (map typeText args)
-         in [i|drop #{keyword} #{qualified q}(#{list})|]
-    Policy t n -> [i|drop policy #{quoted n} on #{qualified t}|]
-    Trigger t n -> [i|drop trigger #{quoted n} on #{qualified t}|]
-    _ -> let keyword = (toAddress object).objectType in [i|drop #{keyword} #{qualifiedName object}|]
+        let list = T.intercalate ", " (map typeText args)
+         in [i|drop #{keyword}#{ifExists} #{qualified q}(#{list})|]
+    Policy t n -> [i|drop policy#{ifExists} #{quoted n} on #{qualified t}|]
+    Trigger t n -> [i|drop trigger#{ifExists} #{quoted n} on #{qualified t}|]
+    _ -> [i|drop #{keyword}#{ifExists} #{qualifiedName object}|]
+  where
+    keyword = (toAddress object).objectType
 
 
 -- | A SQL-standard body, which PostgreSQL parses once and tracks in pg_depend.
 standardBody :: Text -> Bool
 standardBody def = "BEGIN ATOMIC" `T.isInfixOf` def || any ("RETURN " `T.isPrefixOf`) (T.lines def)
+
+
+isDefault :: Definition -> Bool
+isDefault = \case
+    AclDefinition DefaultAcl -> True
+    _ -> False

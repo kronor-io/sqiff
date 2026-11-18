@@ -1,0 +1,75 @@
+-- view public.uses_b
+-- hazard: fails when other objects depend on the view; then drop them first
+drop view public.uses_b;
+
+-- view public.uses_b
+create view public.uses_b as
+SELECT id
+   FROM public.v;
+
+-- view public.v
+drop view if exists public.uses_b;
+
+-- view public.v
+drop view if exists public.keeps;
+
+-- view public.v
+-- hazard: fails when other objects depend on the view; then drop them first
+drop view public.v;
+
+-- view public.v
+create view public.v as
+SELECT id,
+    a
+   FROM public.t;
+
+-- view public.v
+do $$ declare g text; begin for g in select distinct case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end from pg_class c cross join aclexplode(c.relacl) x where c.oid = 'public.v'::regclass and x.grantee <> c.relowner loop execute format('revoke all on table %s from %s', 'public.v', g); end loop; end $$;
+
+-- view public.v
+grant SELECT on table public.v to reader;
+
+-- view public.v
+grant DELETE on table public.v to sqiff;
+
+-- view public.v
+grant INSERT on table public.v to sqiff;
+
+-- view public.v
+grant MAINTAIN on table public.v to sqiff;
+
+-- view public.v
+grant REFERENCES on table public.v to sqiff;
+
+-- view public.v
+grant SELECT on table public.v to sqiff;
+
+-- view public.v
+grant TRIGGER on table public.v to sqiff;
+
+-- view public.v
+grant TRUNCATE on table public.v to sqiff;
+
+-- view public.v
+grant UPDATE on table public.v to sqiff;
+
+-- view public.v
+comment on view public.v is 'the view';
+
+-- view public.v
+comment on column public.v.a is 'column a';
+
+-- view public.v
+create view public.keeps as
+SELECT id,
+    a
+   FROM public.v;
+
+-- view public.v
+comment on view public.keeps is 'unchanged dependent';
+
+-- view public.v
+create view public.uses_b as
+SELECT id
+   FROM public.v;
+

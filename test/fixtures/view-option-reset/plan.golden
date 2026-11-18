@@ -1,5 +1,4 @@
 -- view public.v
--- hazard: fails when a column is removed, renamed or retyped; then drop and recreate it with its dependents
 create or replace view public.v as
 SELECT id
    FROM public.t;

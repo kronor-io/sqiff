@@ -8,7 +8,12 @@ select
             jsonb_build_object(
                 'kind', 'view',
                 'options', c.reloptions,
-                'query', pg_get_viewdef(c.oid)
+                'query', pg_get_viewdef(c.oid),
+                'columns', (
+                    select coalesce(jsonb_agg(jsonb_build_array(a.attname, format_type(a.atttypid, a.atttypmod)) order by a.attnum), '[]')
+                    from pg_attribute a
+                    where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+                )
             )
         else jsonb_build_object(
             'kind', 'table',
