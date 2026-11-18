@@ -2,6 +2,36 @@
 
 sqiff compares PostgreSQL schemas and writes the difference as sqitch changes.
 
+## Install
+
+Install it from the flake. The repository is private, so nix needs access to it on GitHub, for example a token in `access-tokens` in `nix.conf`.
+
+```bash
+nix run github:kronor-io/sqiff -- --help
+```
+
+```bash
+nix profile install github:kronor-io/sqiff
+```
+
+In a clone, `nix build .#sqiff` puts the binary in `result/bin`. `nix develop` gives a shell with GHC, cabal, Postgres, sqitch and git, where `cabal build` and `cabal install` work with the dependency versions in `cabal.project.freeze`.
+
+sqiff needs a reachable Postgres, given with `--db` (`--to` for `diff`, `plan` and `sqitch`) or with libpq's `PG*` variables. It also runs `git` and `sqitch`, and `docker` for `--from master`. The PL/pgSQL body checks need the plpgsql_check extension in the database; without it they are skipped with a note.
+
+## Examples
+
+Write a local database's schema to `schema/`, one file per object:
+
+```bash
+sqiff describe --db "host=localhost dbname=app" --out schema
+```
+
+In a sqitch project, rewrite the deploy file of table `public.orders` to create the table as the database in `PG*` has it, and rework its sqitch change (leave out `--write` to only print the new file):
+
+```bash
+sqiff table deploy/public/table/orders.sql --rewrite-file --write
+```
+
 ## Commands
 
 - `sqiff table FILE [--db CONNINFO] [--write]` prints the migration for an edited table deploy file. It builds the table from the file at `--base` (master) and from your edit inside one rolled-back transaction. With `--write` it adds the migration with `sqitch add` and reworks the table's change.
@@ -19,9 +49,9 @@ Run it from the root of the sqitch project.
 **`sqiff.yaml`**, next to `sqitch.conf`, holds the rest. Every key is optional; an unknown key is an error.
 
 ```yaml
-exclude-schemas: [hdb_catalog]       # left out of every comparison
+exclude-schemas: [audit]             # left out of every comparison
 rename-hint: "..."                   # added to the warning on a column rename
-templates: _dev/sqitch/templates     # create-migration's templates: add_column, add_index, validate_constraint, migration
+templates: sqitch/templates          # sqitch templates for new changes: add_column, add_index, validate_constraint, migration
 
 names:                               # change names; the defaults are shown
   table: "{schema}/table/{name}"
@@ -60,16 +90,4 @@ In `deploy` and `status` arguments, `{host}`, `{port}`, `{user}` and `{database}
 
 The password reaches sqitch as `PGPASSWORD` and sqiff's own connections in the connection string; it is never put in sqitch's arguments.
 
-Without `templates`, `--write` uses sqitch's own templates and writes the scripts itself. Each repository gets its own baseline, shared by its worktrees and jj workspaces, under `~/.cache/sqiff`.
-
-## Build
-
-```bash
-nix build .#sqiff
-```
-
-Inside kronor's dev shell, `cabal build` works too: the shell's GHC already has every dependency at the versions in `cabal.project.freeze`.
-
-## Needs at run time
-
-`git` and `sqitch`, and `docker` for `--from`. The database needs plpgsql_check for the PL/pgSQL body checks; without it they are skipped with a note.
+With `templates`, `--write` adds a change that adds a column, adds an index or validates a constraint from the matching template, passing `schema`, `table_name` and `column_name`, `index_name` or `constraint_name`; other new migrations use `migration`. In `add_column`, sqiff puts the column's type and options where `__your_type_here__ null` is, and it expects `add_index` to name the index `idx_<table_name>_<index_name>`. create-migration's templates already fit, so `templates` can point at them. Without `templates`, `--write` uses sqitch's own templates and writes the scripts itself. Each repository gets its own baseline, shared by its worktrees and jj workspaces, under `~/.cache/sqiff`.
