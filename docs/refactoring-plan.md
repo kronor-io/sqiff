@@ -220,6 +220,15 @@ Guiding rules:
       `sqitch deploy`, then `sqiff diff`, which found nothing left.
   - Not done: reverts per unit (Codex 16) and serial-to-identity coordination (Codex 11).
 
+- [x] **Column order of new tables (Codex 28, in part).**
+  - `CREATE TABLE` used to list a new table's columns by name, so `created_at` came
+    before `id`.
+  - Each column now carries its `attnum` as a `Position`, and new tables list their
+    columns by it.
+  - A `Position` equals every other, so the same column in two databases that added
+    their columns in different orders does not show as changed.
+  - The rest of finding 28 (ownership, inheritance, range-type options) is open.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

@@ -4,6 +4,7 @@ select
     a.attnum::int as objsubid,
     a.attrelid as relid,
     jsonb_build_object(
+        'position', a.attnum,
         'type', format_type(a.atttypid, a.atttypmod),
         'collation', case when a.attcollation <> t.typcollation then co.collname end,
         'not_null', case

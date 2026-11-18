@@ -27,6 +27,8 @@ module Sqiff.Definition (
 
     -- * Columns
     ColumnDef (..),
+    Position (..),
+    positionNumber,
     Nullability (..),
     Validity (..),
     ColumnValue (..),
@@ -220,9 +222,31 @@ data ColumnDef = ColumnDef
     , rewritesOnAdd :: Bool
     -- ^ Adding the column rewrites the table: its default is volatile, or its type a
     -- domain with constraints.
+    , position :: Position
     }
     deriving stock (Eq, Show, Generic)
     deriving anyclass (NFData)
+
+
+-- | Where a column sits in its table (@attnum@), so a new table gets its columns in
+-- order. It is not part of the column's definition: every position equals every other,
+-- so the same column compares equal in two databases that added their columns in
+-- different orders. Sort by 'positionNumber'.
+newtype Position = Position Int
+    deriving stock (Show)
+    deriving newtype (NFData)
+
+
+instance Eq Position where
+    _ == _ = True
+
+
+instance Ord Position where
+    compare _ _ = EQ
+
+
+positionNumber :: Position -> Int
+positionNumber (Position n) = n
 
 
 data Nullability
@@ -354,7 +378,8 @@ instance FromJSON ColumnDef where
             (Nothing, Nothing) -> pure (PlainColumn expression)
             (Just _, Just _) -> fail "a column cannot be both an identity and generated"
         rewritesOnAdd <- o .:? "rewrites_on_add" .!= False
-        pure ColumnDef{colType, collation, nullability, value, rewritesOnAdd}
+        position <- Position <$> o .:? "position" .!= 0
+        pure ColumnDef{colType, collation, nullability, value, rewritesOnAdd, position}
       where
         identityKind :: Text -> Parser IdentityKind
         identityKind = \case

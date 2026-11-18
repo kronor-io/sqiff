@@ -6,8 +6,8 @@ AS $function$select md5(random()::text)$function$;
 
 -- table app.voucher
 create table app.voucher (
-    code text not null default app.next_code(),
-    id integer not null
+    id integer not null,
+    code text not null default app.next_code()
 );
 
 -- table constraint app.voucher.voucher_pkey

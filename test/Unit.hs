@@ -363,7 +363,7 @@ columns =
         , testCase "drift ignores validity but not the words \"not valid\" in a comment" do
             let key o = ObjectKey Comment o
                 table = Table (qname "public" "t")
-                column validity = ColumnDefinition (ColumnDef (typeName "int") Nothing (NotNull validity Nothing) (PlainColumn Nothing) False)
+                column validity = ColumnDefinition (ColumnDef (typeName "int") Nothing (NotNull validity Nothing) (PlainColumn Nothing) False (Position 1))
                 columnKey = ObjectKey Definition (Column (qname "public" "t") (identifier "c"))
             Map.keys (fileDrift Set.empty (Map.fromList [(key table, Printed "is not valid")]) (Map.fromList [(key table, Printed "is")])) @?= [key table]
             fileDrift Set.empty (Map.fromList [(columnKey, column NotValidated)]) (Map.fromList [(columnKey, column Validated)]) @?= Map.empty
@@ -486,6 +486,10 @@ sqitchChecks =
             length (batchProblems p [unitNamed AddChange "a"]) @?= 1
             length (batchProblems p [unitNamed ReworkChange "c"]) @?= 1
             batchProblems p [unitNamed ReworkChange "a", unitNamed AddChange "b"] @?= []
+        , testCase "a column's position does not make it differ" do
+            let at n = ColumnDefinition (ColumnDef (typeName "int") Nothing Nullable (PlainColumn Nothing) False (Position n))
+                key = ObjectKey Definition (Column (qname "public" "t") (identifier "a"))
+            diff (\_ a b -> a == b) (Map.fromList [(key, at 1)]) (Map.fromList [(key, at 3)]) @?= Map.empty
         , testCase "overloads of a new function make one change" do
             let names = either error id (Aeson.eitherDecode "{}")
                 ctx = context Map.empty Map.empty Map.empty [] Map.empty

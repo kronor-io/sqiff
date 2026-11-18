@@ -1,6 +1,6 @@
 -- table app.events
 create table app.events (
-    at date not null,
-    id bigint not null
+    id bigint not null,
+    at date not null
 ) partition by RANGE (at);
 

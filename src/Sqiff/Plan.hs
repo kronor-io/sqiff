@@ -152,9 +152,9 @@ context checks fromSchema toSchema fromEdges changes =
         , viewsAround = Map.empty
         , droppedObjects = Set.fromList [k.object | (k, Dropped _) <- Map.toList changes, k.aspect == Definition]
         , newTableColumns =
-            Map.fromListWith
-                (flip (<>))
-                [(t, [(c, def)]) | (Column t c, Added (ColumnDefinition def)) <- definitions, t `Set.member` tablesWith isAdded]
+            Map.map (L.sortOn (\(_, def) -> positionNumber def.position))
+                . Map.fromListWith (flip (<>))
+                $ [(t, [(c, def)]) | (Column t c, Added (ColumnDefinition def)) <- definitions, t `Set.member` tablesWith isAdded]
         }
   where
     definitions = [(k.object, change) | (k, change) <- Map.toList changes, k.aspect == Definition]
