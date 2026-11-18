@@ -37,7 +37,7 @@ import Sqiff.Git (Repo, findRepo, showFile)
 import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Plan (context, invert, plan, planWith, renderStep, topoOrder)
-import Sqiff.Recipe (Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), recipe, referencedTable, revokeGranted)
+import Sqiff.Recipe (Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), recipe, revokeGranted)
 import Sqiff.Rewrite (Rewrite (..), fileDrift, rewriteFile)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
 import Sqiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), deployedChanges, moveToEnd, parsePlan, plannedChanges, readPlan, requireSqitch, reworkEdited, units, writeUnits)
@@ -288,7 +288,7 @@ viewsAroundTypeChanges deps retyped =
                | (k, def) <- Map.toList deps.dbSchema
                , k.aspect == Definition
                , case k.object of
-                    Index _ -> [i| ON #{qualifiedName a} |] `T.isInfixOf` printed def
+                    Index _ | IndexDefinition ix <- def -> isRelation a == Just ix.table
                     Trigger t _ -> isRelation a == Just t
                     _ -> False
                ]
@@ -335,24 +335,13 @@ standardBody :: Text -> Bool
 standardBody def = "BEGIN ATOMIC" `T.isInfixOf` def || any ("RETURN " `T.isPrefixOf`) (T.lines def)
 
 
--- | For a foreign key constraint's definition, each of its columns' types paired with the
--- referenced column's, by @typeIn table column@.
-foreignKeyTypes :: (QName -> Identifier -> Maybe Text) -> ObjectId -> Text -> Maybe [(Text, Text)]
-foreignKeyTypes typeIn constraint def = do
-    TableConstraint table _ <- Just constraint
-    rest <- T.stripPrefix "FOREIGN KEY " def
-    let (cols, afterCols) = columnList rest
-    refPart <- T.stripPrefix " REFERENCES " afterCols
-    let (refTable, refRest) = T.break (== '(') refPart
-        (refCols, _) = columnList refRest
-        referenced = case T.break (== '.') refTable of
-            (name, "") -> qname "public" (unquote name)
-            (schema, name) -> qname (unquote schema) (unquote (T.drop 1 name))
-    guard (length cols == length refCols && not (null cols))
-    for (zip cols refCols) \(a, b) -> (,) <$> typeIn table a <*> typeIn referenced b
-  where
-    columnList x = let (inside, after) = T.break (== ')') (T.drop 1 x) in (map (identifier . unquote . T.strip) (T.split (== ',') inside), T.drop 1 after)
-    unquote c = fromMaybe c (T.stripPrefix "\"" c >>= T.stripSuffix "\"")
+-- | For a foreign key on @table@, each of its columns' types paired with the referenced
+-- column's, by @typeIn table column@.
+foreignKeyTypes :: (QName -> Identifier -> Maybe Text) -> QName -> ConstraintDef -> Maybe [(Text, Text)]
+foreignKeyTypes typeIn table def = do
+    target <- def.references
+    guard (length def.columns == length target.columns && not (null def.columns))
+    for (zip def.columns target.columns) \(a, b) -> (,) <$> typeIn table a <*> typeIn target.table b
 
 
 -- | Connections per database; the describe queries run over all of them at once.
@@ -918,9 +907,9 @@ foreignKeyBreaksFor conn deps retyped =
         <$> for
             [ (addr, k, types)
             | addr <- map retypedObject retyped
-            , k@TableConstraint{} <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
-            , Just def <- [printed <$> Map.lookup (definitionKey k) deps.dbSchema]
-            , Just types <- [foreignKeyTypes typeIn k def]
+            , k@(TableConstraint onTable _) <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
+            , Just (ConstraintDefinition def) <- [Map.lookup (definitionKey k) deps.dbSchema]
+            , Just types <- [foreignKeyTypes typeIn onTable def]
             ]
             \(addr, k, types) -> fmap (\err -> (addr, [(k, err)])) <$> foreignKeyError conn types
   where
@@ -955,9 +944,9 @@ findingsFor env ev = Findings{steps, renameSteps, newRenames = ev.pendingRenames
             . Set.fromList
             $ [ other
               | k@(TableConstraint onTable _) <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
-              , Just def <- [printed <$> Map.lookup (definitionKey k) deps.dbSchema]
-              , Just referenced <- [referencedTable def]
-              , let other = if onTable == table then referenced else qualified onTable
+              , Just (ConstraintDefinition def) <- [Map.lookup (definitionKey k) deps.dbSchema]
+              , Just target <- [def.references]
+              , let other = if onTable == table then qualified target.table else qualified onTable
               , other /= qualified table
               ]
     convertNote = MayFail "fails when an existing value does not convert to the new type"

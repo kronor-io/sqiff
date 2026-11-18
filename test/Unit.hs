@@ -18,7 +18,7 @@ import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import Sqiff.Config (fill, match)
 import Sqiff.ConnectionString (connectionString, fromPairs, libpqText, redacted)
-import Sqiff.Definition
+import Sqiff.Definition hiding (columns)
 import Sqiff.Diff (Change (..), diff)
 import Sqiff.Identifier (identifier, qname, quoteIdent, typeName)
 import Sqiff.Model (Address (..), Aspect (..), ObjectId (..), ObjectKey (..), fromAddress, toAddress)
@@ -324,6 +324,14 @@ columns =
                 columnKey = ObjectKey Definition (Column (qname "public" "t") (identifier "c"))
             Map.keys (fileDrift Set.empty (Map.fromList [(key table, Printed "is not valid")]) (Map.fromList [(key table, Printed "is")])) @?= [key table]
             fileDrift Set.empty (Map.fromList [(columnKey, column NotValidated)]) (Map.fromList [(columnKey, column Validated)]) @?= Map.empty
+        , testCase "a foreign key knows its columns and target" do
+            c <- decode @ConstraintDef "{\"kind\": \"f\", \"validated\": false, \"columns\": [\"Parent Id\"], \"references\": {\"schema\": \"a.b\", \"table\": \"t\", \"columns\": [\"id\"]}, \"clause\": \"FOREIGN KEY (\\\"Parent Id\\\") REFERENCES \\\"a.b\\\".t(id) NOT VALID\"}"
+            c.kind @?= ForeignKey
+            fmap (.table) c.references @?= Just (qname "a.b" "t")
+            withoutValidity c @?= c{validity = Validated, clause = "FOREIGN KEY (\"Parent Id\") REFERENCES \"a.b\".t(id)"}
+        , testCase "a table's settings print one per line" do
+            t <- decode @TableDef "{\"unlogged\": true, \"partition_by\": \"RANGE (at)\", \"row_security\": true, \"force_row_security\": false, \"options\": [\"fillfactor=70\", \"toast.autovacuum_enabled=false\"]}"
+            tableText t @?= "unlogged\npartition by RANGE (at)\nrow level security\nwith (fillfactor=70, toast.autovacuum_enabled=false)"
         , testCase "no ACL is the default, an empty one is not" do
             decode "null" >>= (@?= DefaultAcl)
             decode "[]" >>= (@?= ExplicitAcl Set.empty)

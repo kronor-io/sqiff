@@ -41,6 +41,7 @@ module Sqiff.Catalog (
 ) where
 
 import Data.Aeson qualified as Aeson
+import Data.Aeson.Types qualified as Aeson
 import Data.FileEmbed (embedDir, embedFile, makeRelativeToProject)
 import Data.Functor.Contravariant (contramap)
 import Data.String.Interpolate (i)
@@ -188,12 +189,21 @@ describeOn conns excluded partitions onlyTable = do
         "comment" -> Comment
         _ -> Definition
 
-    -- The column and privilege queries describe their objects as JSON; the others print them.
+    -- The column, privilege, index, constraint and relation queries describe their
+    -- objects as JSON; the others print them.
     decodeDefinition :: String -> Text -> Either String Definition
     decodeDefinition = \case
         "column" -> fmap ColumnDefinition . Aeson.eitherDecodeStrict . encodeUtf8
         "privileges" -> fmap AclDefinition . Aeson.eitherDecodeStrict . encodeUtf8
+        "index" -> fmap IndexDefinition . Aeson.eitherDecodeStrict . encodeUtf8
+        "constraint" -> fmap ConstraintDefinition . Aeson.eitherDecodeStrict . encodeUtf8
+        "relation" -> Aeson.eitherDecodeStrict . encodeUtf8 >=> relation
         _ -> Right . Printed
+    relation = Aeson.parseEither \v -> flip (Aeson.withObject "relation") v \o ->
+        o Aeson..: "kind" >>= \case
+            "view" -> ViewDefinition <$> Aeson.parseJSON v
+            "table" -> TableDefinition <$> Aeson.parseJSON v
+            other -> fail ("unknown relation kind " <> T.unpack other)
 
     wrap body =
         [i|

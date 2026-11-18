@@ -33,7 +33,7 @@ import Hasql.TH (singletonStatement, vectorStatement)
 import RIO
 import RIO.Map qualified as Map
 import Sqiff.Catalog (Partitions (..), describeOn, errorText, failWith, serverError)
-import Sqiff.Definition (Definition (..), mapText, printed)
+import Sqiff.Definition (Definition (..), IndexDef (..), TableDef (..), mapNames, mapText)
 import Sqiff.Diff (Change (..), Changes, diff)
 import Sqiff.Identifier
 import Sqiff.Model
@@ -309,23 +309,28 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
     asideRef = quoted aside <> "."
     tableSchemaRef = quoted table.schema <> "."
 
-    moveBack k = k{object = mapQNames (\q -> if q.schema == aside then q{schema = table.schema} else q) k.object}
+    fromAside q = if q.schema == aside then q{schema = table.schema} else q
 
-    restore = mapText (T.replace asideRef tableSchemaRef)
+    moveBack k = k{object = mapQNames fromAside k.object}
+
+    restore = mapNames fromAside . mapText (T.replace asideRef tableSchemaRef)
 
     belongsTo q k def = case k.object of
         Table t -> t == q
-        Index _ -> any (`T.isInfixOf` printed def) [[i| ON #{qualified q} |], [i| ON ONLY #{qualified q} |]]
+        Index _ | IndexDefinition ix <- def -> ix.table == q
         Sequence _ -> False
         o -> owningTable o == Just q
 
     keepSettings current k def = case (k.object, k.aspect, Map.lookup k current) of
-        (Table _, Definition, Just old) ->
-            let settings = filter (\l -> l `elem` ["row level security", "force row level security"] || "with (" `T.isPrefixOf` l) (T.lines (printed old))
-                lines' = T.lines (printed def)
-                missing = filter (`notElem` lines') settings
-                hasOptions = any ("with (" `T.isPrefixOf`) lines'
-             in Printed (T.intercalate "\n" (lines' <> filter (\l -> not ("with (" `T.isPrefixOf` l && hasOptions)) missing))
+        -- Settings the file leaves out stay as the table has them.
+        (Table _, Definition, Just (TableDefinition old))
+            | TableDefinition new <- def ->
+                TableDefinition
+                    new
+                        { rowSecurity = new.rowSecurity || old.rowSecurity
+                        , forceRowSecurity = new.forceRowSecurity || old.forceRowSecurity
+                        , options = if null new.options then old.options else new.options
+                        }
         _ -> def
 
     leftOut k c

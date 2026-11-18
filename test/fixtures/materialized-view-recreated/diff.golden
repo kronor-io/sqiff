@@ -1,0 +1,7 @@
+changed materialized view public.mv
+  -     a
+  +     a,
+  +     (a * 2) AS b
+  depended on by:
+    index public.mv_a
+0 added, 0 dropped, 1 changed

@@ -9,7 +9,6 @@ module Sqiff.Recipe (
     Txn (..),
     Hazard (..),
     hazardText,
-    referencedTable,
     revokeGranted,
     Step (..),
     Context (..),
@@ -78,14 +77,6 @@ hazardText = \case
 revokeGranted :: Text -> Text
 revokeGranted relation =
     [i|do $$ declare g text; begin for g in select distinct case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end from pg_class c cross join aclexplode(c.relacl) x where c.oid = #{literal relation}::regclass and x.grantee <> c.relowner loop execute format('revoke all on table %s from %s', #{literal relation}, g); end loop; end $$|]
-
-
--- | The table a foreign key constraint's definition references.
-referencedTable :: Text -> Maybe Text
-referencedTable def = do
-    guard ("FOREIGN KEY " `T.isPrefixOf` def)
-    let (_, rest) = T.breakOn " REFERENCES " def
-    T.takeWhile (/= '(') <$> T.stripPrefix " REFERENCES " rest
 
 
 data Step = Step
@@ -216,7 +207,13 @@ definition ctx key object change = case object of
     remove (txn, hazards) sql = Step DropPhase (dropRank object) object sql txn hazards key change
     manual why = [create (Shared, [Manual why]) ("-- " <> why)]
     noRecipe = [create (Shared, [Manual "no recipe for this kind of object"]) ("-- " <> T.pack (show textual))]
+    -- The change as the kind of definition this recipe reads; a definition of another
+    -- kind is the catalog's mistake, left to a person.
+    typed :: (Definition -> Maybe a) -> (Change a -> [Step]) -> [Step]
+    typed as f = maybe (manual "the catalog described this object unexpectedly") f (traverse as change)
     notValid = " NOT VALID" :: Text
+    -- Whether @new@ is @old@ validated.
+    validates old new = old.validity == NotValidated && new.validity == Validated && withoutValidity old == new
     onEveryPartition s
         | any (`elem` [DeletesData, MayRewriteTable, LongLock]) s.hazards = s{hazards = s.hazards <> [EveryPartition]}
         | otherwise = s
@@ -234,56 +231,54 @@ definition ctx key object change = case object of
             | snd (extensionParts old) /= snd (extensionParts new) -> manual "extension moved to another schema"
             | otherwise -> [create (Own, []) ("alter extension " <> quoted e <> " update to " <> literal (fst (extensionParts new)))]
 
-    table t = case textual of
-        Added def -> createTable t (T.lines def)
+    table t = typed asTable \case
+        Added def -> createTable t def
         Dropped _ -> [remove (Shared, [DeletesData]) ("drop table " <> qualified t)]
-        Changed old new -> alterTable t (T.lines old) (T.lines new)
+        Changed old new -> alterTable t old new
 
-    createTable t lines'
-        | Just parentAndBound <- firstWithPrefix "partition of " lines' =
-            create (Shared, []) ("create table " <> qualified t <> " partition of " <> parentAndBound) : settings
+    createTable t def
+        | Just p <- def.partitionOf =
+            create (Shared, []) ("create table " <> qualified t <> " partition of " <> qualified p.parent <> " " <> p.bound) : settings
         | otherwise =
             create
                 (Shared, [])
-                ( (if "unlogged" `elem` lines' then "create unlogged table " else "create table ")
+                ( (if def.unlogged then "create unlogged table " else "create table ")
                     <> qualified t
                     <> " ("
                     <> columnList
                     <> ")"
-                    <> maybe "" (" partition by " <>) (firstWithPrefix "partition by " lines')
-                    <> maybe "" (" with " <>) (firstWithPrefix "with " lines')
+                    <> maybe "" (" partition by " <>) def.partitionBy
+                    <> maybe "" (" " <>) (withOptions def.options)
                 )
                 : settings
       where
         columnList = case Map.findWithDefault [] t ctx.newTableColumns of
             [] -> ""
             cols -> [i|\n#{T.intercalate ",\n" (map columnLine cols)}\n|]
-        columnLine (c, def) = [i|    #{quoted c} #{columnSql def}|]
+        columnLine (c, col) = [i|    #{quoted c} #{columnSql col}|]
         settings =
-            [createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} enable row level security|] | "row level security" `elem` lines']
-                <> [createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} force row level security|] | "force row level security" `elem` lines']
+            [createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} enable row level security|] | def.rowSecurity]
+                <> [createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} force row level security|] | def.forceRowSecurity]
 
     alterTable t old new
-        | partitioning old /= partitioning new = manual "partitioning changed"
+        | (old.partitionBy, old.partitionOf) /= (new.partitionBy, new.partitionOf) = manual "partitioning changed"
         | otherwise =
-            toggle "unlogged" ("set unlogged", "set logged") [MayRewriteTable, LongLock]
-                <> toggle "row level security" ("enable row level security", "disable row level security") []
-                <> toggle "force row level security" ("force row level security", "no force row level security") []
+            toggle (.unlogged) ("set unlogged", "set logged") [MayRewriteTable, LongLock]
+                <> toggle (.rowSecurity) ("enable row level security", "disable row level security") []
+                <> toggle (.forceRowSecurity) ("force row level security", "no force row level security") []
                 <> storageOptions
       where
-        partitioning = filter (\l -> "partition " `T.isPrefixOf` l)
-        toggle line (enable, disable) hazards
-            | (line `elem` old) == (line `elem` new) = []
-            | line `elem` new = [createAt tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> enable)]
+        toggle setting (enable, disable) hazards
+            | setting old == setting new = []
+            | setting new = [createAt tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> enable)]
             | otherwise = [createAt tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> disable)]
-        options ls = maybe [] (T.splitOn ", " . T.dropEnd 1 . T.drop 1) (firstWithPrefix "with " ls)
-        oldOptions = options old
-        newOptions = options new
-        removedKeys = [k | o <- oldOptions, let k = T.takeWhile (/= '=') o, k `notElem` map (T.takeWhile (/= '=')) newOptions]
+        optionKey = T.takeWhile (/= '=')
+        removedKeys = [k | o <- old.options, let k = optionKey o, k `notElem` map optionKey new.options]
+        newOptions = T.intercalate ", " new.options
         storageOptions =
-            [ createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} set (#{T.intercalate ", " newOptions})|]
-            | not (null newOptions)
-            , L.sort newOptions /= L.sort oldOptions
+            [ createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} set (#{newOptions})|]
+            | not (null new.options)
+            , L.sort new.options /= L.sort old.options
             ]
                 <> [ createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} reset (#{T.intercalate ", " removedKeys})|]
                    | not (null removedKeys)
@@ -398,12 +393,12 @@ end $$|]
                     tableLiteral = literal (qualified t)
                  in [i|do $$ begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal (nameText c)})])); end $$|]
 
-    tableConstraint t c = case textual of
+    tableConstraint t c = typed asConstraint \case
         Added def -> addConstraint def
         Dropped old -> [dropConstraint old]
         Changed old new
-            | old == new <> notValid -> [create (Own, []) (alterT <> "validate constraint " <> quoted c)]
-            | new == old <> notValid -> manual "a validated constraint cannot be made NOT VALID again"
+            | validates old new -> [create (Own, []) (alterT <> "validate constraint " <> quoted c)]
+            | validates new old -> manual "a validated constraint cannot be made NOT VALID again"
             | otherwise -> dropConstraint old : addConstraint new
       where
         alterT = [i|alter table #{qualified t} |]
@@ -412,78 +407,76 @@ end $$|]
                 (Shared, [MayFail "other objects depend on it, such as foreign keys; drop them first" | dependedOn] <> locksOther old)
                 (alterT <> "drop constraint " <> quoted c)
         dependedOn = any (`Set.member` ctx.withDependents) [TableConstraint t c, Index (QName t.schema c)]
-        locksOther def = [LocksOther r | Just r <- [referencedTable def], r /= qualified t]
-        plain hazards def = create (Shared, hazards <> locksOther def) (alterT <> "add constraint " <> quoted c <> " " <> def)
+        locksOther def = [LocksOther (qualified r.table) | Just r <- [def.references], r.table /= t]
+        plain hazards def clause = create (Shared, hazards <> locksOther def) (alterT <> "add constraint " <> quoted c <> " " <> clause)
         addConstraint def
-            | t `Set.member` ctx.newTables = [plain [] def]
-            | validatable def && notValid `T.isSuffixOf` def = [plain [] def]
+            | t `Set.member` ctx.newTables = [plain [] def def.clause]
+            | validatable def && def.validity == NotValidated = [plain [] def def.clause]
             | validatable def =
-                [ plain [] (def <> notValid)
+                [ plain [] def (def.clause <> notValid)
                 , create (Own, []) (alterT <> "validate constraint " <> quoted c)
                 ]
-            | Just (kind, cols) <- simpleKey def
+            | Just (keyword, cols) <- simpleKey def
             , not (t `Set.member` ctx.partitionedTables) =
                 [ create (None, [IndexBuild]) (concurrentBuild (QName t.schema c) [i|create unique index concurrently #{quoted c} on #{qualified t} (#{cols})|])
-                , create (Shared, []) (alterT <> "add constraint " <> quoted c <> " " <> kind <> " using index " <> quoted c)
+                , create (Shared, []) (alterT <> "add constraint " <> quoted c <> " " <> keyword <> " using index " <> quoted c)
                 ]
-            | otherwise = [plain [LongLock, IndexBuild] def]
-        validatable def = any (`T.isPrefixOf` def) ["CHECK ", "FOREIGN KEY "]
-        simpleKey def =
-            listToMaybe
-                [ (kind, cols)
-                | kind <- ["PRIMARY KEY", "UNIQUE"]
-                , Just rest <- [T.stripPrefix (kind <> " (") def]
-                , Just cols <- [T.stripSuffix ")" rest]
-                , not (T.any (`elem` ("()" :: String)) cols)
-                ]
+            | otherwise = [plain [LongLock, IndexBuild] def def.clause]
+        validatable def = def.kind `elem` [Check, ForeignKey]
+        -- A primary key or unique constraint on plain columns and nothing more, which an
+        -- index built beforehand can back.
+        simpleKey def = do
+            keyword <- case def.kind of
+                PrimaryKey -> Just "PRIMARY KEY"
+                Unique -> Just "UNIQUE"
+                _ -> Nothing
+            let cols = T.intercalate ", " (map quoted def.columns)
+            guard (not (null def.columns) && def.clause == keyword <> " (" <> cols <> ")")
+            pure (keyword, cols)
 
-    domainConstraint d c = case textual of
+    domainConstraint d c = typed asConstraint \case
         Added def -> add def
         Dropped _ -> [remove (Shared, []) (alterD <> "drop constraint " <> quoted c)]
         Changed old new
-            | old == new <> notValid -> [validate]
-            | new == old <> notValid -> manual "a validated constraint cannot be made NOT VALID again"
+            | validates old new -> [validate]
+            | validates new old -> manual "a validated constraint cannot be made NOT VALID again"
             | otherwise -> remove (Shared, []) (alterD <> "drop constraint " <> quoted c) : add new
       where
         alterD = [i|alter domain #{typeText d} |]
         validate = create (Own, []) (alterD <> "validate constraint " <> quoted c)
         add def
-            | notValid `T.isSuffixOf` def = [create (Shared, []) [i|#{alterD}add constraint #{quoted c} #{def}|]]
-            | otherwise = [create (Shared, []) [i|#{alterD}add constraint #{quoted c} #{def}#{notValid}|], validate]
+            | def.validity == NotValidated = [create (Shared, []) (alterD <> "add constraint " <> quoted c <> " " <> def.clause)]
+            | otherwise = [create (Shared, []) (alterD <> "add constraint " <> quoted c <> " " <> def.clause <> notValid), validate]
 
-    indexRecipe ix = case textual of
+    indexRecipe ix = typed asIndex \case
         Added def -> addIndex def
         Dropped def
-            | indexTable def `elem` map (Just . qualified) (Set.toList ctx.droppedTables) -> []
-            | onOnly def -> [remove (Shared, [LongLock]) ("drop index " <> qualified ix)]
+            | def.table `Set.member` ctx.droppedTables -> []
+            | def.partitioned -> [remove (Shared, [LongLock]) ("drop index " <> qualified ix)]
             | otherwise -> [remove (None, []) ("drop index concurrently " <> qualified ix)]
         Changed old new
-            | onOnly new || onOnly old -> remove (Shared, [LongLock]) ("drop index " <> qualified ix) : addIndex new
-            | namesAlteredColumnOf (\t -> indexTable old == Just (qualified t)) old ->
+            | new.partitioned || old.partitioned -> remove (Shared, [LongLock]) ("drop index " <> qualified ix) : addIndex new
+            | namesAlteredColumnOf (== old.table) old.statement ->
                 remove (None, []) ("drop index concurrently if exists " <> qualified ix) : addIndex new
             | otherwise ->
                 let tmp = identifier (takeBytes 59 (nameText ix.name) <> "_new")
                     oldName = quoted ix.name
                  in [ create
                         (None, [IndexBuild])
-                        (concurrentBuild (QName ix.schema tmp) (T.replace [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoted tmp} ON |] new))
+                        (concurrentBuild (QName ix.schema tmp) (T.replace [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoted tmp} ON |] new.statement))
                     , create (None, []) ("drop index concurrently if exists " <> qualified ix)
                     , create (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
                     ]
       where
         addIndex def
-            | onOnly def =
-                [ create (Shared, []) def
+            | def.partitioned =
+                [ create (Shared, []) def.statement
                 , create
                     (Shared, [Manual [i|build the index on each partition with create index concurrently, then alter index #{qualified ix} attach partition each one; it stays invalid until every partition has one|]])
                     [i|-- create index concurrently and attach partition for #{qualified ix}|]
                 ]
-            | indexTable def `elem` map (Just . qualified) (Set.toList ctx.newTables) = [create (Shared, []) def]
-            | otherwise = [create (None, [IndexBuild]) (concurrentBuild ix (T.replace " INDEX " " INDEX CONCURRENTLY " def))]
-        onOnly def = " ON ONLY " `T.isInfixOf` def
-        indexTable def =
-            let afterOn = T.drop 4 (snd (T.breakOn " ON " def))
-             in Just (fst (T.breakOn " USING " (fromMaybe afterOn (T.stripPrefix "ONLY " afterOn))))
+            | def.table `Set.member` ctx.newTables = [create (Shared, []) def.statement]
+            | otherwise = [create (None, [IndexBuild]) (concurrentBuild ix (T.replace " INDEX " " INDEX CONCURRENTLY " def.statement))]
 
     sequenceRecipe s = case textual of
         Added def ->
@@ -550,20 +543,20 @@ end $$|]
                         [create (Shared, hazards <> [MayFail "a SQL-standard body that was not checked against the desired database"]) (T.stripEnd def)]
                     | otherwise -> [create (Shared, hazards) (T.stripEnd def)]
 
-    viewRecipe v = case textual of
-        Added def -> [create (Shared, []) ("create view " <> viewHead v def <> viewBody def)]
+    viewRecipe v = typed asView \case
+        Added def -> [create (Shared, []) ("create view " <> viewSql v def)]
         Changed _ new ->
             [ create
                 (Shared, [MayFail "fails when a column is removed, renamed or retyped; then drop and recreate it with its dependents"])
-                ("create or replace view " <> viewHead v new <> viewBody new)
+                ("create or replace view " <> viewSql v new)
             ]
         Dropped _ -> [remove (Shared, []) ("drop view " <> qualified v)]
 
-    materializedView v = case textual of
-        Added def -> [create (Shared, []) ("create materialized view " <> viewHead v def <> viewBody def)]
+    materializedView v = typed asView \case
+        Added def -> [create (Shared, []) ("create materialized view " <> viewSql v def)]
         Changed _ new ->
             [ remove (Shared, [MayFail "fails when other objects depend on it"]) ("drop materialized view " <> qualified v)
-            , create (Shared, [LongLock]) ("create materialized view " <> viewHead v new <> viewBody new)
+            , create (Shared, [LongLock]) ("create materialized view " <> viewSql v new)
             ]
                 <> restoreOnView v
         Dropped _ -> [remove (Shared, []) ("drop materialized view " <> qualified v)]
@@ -755,19 +748,13 @@ enumLabels def = do
             | otherwise -> (body <> "'", T.drop 1 after)
 
 
--- | The name and @with (...)@ options of a described view, up to its query.
-viewHead :: QName -> Text -> Text
-viewHead v def = qualified v <> maybe "" (" " <>) (fst (viewParts def)) <> " as\n"
-
-
-viewBody :: Text -> Text
-viewBody = T.dropWhileEnd (\ch -> ch == ';' || ch == ' ' || ch == '\n') . T.stripStart . snd . viewParts
-
-
-viewParts :: Text -> (Maybe Text, Text)
-viewParts def = case T.breakOn "\n" def of
-    (options, rest) | "with (" `T.isPrefixOf` options -> (Just options, T.drop 1 rest)
-    _ -> (Nothing, def)
+-- | A view's name, options and query, as @create view@ takes them after its keywords.
+viewSql :: QName -> ViewDef -> Text
+viewSql v def =
+    qualified v
+        <> foldMap (\o -> " with (" <> T.intercalate ", " o <> ")") def.options
+        <> " as\n"
+        <> T.dropWhileEnd (\ch -> ch == ';' || ch == ' ' || ch == '\n') (T.stripStart def.query)
 
 
 -- | A concurrent index build that first fails when an invalid index of that name is left
@@ -801,10 +788,6 @@ takeBytes n = T.pack . go 0 . T.unpack
         | used + size ch > n = []
         | otherwise = ch : go (used + size ch) rest
     size ch = B.length (encodeUtf8 (T.singleton ch))
-
-
-firstWithPrefix :: Text -> [Text] -> Maybe Text
-firstWithPrefix prefix = listToMaybe . mapMaybe (T.stripPrefix prefix)
 
 
 literal :: Text -> Text

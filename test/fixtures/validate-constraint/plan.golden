@@ -1,0 +1,4 @@
+-- table constraint public.t.qty_positive
+-- own transaction
+alter table public.t validate constraint qty_positive;
+

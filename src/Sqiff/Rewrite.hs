@@ -19,7 +19,7 @@ import RIO
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
-import Sqiff.Definition
+import Sqiff.Definition hiding (tableText)
 import Sqiff.Diff (Change (..), Changes, diff)
 import Sqiff.Identifier
 import Sqiff.Model
@@ -45,7 +45,7 @@ fileDrift ownFiles fromFile live = Map.filterWithKey kept (diff same fromFile li
     -- constraint the way PostgreSQL names it after a rename.
     normalise k = \case
         ColumnDefinition c -> ColumnDefinition c{nullability = plainNotNull c.nullability}
-        Printed t | TableConstraint{} <- k.object -> Printed (fromMaybe t (T.stripSuffix " NOT VALID" t))
+        ConstraintDefinition c | TableConstraint{} <- k.object -> ConstraintDefinition (withoutValidity c)
         def -> def
     plainNotNull = \case
         NotNull _ name -> NotNull Validated (mfilter (not . defaultNotNullName) name)
@@ -73,8 +73,8 @@ rewriteFile table ownFiles order live fromFile original = do
         comments = Map.fromList [(k.object, printed <$> c) | (k, c) <- Map.toList changes, k.aspect == Comment]
         statements = [(n, s, classify table (snd (splitLead s))) | (n, Stmt s) <- zip [0 :: Int ..] parts]
         indentOf n = statementIndent parts n
-        settings = case lookup (Table table) definitions of
-            Just (Changed fileDef liveDef) -> tableSettings table (T.lines fileDef) (T.lines liveDef)
+        settings = case lookup (Table table) typedDefinitions of
+            Just (Changed (TableDefinition fileDef) (TableDefinition liveDef)) -> tableSettings table fileDef liveDef
             _ -> Nothing
         tableEdit = do
             (n, s, _) <- L.find (\(_, _, k) -> k == CreatesTable) statements
@@ -149,19 +149,20 @@ rewriteFile table ownFiles order live fromFile original = do
 
 
 -- | For a table whose settings the file lacks, the statements that turn them on and the
--- storage options for @create table@; nothing when the file has a setting the table lacks.
-tableSettings :: QName -> [Text] -> [Text] -> Maybe ([Text], Maybe Text)
+-- storage options for @create table@; nothing when the file has a setting the table lacks,
+-- or other options than it.
+tableSettings :: QName -> TableDef -> TableDef -> Maybe ([Text], Maybe Text)
 tableSettings table file live = do
-    let added = filter (`notElem` file) live
-        options = L.find ("with (" `T.isPrefixOf`) added
-        name = qualified table
+    let name = qualified table
+        added setting = setting live && not (setting file)
         alters =
-            [[i|alter table #{name} enable row level security|] | "row level security" `elem` added]
-                <> [[i|alter table #{name} force row level security|] | "force row level security" `elem` added]
-    guard (all (`elem` live) file)
-    guard (all (\l -> l `elem` ["row level security", "force row level security"] || Just l == options) added)
-    guard (isNothing options || not (any ("with (" `T.isPrefixOf`) file))
-    pure (alters, options)
+            [[i|alter table #{name} enable row level security|] | added (.rowSecurity)]
+                <> [[i|alter table #{name} force row level security|] | added (.forceRowSecurity)]
+    guard (file.unlogged == live.unlogged && file.partitionBy == live.partitionBy && file.partitionOf == live.partitionOf)
+    -- The file may lack a setting the table has, not have one the table lacks.
+    guard ((live.rowSecurity || not file.rowSecurity) && (live.forceRowSecurity || not file.forceRowSecurity))
+    guard (null file.options || file.options == live.options)
+    pure (alters, if file.options == live.options then Nothing else withOptions live.options)
 
 
 describeChange :: ObjectKey -> Change a -> Text

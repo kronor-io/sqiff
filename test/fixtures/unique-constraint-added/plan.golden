@@ -1,0 +1,19 @@
+-- table constraint public.t.t_email_key
+-- outside a transaction
+-- hazard: builds an index
+do $$
+begin
+    if exists (
+        select from pg_index
+        where indexrelid = to_regclass('public.t_email_key') and not indisvalid
+    ) then
+        raise exception 'index public.t_email_key is invalid from an earlier failed build; drop it first';
+    end if;
+end
+$$;
+
+create unique index concurrently t_email_key on public.t (email);
+
+-- table constraint public.t.t_email_key
+alter table public.t add constraint t_email_key UNIQUE using index t_email_key;
+

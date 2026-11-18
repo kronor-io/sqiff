@@ -147,8 +147,8 @@ units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: 
             | isAdded s.change -> Unit AddChange n (createNote s) Conventional [s] []
         _ -> Unit AddChange (groupKey s) (note (verb s) s) Migration [s] []
 
-    createNote s = case (s.object, printed <$> s.change) of
-        (Index ix, Added def) | Just t <- indexTableName def -> let table = dotted (QName ix.schema (identifier t)); name = nameText ix.name in [S.i|add_index: add index #{table}.#{name}|]
+    createNote s = case (s.object, s.change) of
+        (Index ix, Added (IndexDefinition def)) | Just t <- plainTable def -> let table = dotted (QName ix.schema t); name = nameText ix.name in [S.i|add_index: add index #{table}.#{name}|]
         _ -> note "create" s
 
     merge u (next : rest)
@@ -224,7 +224,7 @@ units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: 
 conventionalName :: Names -> Step -> Maybe Text
 conventionalName names s
     | s.key.aspect /= Definition = Nothing
-    | otherwise = case (s.object, printed <$> s.change) of
+    | otherwise = case (s.object, s.change) of
         (Table t, Added _) | s.rank == 4 -> Just (path names.table t)
         (Routine Aggregate _ _, _) -> Nothing
         (Routine _ q _, Added _) -> Just (path names.function q)
@@ -234,7 +234,7 @@ conventionalName names s
         (MaterializedView v, Added _) | s.phase == CreatePhase -> Just (path names.view v)
         (Trigger t n, Added _) -> Just (triggerPath t n)
         (Trigger t n, Changed _ _) | "CREATE OR REPLACE TRIGGER" `T.isPrefixOf` s.sql -> Just (triggerPath t n)
-        (Index ix, Added def) | Just t <- indexTableName def -> Just (fill names.index [("schema", nameText ix.schema), ("table", t), ("name", nameText ix.name)])
+        (Index ix, Added (IndexDefinition def)) | Just t <- plainTable def -> Just (fill names.index [("schema", nameText ix.schema), ("table", nameText t), ("name", nameText ix.name)])
         (Type t, Added _) | [schema, name] <- T.splitOn "." (typeText t) -> Just (fill names.type_ [("schema", schema), ("name", name)])
         _ -> Nothing
   where
@@ -242,14 +242,12 @@ conventionalName names s
     triggerPath t n = fill names.trigger [("schema", nameText t.schema), ("table", nameText t.name), ("name", nameText n)]
 
 
--- | The unquoted name of the table an index definition is on.
-indexTableName :: Text -> Maybe Text
-indexTableName def =
-    let afterOn = T.drop 4 (snd (T.breakOn " ON " def))
-        qualifiedTable = fst (T.breakOn " USING " (fromMaybe afterOn (T.stripPrefix "ONLY " afterOn)))
-     in case T.splitOn "." qualifiedTable of
-            [_, t] | not ("\"" `T.isInfixOf` t) -> Just t
-            _ -> Nothing
+-- | The name of the table an index is on, when SQL writes it without quotes.
+plainTable :: IndexDef -> Maybe Identifier
+plainTable def = do
+    let t = def.table.name
+    guard (quoted t == nameText t)
+    pure t
 
 
 -- | The changes create-migration's templates cover.
@@ -266,9 +264,9 @@ shapeOf u = case u.deploy of
     [s]
         | u.placement == Conventional
         , Index ix <- s.object
-        , Added def <- printed <$> s.change
-        , Just t <- indexTableName def ->
-            AddIndexShape (QName ix.schema (identifier t)) ix.name
+        , Added (IndexDefinition def) <- s.change
+        , Just t <- plainTable def ->
+            AddIndexShape (QName ix.schema t) ix.name
         | u.placement == Migration
         , Column t c <- s.object
         , Added _ <- s.change

@@ -93,9 +93,17 @@ Guiding rules:
     `fileDrift` ignoring "not valid" inside comments.
   - Found: grants have no grantor, so a grant option another role has used cannot be
     revoked (`test/fixtures/grant-option-removed`).
-  - Still printed text: indexes, constraints, views, tables, routines and types. Their
-    recipes still re-read SQL (`" ON "`, `"FOREIGN KEY "`, `"partition by "`). Typing them
-    is part 2.
+- [x] **Phase 2 (part 2):** typed tables (`TableDef`), views (`ViewDef`), indexes
+  (`IndexDef`) and constraints (`ConstraintDef` with kind, validity, columns and foreign-key
+  target). No recipe searches SQL text for `" ON "`, `"FOREIGN KEY "`, `"REFERENCES "`,
+  `"partition by "` or `"with ("` any more, and `referencedTable` and `indexTableName` are
+  gone. Output is unchanged: all golden files match, and five new fixtures (partitions,
+  table settings, unique constraints, validation, materialized views) give the same
+  output before and after.
+  - Still printed text: routines, types, sequences, extensions, triggers, policies and
+    comments. Sequences (`" owned by "`), extensions (`"version … schema …"`) and enum
+    labels are the remaining recipes that parse text. They are small and good candidates
+    to type next. Routine bodies stay text by nature.
 
 ## Phases (each one builds, passes tests, and ships on its own)
 

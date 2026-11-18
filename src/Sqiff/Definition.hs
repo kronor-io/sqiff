@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
@@ -13,7 +14,12 @@ module Sqiff.Definition (
     Definition (..),
     printed,
     mapText,
+    mapNames,
     asColumn,
+    asTable,
+    asView,
+    asIndex,
+    asConstraint,
     asAcl,
 
     -- * Columns
@@ -34,6 +40,21 @@ module Sqiff.Definition (
     identityOptionsOf,
     generatedOf,
     failsOnRows,
+
+    -- * Relations
+    TableDef (..),
+    PartitionOf (..),
+    tableText,
+    ViewDef (..),
+    viewText,
+    withOptions,
+
+    -- * Indexes and constraints
+    IndexDef (..),
+    ConstraintDef (..),
+    ConstraintKind (..),
+    ForeignKeyTarget (..),
+    withoutValidity,
 
     -- * Privileges
     Acl (..),
@@ -56,6 +77,10 @@ import Sqiff.Identifier
 data Definition
     = ColumnDefinition ColumnDef
     | AclDefinition Acl
+    | TableDefinition TableDef
+    | ViewDefinition ViewDef
+    | IndexDefinition IndexDef
+    | ConstraintDefinition ConstraintDef
     | -- | As the catalog prints it: a @create@ statement, an expression, a comment.
       Printed Text
     deriving stock (Eq, Show, Generic)
@@ -67,6 +92,10 @@ printed :: Definition -> Text
 printed = \case
     ColumnDefinition c -> columnText c
     AclDefinition acl -> aclText acl
+    TableDefinition t -> tableText t
+    ViewDefinition v -> viewText v
+    IndexDefinition ix -> ix.statement
+    ConstraintDefinition c -> c.clause
     Printed t -> t
 
 
@@ -84,12 +113,55 @@ mapText f = \case
                     identity -> identity
                 }
     AclDefinition acl -> AclDefinition acl
+    TableDefinition t ->
+        TableDefinition
+            t
+                { partitionBy = f <$> t.partitionBy
+                , partitionOf = (\p -> p{bound = f p.bound}) <$> t.partitionOf
+                }
+    ViewDefinition v -> ViewDefinition v{query = f v.query}
+    IndexDefinition ix -> IndexDefinition ix{statement = f ix.statement}
+    ConstraintDefinition c -> ConstraintDefinition c{clause = f c.clause}
     Printed t -> Printed (f t)
+
+
+-- | The definition with each schema-qualified name in it changed by @f@: an index's
+-- table, a foreign key's, a partition's parent.
+mapNames :: (QName -> QName) -> Definition -> Definition
+mapNames f = \case
+    TableDefinition t -> TableDefinition t{partitionOf = (\p -> p{parent = f p.parent}) <$> t.partitionOf}
+    IndexDefinition (IndexDef table unique partitioned statement) -> IndexDefinition (IndexDef (f table) unique partitioned statement)
+    ConstraintDefinition c -> ConstraintDefinition c{references = (\(ForeignKeyTarget table columns) -> ForeignKeyTarget (f table) columns) <$> c.references}
+    def -> def
 
 
 asColumn :: Definition -> Maybe ColumnDef
 asColumn = \case
     ColumnDefinition c -> Just c
+    _ -> Nothing
+
+
+asTable :: Definition -> Maybe TableDef
+asTable = \case
+    TableDefinition t -> Just t
+    _ -> Nothing
+
+
+asView :: Definition -> Maybe ViewDef
+asView = \case
+    ViewDefinition v -> Just v
+    _ -> Nothing
+
+
+asIndex :: Definition -> Maybe IndexDef
+asIndex = \case
+    IndexDefinition ix -> Just ix
+    _ -> Nothing
+
+
+asConstraint :: Definition -> Maybe ConstraintDef
+asConstraint = \case
+    ConstraintDefinition c -> Just c
     _ -> Nothing
 
 
@@ -255,6 +327,157 @@ instance FromJSON ColumnDef where
             "stored" -> pure Stored
             "virtual" -> pure Virtual
             other -> fail ("unknown generated column kind " <> T.unpack other)
+
+
+-- | A table's settings; its columns and constraints are objects of their own.
+data TableDef = TableDef
+    { unlogged :: Bool
+    , partitionBy :: Maybe Text
+    -- ^ The partition key, as @pg_get_partkeydef@ prints it.
+    , partitionOf :: Maybe PartitionOf
+    , rowSecurity :: Bool
+    , forceRowSecurity :: Bool
+    , options :: [Text]
+    -- ^ Storage options such as @fillfactor=70@; the TOAST table's with a @toast.@ prefix.
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+data PartitionOf = PartitionOf
+    { parent :: QName
+    , bound :: Text
+    -- ^ As @pg_get_expr@ prints it, such as @FOR VALUES FROM (0) TO (10)@.
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+-- | @with (a=1, b=2)@, or nothing for no options.
+withOptions :: [Text] -> Maybe Text
+withOptions = \case
+    [] -> Nothing
+    options -> Just ("with (" <> T.intercalate ", " options <> ")")
+
+
+tableText :: TableDef -> Text
+tableText t =
+    T.intercalate "\n"
+        $ ["unlogged" | t.unlogged]
+        <> ["partition by " <> key | Just key <- [t.partitionBy]]
+        <> ["partition of " <> qualified p.parent <> " " <> p.bound | Just p <- [t.partitionOf]]
+        <> ["row level security" | t.rowSecurity]
+        <> ["force row level security" | t.forceRowSecurity]
+        <> maybeToList (withOptions t.options)
+
+
+-- | A view or materialized view.
+data ViewDef = ViewDef
+    { options :: Maybe [Text]
+    -- ^ Nothing when the view has no options at all.
+    , query :: Text
+    -- ^ As @pg_get_viewdef@ prints it.
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+viewText :: ViewDef -> Text
+viewText v = T.intercalate "\n" (["with (" <> T.intercalate ", " o <> ")" | Just o <- [v.options]] <> [v.query])
+
+
+data IndexDef = IndexDef
+    { table :: QName
+    , unique :: Bool
+    , partitioned :: Bool
+    -- ^ On a partitioned table, where it is created @ON ONLY@ the parent.
+    , statement :: Text
+    -- ^ As @pg_get_indexdef@ prints it.
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+data ConstraintKind = Check | ForeignKey | PrimaryKey | Unique | Exclusion
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+-- | A table's or domain's constraint.
+data ConstraintDef = ConstraintDef
+    { kind :: ConstraintKind
+    , validity :: Validity
+    , columns :: [Identifier]
+    -- ^ The table's columns it covers, in order; none for a domain's.
+    , references :: Maybe ForeignKeyTarget
+    , clause :: Text
+    -- ^ As @pg_get_constraintdef@ prints it, @NOT VALID@ included.
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+data ForeignKeyTarget = ForeignKeyTarget
+    { table :: QName
+    , columns :: [Identifier]
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+-- | The constraint as it is once validated.
+withoutValidity :: ConstraintDef -> ConstraintDef
+withoutValidity c = c{validity = Validated, clause = fromMaybe c.clause (T.stripSuffix " NOT VALID" c.clause)}
+
+
+instance FromJSON TableDef where
+    parseJSON = withObject "table" \o ->
+        TableDef
+            <$> o
+            .: "unlogged"
+            <*> o
+            .:? "partition_by"
+            <*> (o .:? "partition_of" >>= traverse (withObject "partition of" \p -> PartitionOf <$> (qname <$> p .: "schema" <*> p .: "name") <*> p .: "bound"))
+            <*> o
+            .: "row_security"
+            <*> o
+            .: "force_row_security"
+            <*> o
+            .:? "options"
+            .!= []
+
+
+instance FromJSON ViewDef where
+    parseJSON = withObject "view" \o -> ViewDef <$> o .:? "options" <*> o .: "query"
+
+
+instance FromJSON IndexDef where
+    parseJSON = withObject "index" \o ->
+        IndexDef
+            <$> (qname <$> o .: "table_schema" <*> o .: "table_name")
+            <*> o
+            .: "unique"
+            <*> o
+            .: "partitioned"
+            <*> o
+            .: "statement"
+
+
+instance FromJSON ConstraintDef where
+    parseJSON = withObject "constraint" \o -> do
+        kind <-
+            o .: "kind" >>= \case
+                "c" -> pure Check
+                "f" -> pure ForeignKey
+                "p" -> pure PrimaryKey
+                "u" -> pure Unique
+                "x" -> pure Exclusion
+                other -> fail ("unknown constraint kind " <> T.unpack other)
+        validity <- bool NotValidated Validated <$> o .: "validated"
+        columns <- map identifier <$> o .:? "columns" .!= []
+        references <- o .:? "references" >>= traverse (withObject "references" \r -> ForeignKeyTarget <$> (qname <$> r .: "schema" <*> r .: "table") <*> (map identifier <$> r .: "columns"))
+        clause <- o .: "clause"
+        pure ConstraintDef{kind, validity, columns, references, clause}
 
 
 -- | An object's privileges.

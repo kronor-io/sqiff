@@ -1,0 +1,19 @@
+-- materialized view public.mv
+-- hazard: fails when other objects depend on it
+drop materialized view public.mv;
+
+-- materialized view public.mv
+-- hazard: holds an ACCESS EXCLUSIVE lock, which blocks reads and writes, while it runs
+create materialized view public.mv as
+SELECT id,
+    a,
+    (a * 2) AS b
+   FROM public.t;
+
+-- materialized view public.mv
+-- hazard: builds an index
+CREATE INDEX mv_a ON public.mv USING btree (a);
+
+-- materialized view public.mv
+do $$ declare g text; begin for g in select distinct case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end from pg_class c cross join aclexplode(c.relacl) x where c.oid = 'public.mv'::regclass and x.grantee <> c.relowner loop execute format('revoke all on table %s from %s', 'public.mv', g); end loop; end $$;
+

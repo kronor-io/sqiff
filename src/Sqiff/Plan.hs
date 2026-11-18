@@ -6,7 +6,6 @@
 -- | Orders recipe steps: drops before creates, then by rank, then by dependencies.
 module Sqiff.Plan (plan, planWith, context, invert, renderStep, topoOrder) where
 
-import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
 import RIO.List qualified as L
@@ -15,7 +14,6 @@ import RIO.Set qualified as Set
 import Sqiff.Body (BodyCheck)
 import Sqiff.Definition
 import Sqiff.Diff (Change (..), Changes, invert)
-import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Recipe
 
@@ -68,9 +66,9 @@ context checks fromSchema toSchema fromEdges changes =
         , partitionedTables =
             Set.fromList
                 [ t
-                | (k, def) <- Map.toList fromSchema <> Map.toList toSchema
+                | (k, TableDefinition def) <- Map.toList fromSchema <> Map.toList toSchema
                 , k.aspect == Definition
-                , any ("partition by " `T.isPrefixOf`) (T.lines (printed def))
+                , isJust def.partitionBy
                 , Table t <- [k.object]
                 ]
         , droppedColumns = Set.fromList [(t, c) | (Column t c, Dropped _) <- definitions]
@@ -90,12 +88,11 @@ context checks fromSchema toSchema fromEdges changes =
   where
     definitions = [(k.object, change) | (k, change) <- Map.toList changes, k.aspect == Definition]
     indexesOn v =
-        [ printed def
-        | (k, def) <- Map.toList toSchema
+        [ def.statement
+        | (k, IndexDefinition def) <- Map.toList toSchema
         , k.aspect == Definition
         , k `Map.notMember` changes
-        , [i| ON #{qualified v} |] `T.isInfixOf` printed def
-        , Index _ <- [k.object]
+        , def.table == v
         ]
     tablesWith p = Set.fromList [t | (Table t, change) <- definitions, p change]
     isAdded = \case Added _ -> True; _ -> False

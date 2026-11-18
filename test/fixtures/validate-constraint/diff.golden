@@ -1,0 +1,4 @@
+changed table constraint public.t.qty_positive
+  - CHECK ((qty > 0)) NOT VALID
+  + CHECK ((qty > 0))
+0 added, 0 dropped, 1 changed
