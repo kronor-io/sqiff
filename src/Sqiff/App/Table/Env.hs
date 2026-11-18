@@ -21,12 +21,13 @@ import Hasql.Connection qualified as Connection
 import RIO
 import RIO.Text qualified as T
 import Sqiff.App.Options (TableOptions (..))
-import Sqiff.Config (Config (..), Layout (..))
+import Sqiff.Config (Config (..))
 import Sqiff.Connection (failWith, withConnection)
 import Sqiff.ConnectionString (ConnectionString, redacted)
 import Sqiff.Git (Repo)
 import Sqiff.Identifier
 import Sqiff.Script (splitStatements, withoutTransactionControl)
+import Sqiff.Sqitch.Layout (Layout (..))
 import Sqiff.TableEdit (requireScratch)
 
 

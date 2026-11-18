@@ -183,6 +183,43 @@ Guiding rules:
   - `locateTable` normalises the deploy directory, so `--top-dir .` works.
   - The SQL-text unit tests from Phase 4 were never registered; they now run.
 
+- [x] **Phase 6:** sqitch output. Fixes bugs 8 and 9.
+  - `Sqiff.Sqitch.Layout` resolves the layout once:
+    - It covers the top, deploy, revert, verify and reworked directories, the plan
+      file and the script extension.
+    - A setting for the target wins over the engine's, which wins over the core's, as
+      in sqitch.
+    - `--top-dir` and `--plan-file` override sqitch's configuration.
+  - Every sqitch command sqiff runs gets `SQITCH_CONFIG` pointing at a generated file:
+    - It has the project's own settings, with the layout pinned for the core, the
+      engine and the target.
+    - `add`, `rework` and `tag` have no top-dir option, so this is the only way to make
+      them write where `--top-dir` says.
+  - `Sqiff.Sqitch.Check` checks the whole batch before the first write:
+    - Change names follow sqitch's rules, with no absolute path and no empty, `.` or
+      `..` segment.
+    - No name appears twice, no add is already in the plan, and no rework is missing
+      from it.
+    - Tags: a given tag must be new. The default is the first free one of
+      `<day>_sqiff`, `<day>_sqiff_2`, …, so a second rework on the same day works.
+    - `sqiff sqitch --dry-run` reports the same problems.
+  - Adjacent conventional units with the same name merge, so overloads of a new
+    function become one change instead of two `sqitch add`s of the same name.
+  - Every write happens inside `withProject`:
+    - sqiff's own writes go through a journal.
+    - If anything fails, the files sqiff wrote are restored, the scripts and
+      directories sqitch made are removed, and the plan is put back last.
+    - The error then ends with "nothing was written, the project is as it was".
+    - This covers `sqiff sqitch`, `table --write` and `table --rewrite-file --write`.
+  - Tests:
+    - Unit tests for the checks, the layout and the generated configuration.
+    - `test/Writing.hs` runs the real sqitch (`SQIFF_TEST_SQITCH_BIN`): a custom
+      layout, rollback after sqitch fails part-way, a second same-day tag, and a
+      refused batch.
+    - By hand: `sqiff sqitch` with `--top-dir`/`--plan-file` on nine fixtures, then
+      `sqitch deploy`, then `sqiff diff`, which found nothing left.
+  - Not done: reverts per unit (Codex 16) and serial-to-identity coordination (Codex 11).
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**
@@ -226,4 +263,5 @@ export collisions.
 
 - The project needs GHC 9.12.4 (`cabal.project.freeze`); use the flake's dev shell.
 - PostgreSQL 18.6 and sqitch-pg 1.5.2 are available in the store, which is enough for the
-  integration harness.
+  integration harness. The tests find them through `SQIFF_TEST_PG_BIN` and
+  `SQIFF_TEST_SQITCH_BIN`, or on PATH.

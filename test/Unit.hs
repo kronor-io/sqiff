@@ -10,6 +10,7 @@ module Unit (tests) where
 
 import Data.Aeson (FromJSON)
 import Data.Aeson qualified as Aeson
+import Data.Time (UTCTime (..), fromGregorian)
 import Hedgehog (Gen, forAll, property, (===))
 import Hedgehog.Gen qualified as Gen
 import Hedgehog.Range qualified as Range
@@ -24,12 +25,15 @@ import Sqiff.Definition hiding (columns)
 import Sqiff.Diff (Change (..), affected, diff)
 import Sqiff.Graph (schedule)
 import Sqiff.Identifier (identifier, qname, quoteIdent, typeName)
-import Sqiff.Model (Address (..), Aspect (..), Edge (..), ObjectId (..), ObjectKey (..), fromAddress, toAddress)
-import Sqiff.Plan (invert, topoOrder)
+import Sqiff.Model (Address (..), Aspect (..), Edge (..), ObjectId (..), ObjectKey (..), RoutineKind (..), fromAddress, toAddress)
+import Sqiff.Plan (context, invert, topoOrder)
+import Sqiff.Recipe (Phase (..), Step (..), Txn (..))
 import Sqiff.Rewrite (fileDrift)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
+import Sqiff.Sqitch.Check (Tagging (..), batchProblems, changeNameProblem, chooseTag, tagNameProblem)
+import Sqiff.Sqitch.Layout (Layout (..), resolveLayout, sqitchConf)
 import Sqiff.Sqitch.Plan (SqitchPlan (..), parsePlan)
-import Sqiff.Sqitch.Units (tidyIndex)
+import Sqiff.Sqitch.Units (Placement (..), Unit (..), UnitKind (..), tidyIndex, units)
 import Sqiff.Sql qualified as Sql
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
@@ -52,6 +56,7 @@ tests =
         , columns
         , formatting
         , tableFlags
+        , sqitchChecks
         ]
 
 
@@ -449,3 +454,67 @@ tableFlags =
                     WithBaseFile rs -> "base file, " <> tshow (length rs) <> " renames, " <> swap
                     WithLiveTable _ -> "live table"
         RewriteFile live -> "rewrite from " <> maybe "--db" redacted live
+
+
+sqitchChecks :: TestTree
+sqitchChecks =
+    testGroup
+        "sqitch checks"
+        [ testCase "change names sqitch and the file system accept" do
+            for_ ["public/function/f", "migrations/2026/11/2026-11-18-120000-add-x", "_x", "v1.2+1"] \n ->
+                changeNameProblem n @?= Nothing
+        , testCase "change names they refuse" do
+            for_ ["", "a b", "a:b", "a@b", "a#b", "a\\b", "-a", "a.", "a^2", "a~12", "/abs", "a/../b", "a//b", "./a"] \n ->
+                isJust (changeNameProblem n) @?= True
+        , testCase "tags cannot have a slash" do
+            isJust (tagNameProblem "a/b") @?= True
+            tagNameProblem "2026-11-18_sqiff" @?= Nothing
+        , testCase "the day's tag, or the next free one" do
+            let at = Tagging{given = Nothing, now = UTCTime (fromGregorian 2026 11 18) 0}
+            chooseTag (plan "") at @?= Right "2026-11-18_sqiff"
+            chooseTag (plan "a 2026-01-01T00:00:00Z x <x@x> # a\n@2026-11-18_sqiff 2026-01-01T00:00:00Z x <x@x> # t\n") at @?= Right "2026-11-18_sqiff_2"
+        , testCase "a given tag must be new" do
+            let at = Tagging{given = Just "v1", now = UTCTime (fromGregorian 2026 11 18) 0}
+            isLeft (chooseTag (plan "a 2026-01-01T00:00:00Z x <x@x> # a\n@v1 2026-01-01T00:00:00Z x <x@x> # t\n") at) @?= True
+            chooseTag (plan "") at @?= Right "v1"
+        , testCase "the plan's tags" do
+            (plan "a 2026-01-01T00:00:00Z x <x@x> # a\n@v1 2026-01-01T00:00:00Z x <x@x> # t\nb [a] 2026-01-01T00:00:00Z x <x@x> # b\n@v2 2026-01-01T00:00:00Z x <x@x> # t\n").tags
+                @?= Set.fromList ["v1", "v2"]
+        , testCase "a batch with a collision, an existing add or a rework of nothing" do
+            let p = plan "a 2026-01-01T00:00:00Z x <x@x> # a\n"
+            length (batchProblems p [unitNamed AddChange "b", unitNamed AddChange "b"]) @?= 1
+            length (batchProblems p [unitNamed AddChange "a"]) @?= 1
+            length (batchProblems p [unitNamed ReworkChange "c"]) @?= 1
+            batchProblems p [unitNamed ReworkChange "a", unitNamed AddChange "b"] @?= []
+        , testCase "overloads of a new function make one change" do
+            let names = either error id (Aeson.eitherDecode "{}")
+                ctx = context Map.empty Map.empty Map.empty [] Map.empty
+                overload arg =
+                    let object = Routine Function (qname "public" "f") [typeName arg]
+                     in Step CreatePhase 9 object ("create function public.f(" <> arg <> ")") Shared [] (ObjectKey Definition object) (Added (Printed arg))
+                written = units names (const True) ctx (plan "") (UTCTime (fromGregorian 2026 11 18) 0) [overload "int", overload "text"]
+            map (\u -> (u.changeName, length u.deploy)) written @?= [("public/function/f", 2)]
+        , testCase "the layout: the target's setting beats the engine's, which beats the core's" do
+            let merged =
+                    [ ("core.engine", "pg")
+                    , ("core.top_dir", "core")
+                    , ("engine.pg.top_dir", "engine")
+                    , ("engine.pg.target", "prod")
+                    , ("target.prod.deploy_dir", "elsewhere/deploy")
+                    ]
+            l <- either (assertFailure . T.unpack) pure (resolveLayout "/p" Nothing Nothing merged [])
+            (l.topDir, l.planFile, l.deployDir, l.revertDir, l.extension) @?= ("engine", "engine/sqitch.plan", "elsewhere/deploy", "engine/revert", "sql")
+        , testCase "the layout: --top-dir moves the scripts and the plan" do
+            l <- either (assertFailure . T.unpack) pure (resolveLayout "/p" (Just "alt") Nothing [("core.top_dir", "db"), ("core.deploy_dir", "db/d")] [])
+            (l.topDir, l.planFile, l.deployDir) @?= ("alt", "alt/sqitch.plan", "alt/deploy")
+        , testCase "sqitch runs with the layout pinned for the core, the engine and the target" do
+            let local = [("core.engine", "pg"), ("core.top_dir", "db"), ("engine.pg.target", "prod"), ("target.prod.uri", "db:pg://h/x")]
+            l <- either (assertFailure . T.unpack) pure (resolveLayout "/p" (Just "alt") Nothing local local)
+            let conf = sqitchConf l
+            for_ ["[core]", "[engine \"pg\"]", "[target \"prod\"]", "\ttop_dir = \"alt\"", "\turi = \"db:pg://h/x\""] \line ->
+                (line, line `T.isInfixOf` conf) @?= (line, True)
+            ("top_dir = \"db\"" `T.isInfixOf` conf) @?= False
+        ]
+  where
+    plan entries = parsePlan ("%syntax-version=1.0.0\n%project=p\n\n" <> entries)
+    unitNamed kind changeName = Unit{kind, changeName, note = "", placement = Migration, deploy = [], revert = []}

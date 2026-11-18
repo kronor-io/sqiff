@@ -78,6 +78,9 @@ units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: 
     merge u (next : rest)
         | u.placement == Migration && next.placement == Migration && u.changeName == next.changeName && all sharable (u.deploy <> next.deploy) && samePhase (u.deploy <> next.deploy) =
             u{deploy = u.deploy <> next.deploy, note = u.note} : rest
+        -- Overloads of a routine share their conventional change.
+        | u.placement == Conventional && next.placement == Conventional && u.changeName == next.changeName && u.kind == next.kind =
+            u{deploy = u.deploy <> next.deploy} : rest
     merge u rest = u : rest
 
     sharable s = s.txn == Shared

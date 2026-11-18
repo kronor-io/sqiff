@@ -20,7 +20,7 @@ import Data.Time (getCurrentTime)
 import Hasql.Connection qualified as Connection
 import RIO
 import RIO.Directory (makeAbsolute)
-import RIO.FilePath (makeRelative, normalise, (<.>), (</>))
+import RIO.FilePath (makeRelative, normalise, (</>))
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
@@ -32,7 +32,7 @@ import Sqiff.App.Table.Env
 import Sqiff.App.Table.Findings
 import Sqiff.App.Table.Rewrite
 import Sqiff.Catalog.PlpgsqlCheck (bodyErrors, notChecked)
-import Sqiff.Config (Config (..), Layout (..), Names (..), fill, findLayout, loadConfig, match)
+import Sqiff.Config (Config (..), Names (..), fill, loadConfig, match)
 import Sqiff.Connection (failWith)
 import Sqiff.ConnectionString (ConnectionString)
 import Sqiff.Definition hiding (DomainType)
@@ -44,8 +44,10 @@ import Sqiff.Plan (context, cycleMessage, invert, renderStep)
 import Sqiff.Recipe (Phase (..), Step (..), Txn (..))
 import Sqiff.Recreate (standardBody)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
-import Sqiff.Sqitch (PreviousFile (..), defaultTag, requireSqitch, reworkEdited, writeUnits)
-import Sqiff.Sqitch.Plan (SqitchPlan (..), moveToEnd, parsePlan, readPlan)
+import Sqiff.Sqitch (PreviousFile (..), moveToEnd, requireSqitch, reworkEdited, withProject, writeUnits)
+import Sqiff.Sqitch.Check (Tagging (..))
+import Sqiff.Sqitch.Layout (Layout (..), Script (..), findLayout, planPath, scriptPath)
+import Sqiff.Sqitch.Plan (SqitchPlan (..), parsePlan, readPlan)
 import Sqiff.Sqitch.Units (Unit (..), units)
 import Sqiff.Sql (replaceInCode)
 import Sqiff.TableEdit (Baseline (..), Live (..), TableEdit (..), TypeChange (..), aside, compareTable, firstFailure, foreignKeyError, typeChangeFacts, withEditedTable)
@@ -95,7 +97,7 @@ startingIf now get action
 locateTable :: Names -> Layout -> FilePath -> FilePath -> IO (FilePath, Text, QName)
 locateTable names layout root file = do
     absFile <- makeAbsolute file
-    let deployDir = normalise (root </> layout.topDir </> "deploy")
+    let deployDir = normalise (root </> layout.deployDir)
         relative = T.pack (makeRelative deployDir absFile)
         pattern = names.table
     changeName <- maybe (failWith [i|#{file} is not under #{deployDir}|]) pure (T.stripSuffix ".sql" relative)
@@ -154,15 +156,14 @@ branchChangesFor :: Comparison -> RIO TableEnv [(Text, [Text])]
 branchChangesFor comparison = do
     env <- ask
     let opts = env.opts
-        root = env.root
     case comparison of
         WithLiveTable _ -> pure []
         WithBaseFile _ -> do
-            current <- liftIO (readPlan (root </> env.layout.planFile))
-            basePlan <- liftIO (parsePlan <$> showFile env.repo opts.base (root </> env.layout.planFile))
+            current <- liftIO (readPlan (planPath env.layout))
+            basePlan <- liftIO (parsePlan <$> showFile env.repo opts.base (planPath env.layout))
             let before = Set.fromList basePlan.changes
             for (filter (\n -> n `Set.notMember` before && forTable env.config.names env.table n) (nubOrd current.changes)) \n -> do
-                script <- readFileUtf8 (root </> env.layout.topDir </> "deploy" </> T.unpack n <.> "sql")
+                script <- readFileUtf8 (scriptPath env.layout Deploy n)
                 (n,) . replayable <$> either (\e -> failWith [i|#{n}: #{e}|]) pure ((withoutTransactionControl <=< splitStatements) script)
 
 
@@ -256,7 +257,6 @@ writeMigration :: Connection.Connection -> Baseline -> TableEdit -> Findings -> 
 writeMigration conn baseline edit f = do
     env <- ask
     let opts = env.opts
-        root = env.root
         table = env.table
         changeName = env.sqitchChange
         same = f.same
@@ -268,8 +268,8 @@ writeMigration conn baseline edit f = do
         let n = length f.blocking
         failWith [i|#{n} dependencies on what the edit drops or retypes; change or drop the dependents first|]
     unless (null f.renameLike) $ failWith "a column is dropped and another added with the same type; say whether it is a rename with --rename or --drop-and-add"
-    sqitchPlan <- timed "write.readPlan" $ liftIO (readPlan (root </> env.layout.planFile))
-    basePlan <- timed "write.basePlan" $ liftIO (parsePlan <$> showFile env.repo opts.base (root </> env.layout.planFile))
+    sqitchPlan <- timed "write.readPlan" $ liftIO (readPlan (planPath env.layout))
+    basePlan <- timed "write.basePlan" $ liftIO (parsePlan <$> showFile env.repo opts.base (planPath env.layout))
     now <- liftIO getCurrentTime
     let inverseCtx = f.withViews (context Map.empty edit.desired edit.current [] (Map.map invert edit.changes))
         renameBack =
@@ -281,7 +281,7 @@ writeMigration conn baseline edit f = do
             | otherwise = u
         isIndex s = case s.object of Index _ -> True; _ -> False
         written = map withRenameBack (units env.config.names isIndex inverseCtx sqitchPlan now f.steps)
-        tagName = fromMaybe (defaultTag now) opts.tableTag
+        tagging = Tagging{given = opts.tableTag, now}
         entries p = length (filter (== changeName) p.changes)
         alreadyReworked = entries sqitchPlan > entries basePlan
     previous <- parseFile env.file (atBase opts) env.original
@@ -289,13 +289,13 @@ writeMigration conn baseline edit f = do
     let baseRev = opts.base
     for_ oldFileFails \err ->
         say [i|the file at #{baseRev} fails on the edited table (#{err}); the rework's revert does nothing and the migrations revert the table|]
-    timed "write.writeUnits" $ liftIO (writeUnits env.config.templates root env.layout.topDir sqitchPlan tagName written)
-    unless alreadyReworked do
-        afterUnits <- liftIO (readPlan (root </> env.layout.planFile))
-        timed "write.reworkEdited"
-            . liftIO
-            $ reworkEdited root env.layout.topDir afterUnits tagName changeName [i|sqiff: #{changeName} as edited|] env.original (maybe PreviousFileRuns (const PreviousFileFails) oldFileFails)
-    when alreadyReworked . liftIO $ moveToEnd (root </> env.layout.planFile) changeName
+    liftIO $ withProject env.layout \project -> do
+        timed "write.writeUnits" $ writeUnits project env.config.templates sqitchPlan tagging written
+        if alreadyReworked
+            then moveToEnd project changeName
+            else
+                timed "write.reworkEdited"
+                    $ reworkEdited project tagging changeName [i|sqiff: #{changeName} as edited|] env.original (maybe PreviousFileRuns (const PreviousFileFails) oldFileFails)
     for_ written \u -> let name = u.changeName in say [i|added #{name}|]
     say
         ( if alreadyReworked

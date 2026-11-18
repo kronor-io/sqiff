@@ -10,7 +10,7 @@ module Sqiff.Sqitch.Plan (
     parsePlan,
     plannedChanges,
     deployedChanges,
-    moveToEnd,
+    entryName,
 ) where
 
 import Data.String.Interpolate qualified as S
@@ -30,6 +30,8 @@ data SqitchPlan = SqitchPlan
     , changes :: [Text]
     , tagged :: Set Text
     -- ^ Changes with a tag somewhere after their last entry.
+    , tags :: Set Text
+    -- ^ The plan's tags, without the @\@@.
     }
 
 
@@ -45,7 +47,6 @@ parsePlan text =
     let lines' = T.lines text
         entries = [l | l <- lines', Just (c, _) <- [T.uncons l], c `notElem` ("%#" :: String)]
         isTag = ("@" `T.isPrefixOf`)
-        entryName = T.takeWhile (\c -> c /= ' ' && c /= '[')
         fromEnd _ _ [] = []
         fromEnd seenTag visited (l : ls)
             | isTag l = fromEnd True visited ls
@@ -55,6 +56,7 @@ parsePlan text =
             { project = fromMaybe "" (listToMaybe (mapMaybe (T.stripPrefix "%project=") lines'))
             , changes = [entryName l | l <- entries, not (isTag l)]
             , tagged = Set.fromList [n | (n, True) <- fromEnd False Set.empty (reverse entries)]
+            , tags = Set.fromList [entryName t | l <- entries, Just t <- [T.stripPrefix "@" l]]
             }
 
 
@@ -85,12 +87,6 @@ deployedChanges conn project =
         |]
 
 
--- | Moves the last plan entry for @name@, one the branch added, to the end of the plan.
-moveToEnd :: FilePath -> Text -> IO ()
-moveToEnd path name = do
-    text <- readFileUtf8 path
-    let ls = reverse (dropWhile (T.null . T.strip) (reverse (T.lines text)))
-        isEntry l = T.takeWhile (\c -> c /= ' ' && c /= '[') l == name
-    case L.lastMaybe [k | (k, l) <- zip [0 :: Int ..] ls, isEntry l] of
-        Just k | k < length ls - 1 -> writeFileUtf8 path (T.unlines (take k ls <> drop (k + 1) ls <> take 1 (drop k ls)))
-        _ -> pure ()
+-- | The name a plan line starts with, a change's or a tag's.
+entryName :: Text -> Text
+entryName = T.takeWhile (\c -> c /= ' ' && c /= '[')

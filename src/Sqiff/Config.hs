@@ -12,11 +12,8 @@ module Sqiff.Config (
     Password (..),
     SqitchPlace (..),
     DeployStep (..),
-    Layout (..),
     loadConfig,
     configFile,
-    sqitchLayout,
-    findLayout,
     fill,
     match,
 ) where
@@ -33,7 +30,6 @@ import RIO.Directory (doesFileExist)
 import RIO.FilePath ((</>))
 import RIO.Map qualified as Map
 import Sqiff.Connection (failWith)
-import System.Process.Typed (nullStream, proc, readProcess, setStdin, setWorkingDir)
 
 
 data Config = Config
@@ -90,13 +86,6 @@ data SqitchPlace = OnHost | InService
 data DeployStep = DeployStep
     { args :: [Text]
     , ifExists :: Maybe FilePath
-    }
-
-
--- | Where sqitch keeps the project's scripts and plan, relative to the project root.
-data Layout = Layout
-    { topDir :: FilePath
-    , planFile :: FilePath
     }
 
 
@@ -180,29 +169,6 @@ known :: [Text] -> Object -> Parser ()
 known keys o = case [k | k <- map Key.toText (KeyMap.keys o), k `notElem` keys] of
     [] -> pure ()
     unknown -> let ks = T.intercalate ", " unknown in fail [i|unknown settings: #{ks}|]
-
-
--- | The top directory and plan file sqitch uses in @root@, from @sqitch config --list@.
-sqitchLayout :: FilePath -> IO Layout
-sqitchLayout root = do
-    (code, out, err) <- readProcess (setStdin nullStream (setWorkingDir root (proc "sqitch" ["config", "--list"])))
-    unless (code == ExitSuccess) $ failWith [i|sqitch config --list in #{root} failed: #{decode err}|]
-    let settings = Map.fromList [(T.toLower k, T.drop 1 v) | l <- T.lines (decode out), let (k, v) = T.breakOn "=" l, not (T.null v)]
-        topDir = maybe "." T.unpack (Map.lookup "core.top_dir" settings)
-        planFile = maybe (topDir </> "sqitch.plan") T.unpack (Map.lookup "core.plan_file" settings)
-    pure Layout{topDir, planFile}
-  where
-    decode = T.strip . decodeUtf8Lenient . toStrictBytes
-
-
--- | sqitch's top directory and plan file in @root@: the given ones, and sqitch's
--- configuration for the others.
-findLayout :: FilePath -> Maybe FilePath -> Maybe FilePath -> IO Layout
-findLayout root top planFile = case (top, planFile) of
-    (Just topDir, Just given) -> pure Layout{topDir, planFile = given}
-    _ -> do
-        found <- sqitchLayout root
-        pure Layout{topDir = fromMaybe found.topDir top, planFile = fromMaybe found.planFile planFile}
 
 
 -- | @pattern@ with each @{key}@ replaced by its value, in one pass, so a value is never

@@ -20,7 +20,6 @@ import Data.Algorithm.Diff (PolyDiff (..), getDiff)
 import Data.String.Interpolate (i)
 import Data.Time (getCurrentTime)
 import RIO
-import RIO.FilePath ((</>))
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
@@ -30,7 +29,7 @@ import Sqiff.App.Options (DescribeOptions (..), SqitchOptions (..))
 import Sqiff.App.Read (Purpose (..), describeConnections, readBoth)
 import Sqiff.Body (BodyCheck, sameDefinition)
 import Sqiff.Catalog (describeOn)
-import Sqiff.Config (Config (..), Layout (..), findLayout)
+import Sqiff.Config (Config (..))
 import Sqiff.Connection (failWith, withConnections)
 import Sqiff.ConnectionString (ConnectionString)
 import Sqiff.Definition (Definition, printed)
@@ -40,7 +39,9 @@ import Sqiff.Model
 import Sqiff.Plan (context, cycleMessage, invert, planWith, renderStep)
 import Sqiff.Recipe (Step)
 import Sqiff.Recreate (withViewsAround)
-import Sqiff.Sqitch (defaultTag, writeUnits)
+import Sqiff.Sqitch (withProject, writeUnits)
+import Sqiff.Sqitch.Check (Tagging (..), batchProblems)
+import Sqiff.Sqitch.Layout (findLayout, planPath)
 import Sqiff.Sqitch.Plan (readPlan)
 import Sqiff.Sqitch.Units (Unit (..), UnitKind (..), units)
 import Sqiff.Timing (measure, timed)
@@ -90,12 +91,12 @@ runSqitch :: Source -> ConnectionString -> SqitchOptions -> RIO AppEnv ()
 runSqitch from toDb opts = do
     config <- asks (.config)
     layout <- liftIO (findLayout opts.projectDir opts.topDir opts.planFile)
-    sqitchPlan <- liftIO (readPlan (opts.projectDir </> layout.planFile))
+    sqitchPlan <- liftIO (readPlan (planPath layout))
     planned <- planBoth from toDb
     now <- liftIO getCurrentTime
     let inverseCtx = context Map.empty planned.toSchema planned.fromSchema planned.toEdges (Map.map invert planned.changes)
         written = units config.names (const True) inverseCtx sqitchPlan now planned.steps
-        tagName = fromMaybe (defaultTag now) opts.tag
+        tagging = Tagging{given = opts.tag, now}
     measure "sqitch.planUnits" (sum [length u.deploy + length u.revert | u <- written])
     if opts.dryRun
         then for_ written \u -> do
@@ -104,7 +105,11 @@ runSqitch from toDb opts = do
                 changeName = u.changeName
                 unitNote = u.note
             say [i|#{kind}\t#{changeName}\t#{count} statements\t#{unitNote}|]
-        else liftIO (writeUnits config.templates opts.projectDir layout.topDir sqitchPlan tagName written)
+        else liftIO (withProject layout \project -> writeUnits project config.templates sqitchPlan tagging written)
+    -- A dry run reports what would stop the write, too.
+    case batchProblems sqitchPlan written of
+        problems@(_ : _) | opts.dryRun -> failWith (T.intercalate "; " problems)
+        _ -> pure ()
 
 
 -- | Both databases, what differs and the steps that migrate it.

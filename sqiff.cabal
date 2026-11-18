@@ -54,6 +54,8 @@ library
     Sqiff.Script
     Sqiff.Sql
     Sqiff.Sqitch
+    Sqiff.Sqitch.Check
+    Sqiff.Sqitch.Layout
     Sqiff.Sqitch.Plan
     Sqiff.Sqitch.Units
     Sqiff.TableEdit
@@ -103,6 +105,7 @@ test-suite sqiff-test
     Integration
     Postgres
     Unit
+    Writing
 
   ghc-options:        -threaded -rtsopts -with-rtsopts=-N4
   build-tool-depends: sqiff:sqiff
@@ -125,4 +128,5 @@ test-suite sqiff-test
     , tasty-hunit
     , temporary
     , text
+    , time
     , typed-process

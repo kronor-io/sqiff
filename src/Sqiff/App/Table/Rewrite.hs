@@ -20,7 +20,6 @@ import Data.Time (getCurrentTime)
 import Hasql.Connection qualified as Connection
 import RIO
 import RIO.Directory (doesFileExist)
-import RIO.FilePath ((<.>), (</>))
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
@@ -28,7 +27,7 @@ import RIO.Text.Partial qualified as TP
 import Sqiff.App.Env (say)
 import Sqiff.App.Options (Output (..), TableOptions (..))
 import Sqiff.App.Table.Env
-import Sqiff.Config (Config (..), Layout (..), Names (..), fill)
+import Sqiff.Config (Config (..), Names (..), fill)
 import Sqiff.Connection (failWith, withConnection)
 import Sqiff.ConnectionString (ConnectionString, redacted)
 import Sqiff.Git (showFile)
@@ -36,7 +35,9 @@ import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Rewrite (Rewrite (..), fileDrift, rewriteFile)
 import Sqiff.Script (splitStatements)
-import Sqiff.Sqitch (PreviousFile (..), defaultTag, reworkEdited)
+import Sqiff.Sqitch (PreviousFile (..), reworkEdited, withProject, writeTracked)
+import Sqiff.Sqitch.Check (Tagging (..))
+import Sqiff.Sqitch.Layout (Script (..), planPath, scriptPath)
 import Sqiff.Sqitch.Plan (SqitchPlan (..), deployedChanges, parsePlan, plannedChanges, readPlan)
 import Sqiff.TableEdit (Baseline (..), Drops (..), Live (..), TableEdit (..), columnOrder, compareTable, readOnly)
 import Sqiff.Timing (timed)
@@ -63,7 +64,6 @@ rewriteFrom liveFrom current conn (live, liveConn) = do
     env <- ask
     let opts = env.opts
         table = env.table
-        deployDir = env.root </> env.layout.topDir </> "deploy"
         liveDb = redacted (fromMaybe env.db liveFrom)
     order <- liftIO (columnOrder liveConn table)
     when (null order) $ failWith [i|#{qualified table} is not in #{liveDb}; there is nothing to rewrite the file from|]
@@ -75,7 +75,7 @@ rewriteFrom liveFrom current conn (live, liveConn) = do
     edit <- timed "rewrite.compare" $ liftIO (compareTable conn (LiveTable live ReportDrops) table env.statements)
     ownFiles <-
         fmap Set.fromList
-            . filterM (\n -> doesFileExist (deployDir </> T.unpack (fill env.config.names.index [("schema", nameText table.schema), ("table", nameText table.name), ("name", nameText n)]) <.> "sql"))
+            . filterM (\n -> doesFileExist (scriptPath env.layout Deploy (fill env.config.names.index [("schema", nameText table.schema), ("table", nameText table.name), ("name", nameText n)])))
             $ [q.name | k <- Map.keys edit.current, Index q <- [k.object]]
     let path = env.file
     rewrite <- either (\e -> failWith [i|#{path}: #{e}|]) pure (rewriteFile table ownFiles order edit.current edit.desired current)
@@ -99,28 +99,31 @@ rewriteFrom liveFrom current conn (live, liveConn) = do
             | not (null still) -> let n = length still in failWith [i|the rewritten file still differs from the table in #{n} places; nothing written|]
             | rewrite.text == current -> say "nothing to write: the file matches the table"
             | otherwise -> do
-                sqitchPlan <- liftIO (readPlan (env.root </> env.layout.planFile))
-                basePlan <- liftIO (parsePlan <$> showFile env.repo opts.base (env.root </> env.layout.planFile))
+                sqitchPlan <- liftIO (readPlan (planPath env.layout))
+                basePlan <- liftIO (parsePlan <$> showFile env.repo opts.base (planPath env.layout))
                 now <- liftIO getCurrentTime
                 let changeName = env.sqitchChange
                     entries p = length (filter (== changeName) p.changes)
-                    tagName = fromMaybe (defaultTag now) opts.tableTag
-                writeFileUtf8 env.file rewrite.text
-                if entries sqitchPlan > entries basePlan
-                    then say [i|rewrote #{changeName}; the branch already reworks it|]
-                    else do
-                        liftIO $ reworkEdited env.root env.layout.topDir sqitchPlan tagName changeName [i|sqiff: #{changeName} as the database has it|] current PreviousFileRuns
-                        say [i|rewrote and reworked #{changeName}|]
+                    tagging = Tagging{given = opts.tableTag, now}
+                    alreadyReworked = entries sqitchPlan > entries basePlan
+                liftIO $ withProject env.layout \project -> do
+                    writeTracked project env.file rewrite.text
+                    unless alreadyReworked
+                        $ reworkEdited project tagging changeName [i|sqiff: #{changeName} as the database has it|] current PreviousFileRuns
+                say
+                    ( if alreadyReworked
+                        then [i|rewrote #{changeName}; the branch already reworks it|]
+                        else [i|rewrote and reworked #{changeName}|]
+                    )
 
 
 -- | The planned changes @live@'s sqitch registry lacks whose deploy scripts name the table.
 undeployedTouching :: Connection.Connection -> RIO TableEnv [Text]
 undeployedTouching live = do
     env <- ask
-    let deployDir = env.root </> env.layout.topDir </> "deploy"
-        needle = T.toLower (qualified env.table)
+    let needle = T.toLower (qualified env.table)
         touching name = do
-            let path = deployDir </> T.unpack name <.> "sql"
+            let path = scriptPath env.layout Deploy name
             exists <- doesFileExist path
             if not exists
                 then pure (Just [i|#{name} (no deploy file)|])
@@ -128,7 +131,7 @@ undeployedTouching live = do
                     splitStatements <$> readFileUtf8 path <&> \case
                         Left _ -> Just [i|#{name} (its statements could not be read)|]
                         Right statements -> bool Nothing (Just name) (any (changesTableIn needle) statements)
-    planText <- readFileUtf8 (env.root </> env.layout.planFile)
+    planText <- readFileUtf8 (planPath env.layout)
     deployed <- liftIO (deployedChanges live (parsePlan planText).project)
     when (Set.null deployed) $ failWith "the live database's sqitch registry has no changes of this project"
     let pending = nubOrd [name | c@(name, _) <- plannedChanges planText, c `Set.notMember` deployed]
