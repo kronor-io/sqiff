@@ -32,6 +32,7 @@ import Sqiff.Definition
 import Sqiff.Diff (Change (..))
 import Sqiff.Identifier
 import Sqiff.Model
+import Sqiff.Sql (doBlock, literal, replaceInCode)
 
 
 data Phase = DropPhase | CreatePhase
@@ -79,7 +80,7 @@ hazardText = \case
 -- privileges give a view created again, before its own grants are restored.
 revokeGranted :: Text -> Text
 revokeGranted relation =
-    [i|do $$ declare g text; begin for g in select distinct case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end from pg_class c cross join aclexplode(c.relacl) x where c.oid = #{literal relation}::regclass and x.grantee <> c.relowner loop execute format('revoke all on table %s from %s', #{literal relation}, g); end loop; end $$|]
+    doBlock [i| declare g text; begin for g in select distinct case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end from pg_class c cross join aclexplode(c.relacl) x where c.oid = #{literal relation}::regclass and x.grantee <> c.relowner loop execute format('revoke all on table %s from %s', #{literal relation}, g); end loop; end |]
 
 
 data Step = Step
@@ -346,7 +347,8 @@ definition ctx key object change = case object of
         columnLit = literal (nameText c)
         serialName = let tableName = nameText t.name in qualified (QName t.schema (identifier [i|#{tableName}_#{nameText c}_seq|]))
         toIdentity k =
-            [i|do $$
+            doBlock
+                [i|
 declare seq text := pg_get_serial_sequence(#{tableLit}, #{columnLit}); last bigint; called boolean; acl aclitem[];
 begin
     execute format('select last_value, is_called from %s', seq) into last, called;
@@ -356,9 +358,10 @@ begin
     #{col}add generated #{k};
     perform setval(pg_get_serial_sequence(#{tableLit}, #{columnLit}), last, called);
     #{grantAcl serialOf}
-end $$|]
+end |]
         toSerial colType =
-            [i|do $$
+            doBlock
+                [i|
 declare last bigint; called boolean; acl aclitem[];
 begin
     execute format('select last_value, is_called from %s', pg_get_serial_sequence(#{tableLit}, #{columnLit})) into last, called;
@@ -368,7 +371,7 @@ begin
     perform setval(#{literal serialName}, last, called);
     #{col}set default nextval(#{literal serialName}::regclass);
     #{grantAcl (literal serialName)}
-end $$|]
+end |]
         serialOf = [i|pg_get_serial_sequence(#{tableLit}, #{columnLit})|] :: Text
         grantAcl :: Text -> Text
         grantAcl target =
@@ -394,7 +397,7 @@ end $$|]
             Nothing ->
                 let command = literal [i|#{T.replace "%" "%%" (alter <> action)} %I#{T.replace "%" "%%" rest}|]
                     tableLiteral = literal (qualified t)
-                 in [i|do $$ begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal (nameText c)})])); end $$|]
+                 in doBlock [i| begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal (nameText c)})])); end |]
 
     tableConstraint t c = typed asConstraint \case
         Added def -> addConstraint def
@@ -466,7 +469,7 @@ end $$|]
                     oldName = quoted ix.name
                  in [ create
                         (None, [IndexBuild])
-                        (concurrentBuild (QName ix.schema tmp) (T.replace [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoted tmp} ON |] new.statement))
+                        (concurrentBuild (QName ix.schema tmp) (replaceInCode [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoted tmp} ON |] new.statement))
                     , create (None, []) ("drop index concurrently if exists " <> qualified ix)
                     , create (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
                     ]
@@ -479,7 +482,7 @@ end $$|]
                     [i|-- create index concurrently and attach partition for #{qualified ix}|]
                 ]
             | def.table `Set.member` ctx.newTables = [create (Shared, []) def.statement]
-            | otherwise = [create (None, [IndexBuild]) (concurrentBuild ix (T.replace " INDEX " " INDEX CONCURRENTLY " def.statement))]
+            | otherwise = [create (None, [IndexBuild]) (concurrentBuild ix (replaceInCode " INDEX " " INDEX CONCURRENTLY " def.statement))]
 
     sequenceRecipe s = typed asSequence \case
         Added def ->
@@ -500,12 +503,12 @@ end $$|]
         Dropped _ -> [remove (Shared, []) ("drop type " <> t)]
         Changed (EnumType oldLabels) (EnumType newLabels)
             | oldLabels `L.isSubsequenceOf` newLabels ->
-                [ create (Own, []) ("alter type " <> t <> " add value " <> quoteLiteral label <> placement)
+                [ create (Own, []) ("alter type " <> t <> " add value " <> literal label <> placement)
                 | (label, position) <- zip newLabels [0 :: Int ..]
                 , label `notElem` oldLabels
                 , let placement = case previous position newLabels of
-                        Just before -> " after " <> quoteLiteral before
-                        Nothing -> maybe "" ((" before " <>) . quoteLiteral) (L.headMaybe (filter (`elem` oldLabels) newLabels))
+                        Just before -> " after " <> literal before
+                        Nothing -> maybe "" ((" before " <>) . literal) (L.headMaybe (filter (`elem` oldLabels) newLabels))
                 ]
         Changed _ _ -> manual "only adding enum values is automated"
       where
@@ -728,20 +731,21 @@ viewSql v def =
 concurrentBuild :: QName -> Text -> Text
 concurrentBuild index build =
     let regclass = literal (qualified index)
-        message = T.replace "'" "''" (qualified index)
-     in T.unlines
-            [ "do $$"
-            , "begin"
-            , "    if exists ("
-            , "        select from pg_index"
-            , [i|        where indexrelid = to_regclass(#{regclass}) and not indisvalid|]
-            , "    ) then"
-            , [i|        raise exception 'index #{message} is invalid from an earlier failed build; drop it first';|]
-            , "    end if;"
-            , "end"
-            , "$$;"
-            ]
-            <> "\n"
+        message = literal ("index " <> qualified index <> " is invalid from an earlier failed build; drop it first")
+     in doBlock
+            ( T.unlines
+                [ ""
+                , "begin"
+                , "    if exists ("
+                , "        select from pg_index"
+                , [i|        where indexrelid = to_regclass(#{regclass}) and not indisvalid|]
+                , "    ) then"
+                , [i|        raise exception using message = #{message};|]
+                , "    end if;"
+                , "end"
+                ]
+            )
+            <> ";\n\n"
             <> build
 
 
@@ -754,7 +758,3 @@ takeBytes n = T.pack . go 0 . T.unpack
         | used + size ch > n = []
         | otherwise = ch : go (used + size ch) rest
     size ch = B.length (encodeUtf8 (T.singleton ch))
-
-
-literal :: Text -> Text
-literal t = [i|'#{T.replace "'" "''" t}'|]

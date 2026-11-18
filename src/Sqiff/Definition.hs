@@ -64,7 +64,6 @@ module Sqiff.Definition (
     sequenceOptions,
     ExtensionDef (..),
     TypeDef (..),
-    quoteLiteral,
 
     -- * Privileges
     Acl (..),
@@ -81,6 +80,7 @@ import RIO
 import RIO.List qualified as L
 import RIO.Set qualified as Set
 import Sqiff.Identifier
+import Sqiff.Sql (literal)
 
 
 -- | One aspect of one object.
@@ -577,18 +577,10 @@ data TypeDef
 
 typeDefText :: TypeDef -> Text
 typeDefText = \case
-    EnumType labels -> "enum (" <> T.intercalate ", " (map quoteLiteral labels) <> ")"
+    EnumType labels -> "enum (" <> T.intercalate ", " (map literal labels) <> ")"
     DomainType base notNull dflt -> T.unwords (["domain " <> typeText base] <> ["not null" | notNull] <> ["default " <> d | Just d <- [dflt]])
     CompositeType attributes -> "composite (" <> T.intercalate ", " [quoted a <> " " <> typeText t | (a, t) <- attributes] <> ")"
     RangeType subtype -> "range (subtype = " <> typeText subtype <> ")"
-
-
--- | Like PostgreSQL's @quote_literal@: quotes doubled, and an @E@ string when there is a
--- backslash, doubled too.
-quoteLiteral :: Text -> Text
-quoteLiteral t
-    | "\\" `T.isInfixOf` t = "E'" <> T.replace "\\" "\\\\" (T.replace "'" "''" t) <> "'"
-    | otherwise = "'" <> T.replace "'" "''" t <> "'"
 
 
 instance FromJSON SequenceDef where

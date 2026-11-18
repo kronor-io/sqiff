@@ -45,6 +45,7 @@ import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Plan (invert)
 import Sqiff.Recipe
+import Sqiff.Sql (doBlock, literal, replaceAllInCode)
 import Sqiff.Timing (timed)
 import System.Process.Typed (proc, runProcess, setWorkingDir)
 
@@ -337,12 +338,14 @@ renderScript header placement steps =
             | otherwise -> sql
     indexLike = \case Index _ -> True; TableConstraint _ _ -> True; _ -> False
     idempotent sql =
-        T.replace "CREATE UNIQUE INDEX CONCURRENTLY " "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "
-            . T.replace "CREATE INDEX CONCURRENTLY " "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
-            . T.replace "create unique index concurrently " "create unique index concurrently if not exists "
-            . T.replace "drop index concurrently " "drop index concurrently if exists "
-            . T.replace "drop index concurrently if exists " "drop index concurrently "
-            $ sql
+        replaceAllInCode
+            [ ("drop index concurrently if exists ", "drop index concurrently ")
+            , ("drop index concurrently ", "drop index concurrently if exists ")
+            , ("create unique index concurrently ", "create unique index concurrently if not exists ")
+            , ("CREATE INDEX CONCURRENTLY ", "CREATE INDEX CONCURRENTLY IF NOT EXISTS ")
+            , ("CREATE UNIQUE INDEX CONCURRENTLY ", "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ")
+            ]
+            sql
     hazardNotes s = map hazardText s.hazards
 
 
@@ -352,7 +355,7 @@ tidyConstraint clause = case T.stripPrefix "add constraint " clause of
     Just rest ->
         let (name, def) = T.breakOn " " rest
             lowered
-                | "FOREIGN KEY " `T.isPrefixOf` T.stripStart def = replaceAll foreignKey def
+                | "FOREIGN KEY " `T.isPrefixOf` T.stripStart def = replaceAllInCode foreignKey def
                 | otherwise = fromMaybe def (asum [(new <>) <$> T.stripPrefix old def | (old, new) <- leading])
             rest' = replaceSuffixes lowered
          in [S.i|add constraint #{name}#{rest'}|]
@@ -377,10 +380,6 @@ tidyConstraint clause = case T.stripPrefix "add constraint " clause of
     replaceSuffixes t = foldl' (\acc (old, new) -> maybe acc (<> new) (T.stripSuffix old acc)) t [(" NO INHERIT", " no inherit"), (" NOT VALID", " not valid")]
 
 
-replaceAll :: [(Text, Text)] -> Text -> Text
-replaceAll pairs t = foldl' (\acc (old, new) -> T.replace old new acc) t pairs
-
-
 -- | pg_get_indexdef's keywords in lower case, without the default @USING btree@.
 tidyIndex :: Text -> Text
 tidyIndex line
@@ -389,7 +388,7 @@ tidyIndex line
             method = T.drop 7 back
             (name, columns) = T.breakOn " " method
             using = if name == "btree" then "" else [S.i| using #{name}|]
-         in replaceAll keywords front <> using <> replaceAll tail' columns
+         in replaceAllInCode keywords front <> using <> replaceAllInCode tail' columns
     | otherwise = line
   where
     keywords =
@@ -407,7 +406,7 @@ tidyIndex line
 -- behind.
 verifyScript :: Text -> [Step] -> Text
 verifyScript header steps =
-    T.intercalate "\n\n" ([header, "BEGIN;"] <> map ("    " <>) selects <> doBlock <> ["ROLLBACK;"]) <> "\n"
+    T.intercalate "\n\n" ([header, "BEGIN;"] <> map ("    " <>) selects <> assertBlock <> ["ROLLBACK;"]) <> "\n"
   where
     final = Map.elems (Map.fromList [(s.object, s) | s <- steps, s.key.aspect == Definition])
     gone :: Step -> Bool
@@ -429,19 +428,19 @@ verifyScript header steps =
     check :: Step -> [Text]
     check s = case s.object of
         Column t col
-            | gone s -> [notExists [S.i|select from pg_attribute where attrelid = #{reg t} and attname = #{sqlLiteral c} and not attisdropped|] [S.i|column #{c} is still on #{qualified t}|]]
+            | gone s -> [notExists [S.i|select from pg_attribute where attrelid = #{reg t} and attname = #{literal c} and not attisdropped|] [S.i|column #{c} is still on #{qualified t}|]]
             | Changed (ColumnDefinition old) (ColumnDefinition new) <- s.change
             , let ty = typeText new.colType
             , old.colType /= new.colType ->
-                [ let message = sqlLiteral [S.i|#{c} is not #{ty}|]
-                   in [S.i|assert (select atttypid from pg_attribute where attrelid = #{reg t} and attname = #{sqlLiteral c}) = #{sqlLiteral ty}::regtype, #{message};|]
+                [ let message = literal [S.i|#{c} is not #{ty}|]
+                   in [S.i|assert (select atttypid from pg_attribute where attrelid = #{reg t} and attname = #{literal c}) = #{literal ty}::regtype, #{message};|]
                 ]
           where
             c = nameText col
         TableConstraint t con | "create unique index " `T.isInfixOf` T.toLower s.sql -> [relation s (QName t.schema con)]
-        TableConstraint t con -> let c = nameText con in [presence s [S.i|select from pg_constraint where conrelid = #{reg t} and conname = #{sqlLiteral c}|] [S.i|constraint #{c} on #{qualified t}|]]
-        Policy t name -> let n = nameText name in [presence s [S.i|select from pg_policy where polrelid = #{reg t} and polname = #{sqlLiteral n}|] [S.i|policy #{n} on #{qualified t}|]]
-        Trigger t name -> let n = nameText name in [presence s [S.i|select from pg_trigger where tgrelid = #{reg t} and tgname = #{sqlLiteral n} and not tgisinternal|] [S.i|trigger #{n} on #{qualified t}|]]
+        TableConstraint t con -> let c = nameText con in [presence s [S.i|select from pg_constraint where conrelid = #{reg t} and conname = #{literal c}|] [S.i|constraint #{c} on #{qualified t}|]]
+        Policy t name -> let n = nameText name in [presence s [S.i|select from pg_policy where polrelid = #{reg t} and polname = #{literal n}|] [S.i|policy #{n} on #{qualified t}|]]
+        Trigger t name -> let n = nameText name in [presence s [S.i|select from pg_trigger where tgrelid = #{reg t} and tgname = #{literal n} and not tgisinternal|] [S.i|trigger #{n} on #{qualified t}|]]
         Index q -> [relation s q]
         View q -> [relation s q]
         MaterializedView q -> [relation s q]
@@ -450,26 +449,22 @@ verifyScript header steps =
     relation :: Step -> QName -> Text
     relation s q =
         let name = qualified q
-            stillThere = sqlLiteral [S.i|#{name} still exists|]
-            missing = sqlLiteral [S.i|#{name} is missing|]
+            stillThere = literal [S.i|#{name} still exists|]
+            missing = literal [S.i|#{name} is missing|]
          in if gone s
-                then [S.i|assert to_regclass(#{sqlLiteral name}) is null, #{stillThere};|]
-                else [S.i|assert to_regclass(#{sqlLiteral name}) is not null, #{missing};|]
+                then [S.i|assert to_regclass(#{literal name}) is null, #{stillThere};|]
+                else [S.i|assert to_regclass(#{literal name}) is not null, #{missing};|]
     presence :: Step -> Text -> Text -> Text
     presence s query what =
-        let missing = sqlLiteral [S.i|#{what} is missing|]
+        let missing = literal [S.i|#{what} is missing|]
          in if gone s then notExists query [S.i|#{what} still exists|] else [S.i|assert exists (#{query}), #{missing};|]
     notExists :: Text -> Text -> Text
-    notExists query message = [S.i|assert not exists (#{query}), #{sqlLiteral message};|]
+    notExists query message = [S.i|assert not exists (#{query}), #{literal message};|]
     reg :: QName -> Text
-    reg t = let name = sqlLiteral (qualified t) in [S.i|#{name}::regclass|]
-    doBlock
+    reg t = let name = literal (qualified t) in [S.i|#{name}::regclass|]
+    assertBlock
         | null asserts = []
-        | otherwise = [T.intercalate "\n" (["    do $$", "    begin"] <> map ("        " <>) asserts <> ["    end", "    $$;"])]
-
-
-sqlLiteral :: Text -> Text
-sqlLiteral t = let escaped = T.replace "'" "''" t in [S.i|'#{escaped}'|]
+        | otherwise = ["    " <> doBlock (T.intercalate "\n" ([""] <> ["    begin"] <> map ("        " <>) asserts <> ["    end", "    "])) <> ";"]
 
 
 -- | Moves the last plan entry for @name@, one the branch added, to the end of the plan.

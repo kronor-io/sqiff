@@ -194,15 +194,20 @@ sqitchLayout root = do
     decode = T.strip . decodeUtf8Lenient . toStrictBytes
 
 
--- | @pattern@ with each @{key}@ replaced by its value.
+-- | @pattern@ with each @{key}@ replaced by its value, in one pass, so a value is never
+-- read as a placeholder itself; a key without a value stays as written.
 fill :: Text -> [(Text, Text)] -> Text
-fill = foldl' (\t (k, v) -> T.replace ("{" <> k <> "}") v t)
+fill pattern values = T.concat (map piece (templatePieces pattern))
+  where
+    piece = \case
+        Left text -> text
+        Right key -> fromMaybe ("{" <> key <> "}") (lookup key values)
 
 
 -- | The values @pattern@'s placeholders take in @text@; a placeholder matches one or more
 -- characters other than @/@.
 match :: Text -> Text -> Maybe [(Text, Text)]
-match pattern text = go (pieces pattern) text
+match pattern text = go (templatePieces pattern) text
   where
     go [] rest = if T.null rest then Just [] else Nothing
     go (Left literal : ps) rest = T.stripPrefix literal rest >>= go ps
@@ -218,8 +223,12 @@ match pattern text = go (pieces pattern) text
                 , Just bound <- [go ps after]
                 ]
     breaks literal rest = [(T.dropEnd (T.length r) rest, r) | r <- T.tails rest, literal `T.isPrefixOf` r]
-    pieces p = case T.breakOn "{" p of
-        (literal, "") -> [Left literal | not (T.null literal)]
-        (literal, rest) ->
-            let (key, after) = T.breakOn "}" (T.drop 1 rest)
-             in [Left literal | not (T.null literal)] <> [Right key] <> pieces (T.drop 1 after)
+
+
+-- | A template's literal text and its @{key}@ placeholders, in order.
+templatePieces :: Text -> [Either Text Text]
+templatePieces p = case T.breakOn "{" p of
+    (literal, "") -> [Left literal | not (T.null literal)]
+    (literal, rest) ->
+        let (key, after) = T.breakOn "}" (T.drop 1 rest)
+         in [Left literal | not (T.null literal)] <> [Right key] <> templatePieces (T.drop 1 after)

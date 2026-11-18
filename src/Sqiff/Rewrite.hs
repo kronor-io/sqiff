@@ -12,7 +12,7 @@ module Sqiff.Rewrite (
     fileDrift,
 ) where
 
-import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
+import Data.Char (isDigit, isSpace)
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
@@ -26,6 +26,8 @@ import Sqiff.Model
 import Sqiff.Recipe (columnSql)
 import Sqiff.Script (splitStatements)
 import Sqiff.Sqitch (tidyConstraint, tidyIndex)
+import Sqiff.Sql (Region (..), codeOnly, regions, replaceInCode, topWords)
+import Sqiff.Sql qualified as Sql
 
 
 data Rewrite = Rewrite
@@ -303,72 +305,6 @@ unquote p = case T.stripPrefix "\"" p >>= T.stripSuffix "\"" of
     Nothing -> T.toLower p
 
 
-data Region = Code | Quoted | Remark
-    deriving stock (Eq)
-
-
--- | Each character with whether it is code, inside quotes, or inside a comment.
-regions :: Text -> [(Char, Region)]
-regions = code ' ' . T.unpack
-  where
-    code prev = \case
-        [] -> []
-        '-' : '-' : rest -> let (c, more) = break (== '\n') rest in map (,Remark) ('-' : '-' : c) <> code ' ' more
-        '/' : '*' : rest -> ('/', Remark) : ('*', Remark) : block (1 :: Int) rest
-        e : '\'' : rest | e `elem` ("eE" :: String), not (wordChar prev) -> (e, Quoted) : ('\'', Quoted) : escaped rest
-        '$' : rest
-            | not (wordChar prev)
-            , Just tag <- dollarTag rest ->
-                map (,Quoted) ('$' : tag) <> dollar ('$' : tag) (drop (length tag) rest)
-        q : rest | q == '\'' || q == '"' -> (q, Quoted) : inQuote q rest
-        c : rest -> (c, Code) : code c rest
-    inQuote q = \case
-        [] -> []
-        c : d : more | c == q && d == q -> (c, Quoted) : (d, Quoted) : inQuote q more
-        c : more | c == q -> (c, Quoted) : code c more
-        c : more -> (c, Quoted) : inQuote q more
-    escaped = \case
-        [] -> []
-        '\\' : x : more -> ('\\', Quoted) : (x, Quoted) : escaped more
-        '\'' : '\'' : more -> ('\'', Quoted) : ('\'', Quoted) : escaped more
-        '\'' : more -> ('\'', Quoted) : code '\'' more
-        c : more -> (c, Quoted) : escaped more
-    dollar tag s = case L.stripPrefix tag s of
-        Just after -> map (,Quoted) tag <> code '$' after
-        Nothing -> case s of
-            [] -> []
-            c : more -> (c, Quoted) : dollar tag more
-    dollarTag more = case span (\c -> isAlphaNum c || c == '_') more of
-        (tag, '$' : _) | maybe True (not . isDigit) (listToMaybe tag) -> Just (tag <> "$")
-        _ -> Nothing
-    wordChar c = isAlphaNum c || c == '_' || c == '$'
-    block depth = \case
-        [] -> []
-        '*' : '/' : more -> ('*', Remark) : ('/', Remark) : if depth == 1 then code '/' more else block (depth - 1) more
-        '/' : '*' : more -> ('/', Remark) : ('*', Remark) : block (depth + 1) more
-        c : more -> (c, Remark) : block depth more
-
-
--- | The text with its comments blanked out.
-codeOnly :: Text -> Text
-codeOnly t = T.pack [if r == Remark then ' ' else c | (c, r) <- regions t]
-
-
--- | The words outside quotes, comments and parentheses, lower case, with where they start.
-topWords :: Text -> [(Int, Text)]
-topWords t = go (0 :: Int) (zip [0 ..] (regions t))
-  where
-    go _ [] = []
-    go depth xs@((k, (c, r)) : rest)
-        | r /= Code = go depth rest
-        | c == '(' = go (depth + 1) rest
-        | c == ')' = go (depth - 1) rest
-        | depth == 0 && (isAlpha c || c == '_') =
-            let (w, more) = span (\(_, (ch, rr)) -> rr == Code && (isAlphaNum ch || ch == '_' || ch == '$')) xs
-             in (k, T.toLower (T.pack (map (fst . snd) w))) : go depth more
-        | otherwise = go depth rest
-
-
 -- | A comment statement with its text replaced, keeping how the file quotes it.
 withLiteral :: Text -> Text -> Text
 withLiteral new code = case [k | (k, "is") <- topWords code] of
@@ -384,7 +320,7 @@ literal tag t = case tag of
     Just q | fits q -> q <> t <> q
     _
         | "\n" `T.isInfixOf` t && fits "$comment$" -> "$comment$" <> t <> "$comment$"
-        | otherwise -> "'" <> T.replace "'" "''" t <> "'"
+        | otherwise -> Sql.literal t
   where
     fits q = not (q `T.isInfixOf` (t <> "$"))
 
@@ -583,5 +519,5 @@ inlineSuffix body = case [k | (k, w) <- drop 1 (topWords body), w `elem` ["const
 constraintLine :: Text -> Identifier -> Text -> Text
 constraintLine indent n def =
     let tidied = fromMaybe def (T.stripPrefix "add constraint " (tidyConstraint [i|add constraint #{quoted n} #{def}|]))
-        broken = foldl' (\acc kw -> T.replace (" " <> kw <> " ") ("\n" <> indent <> "    " <> kw <> " ") acc) tidied ["foreign key", "references", "on delete", "on update"]
+        broken = foldl' (\acc kw -> replaceInCode (" " <> kw <> " ") ("\n" <> indent <> "    " <> kw <> " ") acc) tidied ["foreign key", "references", "on delete", "on update"]
      in "constraint " <> if "foreign key" `T.isInfixOf` tidied then broken else tidied

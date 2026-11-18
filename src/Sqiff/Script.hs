@@ -10,6 +10,7 @@ import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
 import RIO.List qualified as L
+import Sqiff.Sql (codeOnly)
 
 
 data Mode = Plain | Single | Escaped | Double | Dollar String | LineComment | BlockComment Int
@@ -102,17 +103,10 @@ splitStatements = go Plain "" False "" Nothing 0 [] . T.unpack
 withoutTransactionControl :: [Text] -> Either Text [Text]
 withoutTransactionControl = fmap catMaybes . traverse classify
   where
-    classify s = case T.words (T.toLower (withoutComments s)) of
+    classify s = case T.words (T.toLower (codeOnly s)) of
         "prepare" : "transaction" : _ -> Left "PREPARE TRANSACTION cannot run inside a transaction of ours"
         w : "prepared" : _ | w `elem` ["commit", "rollback"] -> Left (T.toUpper w <> " PREPARED cannot run inside a transaction of ours")
-        "rollback" : "to" : _ -> Right (Just s)
+        -- ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name undoes to a savepoint and stays.
+        "rollback" : rest | "to" : _ <- dropWhile (`elem` ["work", "transaction"]) rest -> Right (Just s)
         w : _ | w `elem` ["begin", "start", "commit", "end", "rollback", "abort"] -> Right Nothing
         _ -> Right (Just s)
-
-    withoutComments = T.pack . strip (0 :: Int) . T.unpack
-    strip 0 ('-' : '-' : rest) = strip 0 (dropWhile (/= '\n') rest)
-    strip n ('/' : '*' : rest) = strip (n + 1) rest
-    strip n ('*' : '/' : rest) | n > 0 = ' ' : strip (n - 1) rest
-    strip 0 (ch : rest) = ch : strip 0 rest
-    strip n (_ : rest) = strip n rest
-    strip _ [] = []

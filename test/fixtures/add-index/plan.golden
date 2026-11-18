@@ -7,7 +7,7 @@ begin
         select from pg_index
         where indexrelid = to_regclass('public.t_email') and not indisvalid
     ) then
-        raise exception 'index public.t_email is invalid from an earlier failed build; drop it first';
+        raise exception using message = 'index public.t_email is invalid from an earlier failed build; drop it first';
     end if;
 end
 $$;

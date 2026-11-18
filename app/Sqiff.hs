@@ -43,6 +43,7 @@ import Sqiff.Recreate (standardBody, viewsAroundTypeChanges, withViewsAround)
 import Sqiff.Rewrite (Rewrite (..), fileDrift, rewriteFile)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
 import Sqiff.Sqitch (PreviousFile (..), SqitchPlan (..), Unit (..), UnitKind (..), deployedChanges, moveToEnd, parsePlan, plannedChanges, readPlan, requireSqitch, reworkEdited, units, writeUnits)
+import Sqiff.Sql (replaceInCode)
 import Sqiff.TableEdit (Baseline (..), Drops (..), Live (..), TableEdit (..), TableRewrite (..), TargetType (..), TypeChange (..), aside, columnOrder, compareTable, firstFailure, foreignKeyError, readOnly, requireScratch, typeChangeFacts, withEditedTable)
 import Sqiff.Timing (measure, timed)
 
@@ -1067,7 +1068,7 @@ forTable names t n =
 -- | A migration's statements as they can run inside the comparison's transaction:
 -- without session settings, and with concurrent index builds made plain.
 replayable :: [Text] -> [Text]
-replayable = map (TP.replace "concurrently " "" . TP.replace "CONCURRENTLY " "") . filter (not . setting)
+replayable = map (replaceInCode "concurrently " "" . replaceInCode "CONCURRENTLY " "") . filter (not . setting)
   where
     setting s = any (`T.isPrefixOf` T.toLower (withoutLeadingComments s)) ["set ", "reset ", "select set_config("]
 

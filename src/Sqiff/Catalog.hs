@@ -66,6 +66,7 @@ import Sqiff.ConnectionString (ConnectionString, libpqText)
 import Sqiff.Definition (Definition (..))
 import Sqiff.Identifier (Identifier, QName (..), identifier, nameText, qname)
 import Sqiff.Model
+import Sqiff.Sql (doBlock, literal)
 import Sqiff.Timing (timed)
 
 
@@ -459,13 +460,14 @@ bodyErrors conn aside table made signatures sqlSignatures =
     validate = [singletonStatement| select pg_catalog.fmgr_sql_validator(to_regprocedure($1 :: text)) :: text? |]
     recompile =
         let list = T.intercalate ", " (map literal signatures)
-         in [i|do $sqiff$
+         in doBlock
+                [i|
 declare f record;
 begin
     for f in select p.oid::regprocedure as signature, p.prosecdef from pg_proc p where p.oid in (select to_regprocedure(s) from unnest(array[#{list}]::text[]) s) loop
         execute format('alter routine %s %s', f.signature, case when f.prosecdef then 'security definer' else 'security invoker' end);
     end loop;
-end $sqiff$|]
+end |]
     guarded action = do
         savepoint "savepoint sqiff_check"
         result <- action
@@ -515,7 +517,6 @@ end $sqiff$|]
             ) e
             order by s.n
         |]
-    literal t = [i|'#{TP.replace "'" "''" t}'|] :: Text
 
 
 -- | How 'bodyErrors' starts the message for a function it could not check.

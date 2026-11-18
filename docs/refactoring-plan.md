@@ -129,6 +129,26 @@ Guiding rules:
   - Not done: serial-to-identity as one coordinated operation, and reverts per unit
     (Codex 11 and 16).
 
+- [x] **Phase 4:** one SQL-text policy, in `Sqiff.Sql`.
+  - The lexer from `Rewrite` (`regions`: code, quoted or comment, per character) is shared
+    by `Rewrite`, `Sqitch`, `Script` and the app.
+  - `replaceInCode` rewrites words only where they are code. It is used for index and
+    constraint tidying, `IF NOT EXISTS`, replaying `concurrently` and line-breaking
+    foreign keys.
+  - `literal` follows `quote_literal` (an `E''` string when there is a backslash) and
+    replaces four copies.
+  - `dollarQuoted` and `doBlock` choose a tag the body does not contain. They replace
+    the fixed `$$` and `$sqiff$`.
+  - Invalid-index checks use `raise exception using message = …`, so `%` in a name is
+    safe.
+  - `fill` expands a template in one pass, and `ROLLBACK WORK/TRANSACTION TO` is kept.
+  - No `known bug:` unit test is left. The new fixture `index-odd-name` fails on the
+    previous commit.
+  - Kept global: `TableEdit` still replaces `sqiff_aside.` everywhere in a definition,
+    because owned sequences move with the table and their names appear in
+    `nextval('…')` literals. `Script.splitStatements` keeps its own state machine, which
+    tracks `BEGIN ATOMIC` depth.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

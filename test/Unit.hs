@@ -3,8 +3,8 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Tests of the pure parts: quoting, name templates, script splitting, plan parsing,
--- ordering and diffing. Tests named @known bug:@ pin down defects from the review
--- (docs/codex-review.md); they are expected to fail until the bug is fixed.
+-- ordering and diffing. A defect from the review (docs/codex-review.md) that is not fixed
+-- yet is a test wrapped in @expectFailBecause@, named @known bug:@.
 module Unit (tests) where
 
 import Data.Aeson (FromJSON)
@@ -27,8 +27,8 @@ import Sqiff.Plan (invert, topoOrder)
 import Sqiff.Rewrite (fileDrift)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
 import Sqiff.Sqitch (SqitchPlan (..), parsePlan, tidyIndex)
+import Sqiff.Sql qualified as Sql
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.ExpectedFailure (expectFailBecause)
 import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
 import Test.Tasty.Hedgehog (testProperty)
 
@@ -47,6 +47,26 @@ tests =
         , diffing
         , columns
         , formatting
+        ]
+
+
+sqlText :: TestTree
+sqlText =
+    testGroup
+        "SQL text"
+        [ testCase "replaceInCode leaves literals, quoted names and comments alone"
+            $ Sql.replaceInCode " WHERE " " where " "x WHERE y = ' WHERE ' -- WHERE \n and \" WHERE \" WHERE z"
+            @?= "x where y = ' WHERE ' -- WHERE \n and \" WHERE \" where z"
+        , testCase "replaceInCode leaves dollar-quoted bodies alone"
+            $ Sql.replaceInCode "concurrently " "" "create index concurrently i on t (x) where f($$concurrently $$)"
+            @?= "create index i on t (x) where f($$concurrently $$)"
+        , testCase "dollarQuoted picks a tag the body lacks" do
+            Sql.dollarQuoted "select 1" @?= "$$select 1$$"
+            Sql.dollarQuoted "a $$ b" @?= "$sqiff$a $$ b$sqiff$"
+            Sql.dollarQuoted "$$ $sqiff$" @?= "$sqiff1$$$ $sqiff$$sqiff1$"
+        , testCase "a body ending in a dollar does not close the quote early"
+            $ Sql.dollarQuoted "x$"
+            @?= "$sqiff$x$$sqiff$"
         ]
 
 
@@ -170,8 +190,7 @@ templates =
             let keys = placeholders pattern
             values <- forAll (traverse (\k -> (k,) <$> segment) keys)
             match pattern (fill pattern values) === Just values
-        , expectFailBecause "fill substitutes one key at a time, so a value that looks like a placeholder is expanded again"
-            $ testCase "known bug: a value is not expanded again"
+        , testCase "a value is not expanded again"
             $ fill "{schema}/{name}" [("schema", "{name}"), ("name", "t")]
             @?= "{name}/t"
         ]
@@ -212,8 +231,7 @@ scripts =
         , testCase "refuses PREPARE TRANSACTION"
             $ isLeft (withoutTransactionControl ["prepare transaction 'x'"])
             @?= True
-        , expectFailBecause "only ROLLBACK TO is recognised, not ROLLBACK WORK TO or ROLLBACK TRANSACTION TO"
-            $ testCase "known bug: keeps ROLLBACK WORK TO"
+        , testCase "keeps ROLLBACK WORK TO"
             $ withoutTransactionControl ["rollback work to sp"]
             @?= Right ["rollback work to sp"]
         ]
@@ -347,9 +365,9 @@ columns =
         , testCase "a table's settings print one per line" do
             t <- decode @TableDef "{\"unlogged\": true, \"partition_by\": \"RANGE (at)\", \"row_security\": true, \"force_row_security\": false, \"options\": [\"fillfactor=70\", \"toast.autovacuum_enabled=false\"]}"
             tableText t @?= "unlogged\npartition by RANGE (at)\nrow level security\nwith (fillfactor=70, toast.autovacuum_enabled=false)"
-        , testCase "quoteLiteral matches quote_literal" do
-            quoteLiteral "it's" @?= "'it''s'"
-            quoteLiteral "a\\, b" @?= "E'a\\\\, b'"
+        , testCase "literal matches quote_literal" do
+            Sql.literal "it's" @?= "'it''s'"
+            Sql.literal "a\\, b" @?= "E'a\\\\, b'"
         , testCase "no ACL is the default, an empty one is not" do
             decode "null" >>= (@?= DefaultAcl)
             decode "[]" >>= (@?= ExplicitAcl Set.empty)
@@ -369,8 +387,7 @@ formatting =
         , testCase "keeps a non-default method"
             $ tidyIndex "CREATE INDEX t_x ON public.t USING gin (x)"
             @?= "create index t_x on public.t using gin (x)"
-        , expectFailBecause "keywords are replaced anywhere, string literals included"
-            $ testCase "known bug: leaves string literals alone"
+        , testCase "leaves string literals alone"
             $ tidyIndex "CREATE INDEX t_x ON public.t USING btree (x) WHERE (y <> ' WHERE ')"
             @?= "create index t_x on public.t (x) where (y <> ' WHERE ')"
         ]
