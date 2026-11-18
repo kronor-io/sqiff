@@ -439,8 +439,8 @@ verifyScript header steps =
                               in [S.i|assert #{attribute "attnotnull"} = #{notNull}, #{literal message};|]
                            | differs isNotNull
                            ]
-                        <> [ let name = nameText co
-                              in [S.i|assert (select collname from pg_collation where oid = #{attribute "attcollation"}) = #{literal name}, #{literal (c <> " is not collated " <> name)};|]
+                        <> [ let name = collationSql co
+                              in [S.i|assert #{attribute "attcollation"} = #{literal name}::regcollation, #{literal (c <> " is not collated " <> name)};|]
                            | differs (.collation)
                            , Just co <- [new.collation]
                            ]

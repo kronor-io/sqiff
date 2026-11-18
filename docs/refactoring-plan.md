@@ -385,6 +385,14 @@ Guiding rules:
   - Still heuristics: a quoted name with spaces splits into words, and a search path
     other than the table's schema is not resolved.
 
+- [x] **Collations keep their schema (Codex 9).**
+  - A column's collation is a `Collation`: its schema, left out for `pg_catalog`'s, and
+    its name. Plans write `collate app.c_copy` rather than `collate c_copy`, which the
+    deploy's search path may not find, or may find in another schema.
+  - Verify scripts compare the collation with `regcollation`, which resolves the name as
+    PostgreSQL does.
+  - The new fixture `collation-in-schema` covers it.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

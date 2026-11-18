@@ -1,0 +1,9 @@
+-- table column app.names.name
+-- hazard: may rewrite the table
+-- hazard: holds an ACCESS EXCLUSIVE lock, which blocks reads and writes, while it runs
+-- hazard: fails when an existing value does not convert to the new type
+alter table app.names alter column name type text collate app.c_copy using name::text;
+
+-- table column app.names.other
+alter table app.names add column other text collate "C";
+

@@ -352,7 +352,7 @@ definition ctx key object change = case object of
                             , [MayRewriteTable, LongLock, MayFail "fails when an existing value does not convert to the new type"]
                                 <> [MayFail "recreating a view fails when its query relies on the old type; then edit the view" | Map.member (t, c) ctx.viewsAround]
                             )
-                            (aroundViews (col <> "type " <> typeText new.colType <> maybe "" ((" collate " <>) . quoted) new.collation <> " using " <> quoted c <> "::" <> typeText new.colType))
+                            (aroundViews (col <> "type " <> typeText new.colType <> maybe "" ((" collate " <>) . collationSql) new.collation <> " using " <> quoted c <> "::" <> typeText new.colType))
                        | typeChanged
                        ]
                     <> case defaultExpr new of
@@ -763,7 +763,7 @@ columnSql :: ColumnDef -> Text
 columnSql c =
     T.unwords
         $ [typeText c.colType]
-        <> ["collate " <> quoted co | Just co <- [c.collation]]
+        <> ["collate " <> collationSql co | Just co <- [c.collation]]
         <> ["generated always as (" <> e <> ") " <> storageSql storage | Just (storage, e) <- [generatedOf c]]
         <> ["generated " <> identityKindSql kind <> " as identity" <> identityOptionsSql options | IdentityColumn kind options <- [c.value]]
         <> [maybe "" (\n -> "constraint " <> quoted n <> " ") (notNullName c) <> "not null" | isNotNull c]

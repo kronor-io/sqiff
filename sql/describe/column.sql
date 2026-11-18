@@ -6,7 +6,11 @@ select
     jsonb_build_object(
         'position', a.attnum,
         'type', format_type(a.atttypid, a.atttypmod),
-        'collation', case when a.attcollation <> t.typcollation then co.collname end,
+        -- The schema is left out for pg_catalog, where the built-in collations are.
+        'collation', case when a.attcollation <> t.typcollation then jsonb_build_object(
+            'schema', nullif(con.nspname, 'pg_catalog'),
+            'name', co.collname
+        ) end,
         'not_null', case
             when nn.oid is not null then jsonb_build_object(
                 'validated', nn.convalidated,
@@ -76,6 +80,7 @@ join pg_class c on c.oid = a.attrelid
 join pg_namespace n on n.oid = c.relnamespace
 join pg_type t on t.oid = a.atttypid
 left join pg_collation co on co.oid = a.attcollation
+left join pg_namespace con on con.oid = co.collnamespace
 left join pg_attrdef ad on ad.adrelid = a.attrelid and ad.adnum = a.attnum
 left join pg_constraint nn on nn.conrelid = a.attrelid and nn.contype = 'n' and nn.conkey = array[a.attnum]
 where a.attnum > 0

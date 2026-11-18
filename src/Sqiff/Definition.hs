@@ -27,6 +27,8 @@ module Sqiff.Definition (
 
     -- * Columns
     ColumnDef (..),
+    Collation (..),
+    collationSql,
     Position (..),
     positionNumber,
     Nullability (..),
@@ -79,7 +81,7 @@ module Sqiff.Definition (
     granteeSql,
 ) where
 
-import Data.Aeson (FromJSON (..), Value (Null), withObject, (.!=), (.:), (.:?))
+import Data.Aeson (FromJSON (..), Value (Null, String), withObject, (.!=), (.:), (.:?))
 import Data.Aeson.Types (Parser)
 import Data.Text qualified as T
 import RIO
@@ -219,7 +221,7 @@ asAcl = \case
 -- | A table column, as @alter table ... add column@ would declare it.
 data ColumnDef = ColumnDef
     { colType :: TypeName
-    , collation :: Maybe Identifier
+    , collation :: Maybe Collation
     -- ^ Only when it is not the type's own.
     , nullability :: Nullability
     , value :: ColumnValue
@@ -347,12 +349,32 @@ failsOnRows :: ColumnDef -> Bool
 failsOnRows c = isNotNull c && c.value == PlainColumn Nothing
 
 
+-- | A collation, by its schema unless it is one of pg_catalog's.
+data Collation = Collation
+    { schema :: Maybe Identifier
+    , name :: Identifier
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+collationSql :: Collation -> Text
+collationSql c = maybe "" (\s -> quoted s <> ".") c.schema <> quoted c.name
+
+
+instance FromJSON Collation where
+    parseJSON v = case v of
+        -- A name alone, as sqiff wrote it before it kept the schema.
+        String n -> pure (Collation Nothing (identifier n))
+        _ -> withObject "collation" (\o -> Collation <$> (fmap identifier <$> o .:? "schema") <*> (identifier <$> o .: "name")) v
+
+
 -- | The column as text, one fact per line.
 columnText :: ColumnDef -> Text
 columnText c =
     T.intercalate "\n"
         $ ["type " <> typeText c.colType]
-        <> ["collate " <> quoted co | Just co <- [c.collation]]
+        <> ["collate " <> collationSql co | Just co <- [c.collation]]
         <> case c.nullability of
             Nullable -> []
             NotNull validity name ->
@@ -368,7 +390,7 @@ columnText c =
 instance FromJSON ColumnDef where
     parseJSON = withObject "column" \o -> do
         colType <- typeName <$> o .: "type"
-        collation <- fmap identifier <$> o .:? "collation"
+        collation <- o .:? "collation"
         notNull <- o .:? "not_null"
         nullability <- case notNull of
             Nothing -> pure Nullable
