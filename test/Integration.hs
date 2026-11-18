@@ -13,7 +13,10 @@
 --   @sqiff diff@ to find nothing left;
 -- * the sqitch round trip writes the plan as sqitch changes into a new project, has
 --   sqitch deploy and verify them on a fresh copy of @from@, and expects the same;
--- * a @known-bug@ file marks a fixture whose round trips fail today, and says why.
+-- * after its round trip, each migration is reverted, deployed again and reverted again,
+--   last first, and reverting them all must give back @from@;
+-- * a @known-bug@ file marks a fixture whose round trips fail today, and says why;
+-- * a @revert-gap@ file marks one whose changes PostgreSQL cannot fully revert, and why.
 module Integration (tests) where
 
 import Data.String.Interpolate (i)
@@ -31,6 +34,7 @@ import RIO.Text qualified as T
 import Sqiff.Connection (withConnections, withSharedSnapshot)
 import Sqiff.ConnectionString (connectionString)
 import Sqiff.Script (splitStatements)
+import Sqiff.Sqitch.Plan (SqitchPlan (..), readPlan)
 import System.Environment (lookupEnv, setEnv)
 import System.Process.Typed (proc, readProcess, setWorkingDir)
 import Test.Tasty (TestTree, testGroup, withResource)
@@ -46,7 +50,7 @@ fixturesDir = "test/fixtures"
 tests :: Bool -> IO TestTree
 tests sqitch = do
     names <- sort <$> listDirectory fixturesDir
-    fixtures <- for names \name -> (name,) <$> knownBug name
+    fixtures <- for names \name -> (name,) <$> ((,) <$> reasonIn name "known-bug" <*> reasonIn name "revert-gap")
     findBinaries >>= \case
         Left why -> pure (testGroup "integration" [testCase "PostgreSQL is available" (assertFailure (T.unpack why))])
         Right bin -> do
@@ -73,10 +77,10 @@ sharedSnapshot getCluster = testCase "connections in a shared snapshot see one s
         after @?= 1
 
 
--- | The reason in a fixture's @known-bug@ file, if it has one.
-knownBug :: FilePath -> IO (Maybe Text)
-knownBug name = do
-    let path = fixturesDir </> name </> "known-bug"
+-- | The reason in one of a fixture's marker files, if it has it.
+reasonIn :: FilePath -> FilePath -> IO (Maybe Text)
+reasonIn name file = do
+    let path = fixturesDir </> name </> file
     doesFileExist path >>= \case
         True -> Just . T.strip <$> readFileUtf8 path
         False -> pure Nothing
@@ -89,8 +93,8 @@ data Before = Before
     }
 
 
-fixture :: Bool -> IO Cluster -> FilePath -> Maybe Text -> TestTree
-fixture sqitch getCluster name bug = withResource prepare (const (pure ())) \getBefore ->
+fixture :: Bool -> IO Cluster -> FilePath -> (Maybe Text, Maybe Text) -> TestTree
+fixture sqitch getCluster name (bug, revertGap) = withResource prepare (const (pure ())) \getBefore ->
     testGroup
         name
         [ golden "diff" (.diffOut) getBefore
@@ -104,6 +108,7 @@ fixture sqitch getCluster name bug = withResource prepare (const (pure ())) \get
     fromDb = base <> "_from"
     toDb = base <> "_to"
     sqitchDb = base <> "_sqitch"
+    originalDb = base <> "_original"
 
     prepare = do
         cluster <- getCluster
@@ -118,9 +123,11 @@ fixture sqitch getCluster name bug = withResource prepare (const (pure ())) \get
 
     sqiff cluster command = sqiffFrom cluster fromDb command
 
-    sqiffFrom cluster from command = do
+    sqiffFrom cluster from = sqiffBetween cluster from toDb
+
+    sqiffBetween cluster from to command = do
         exe <- fromMaybe "sqiff" <$> lookupEnv "SQIFF_EXE"
-        let args = command <> ["--from", T.unpack (conninfo cluster from), "--to", T.unpack (conninfo cluster toDb)]
+        let args = command <> ["--from", T.unpack (conninfo cluster from), "--to", T.unpack (conninfo cluster to)]
         -- Run outside the repository, so no sqiff.yaml is read.
         (code, out, err) <- readProcess (setWorkingDir "/" (proc exe args))
         pure (code, decode out, decode err)
@@ -169,8 +176,29 @@ fixture sqitch getCluster name bug = withResource prepare (const (pure ())) \get
             unless (T.null (T.strip before.planOut)) do
                 run "sqitch deploy" "sqitch" ["deploy", "--verify", target]
                 run "sqitch verify" "sqitch" ["verify", target]
-        (code, out, err) <- sqiffFrom cluster sqitchDb ["diff", "--exclude-schema", "sqitch"]
-        unless (code == ExitSuccess)
-            $ assertFailure (T.unpack [i|after sqitch deploy, diff still finds:\n#{out}#{err}|])
+                (code, out, err) <- sqiffFrom cluster sqitchDb ["diff", "--exclude-schema", "sqitch"]
+                unless (code == ExitSuccess)
+                    $ assertFailure (T.unpack [i|after sqitch deploy, diff still finds:\n#{out}#{err}|])
+                -- Each migration's revert returns to the state after the one before: it can
+                -- be deployed again from there, and reverting them all gives back from.
+                changes <- (.changes) <$> readPlan (project </> "sqitch.plan")
+                -- A revert that stops at a step sqiff cannot write is left to a person.
+                reverts <- for changes \name -> readFileUtf8 (project </> "revert" </> T.unpack name <> ".sql")
+                let byHand = any ("sqiff could not write this step" `T.isInfixOf`) reverts || isJust revertGap
+                let revertTo k = case drop (k - 1) changes of
+                        previous : _ | k > 0 -> ["--to", T.unpack previous]
+                        _ -> []
+                unless byHand $ for_ (reverse (zip [0 :: Int ..] changes)) \(k, name) -> do
+                    run [i|sqitch revert of #{name}|] "sqitch" (["revert", "-y"] <> revertTo k <> [target])
+                    run [i|sqitch deploy of #{name} after its revert|] "sqitch" ["deploy", "--verify", "--to", T.unpack name, target]
+                    run [i|sqitch revert of #{name} again|] "sqitch" (["revert", "-y"] <> revertTo k <> [target])
+            unless (T.null (T.strip before.planOut)) do
+                byHand <- (isJust revertGap ||) . any ("sqiff could not write this step" `T.isInfixOf`) <$> (traverse (\n -> readFileUtf8 (project </> "revert" </> T.unpack n <> ".sql")) . (.changes) =<< readPlan (project </> "sqitch.plan"))
+                unless byHand do
+                    createDatabase cluster originalDb
+                    runScript cluster originalDb fromSql >>= either (assertFailure . T.unpack) pure
+                    (code, out, err) <- sqiffBetween cluster sqitchDb originalDb ["diff", "--exclude-schema", "sqitch"]
+                    unless (code == ExitSuccess)
+                        $ assertFailure (T.unpack [i|after reverting every change, diff with from finds:\n#{out}#{err}|])
 
     withKnownBug test = maybe test (\why -> expectFailBecause (T.unpack why) test) bug

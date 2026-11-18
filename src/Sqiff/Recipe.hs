@@ -11,6 +11,7 @@ module Sqiff.Recipe (
     hazardText,
     revokeGranted,
     Step (..),
+    Undo (..),
     Context (..),
     columnSql,
     recipe,
@@ -92,7 +93,20 @@ data Step = Step
     , hazards :: [Hazard]
     , key :: ObjectKey
     , change :: Change Definition
+    , undo :: Undo
+    -- ^ How a migration that holds this step reverts it.
     }
+    deriving stock (Eq, Show)
+
+
+-- | How a step is reverted when its object's change is split over several migrations,
+-- so that reverting one migration returns to the state after the one before it.
+data Undo
+    = -- | By the object's inverse: as a whole when its migration holds all the change, else
+      -- a drop by creating the old object again and a create by dropping the new one.
+      UndoObject
+    | -- | By these steps, in order.
+      UndoBy [Step]
     deriving stock (Eq, Show)
 
 
@@ -211,14 +225,17 @@ definition ctx key object change = case object of
   where
     -- The definitions as the catalog prints them, for the recipes that read the text.
     textual = printed <$> change
-    create (txn, hazards) sql = Step CreatePhase (createRank object) object sql txn hazards key change
-    createAt rank (txn, hazards) sql = Step CreatePhase rank object sql txn hazards key change
-    remove (txn, hazards) sql = Step DropPhase (dropRank object) object sql txn hazards key change
+    create (txn, hazards) sql = Step CreatePhase (createRank object) object sql txn hazards key change UndoObject
+    createAt rank (txn, hazards) sql = Step CreatePhase rank object sql txn hazards key change UndoObject
+    remove (txn, hazards) sql = Step DropPhase (dropRank object) object sql txn hazards key change UndoObject
+    undoneBy steps s = s{undo = UndoBy steps}
+    -- A concurrent build is reverted by dropping what it built.
+    builds index = undoneBy [create (None, []) ("drop index concurrently if exists " <> qualified index)]
     manual why = [create (Shared, [Manual why]) ("-- " <> why)]
     -- The unchanged comments of what this step drops and creates again: they go with
     -- the old object, and nothing else in the plan sets them.
     restoreComments objects =
-        [ createAt commentRank (Shared, []) ("comment on " <> subject <> " is " <> literal text)
+        [ undoneBy [] (createAt commentRank (Shared, []) ("comment on " <> subject <> " is " <> literal text))
         | o <- objects
         , Just text <- [Map.lookup o ctx.keptComments]
         , Just subject <- [commentTarget o]
@@ -411,10 +428,10 @@ end |]
                  in doBlock [i| begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal (nameText c)})])); end |]
 
     tableConstraint t c = typed asConstraint \case
-        Added def -> addConstraint def
+        Added def -> addConstraint def <> restoreComments [TableConstraint t c]
         Dropped old -> [dropConstraint old]
         Changed old new
-            | validates old new -> [create (Own, []) (alterT <> "validate constraint " <> quoted c)]
+            | validates old new -> [undoneBy [] $ create (Own, []) (alterT <> "validate constraint " <> quoted c)]
             | validates new old -> manual "a validated constraint cannot be made NOT VALID again"
             | otherwise -> dropConstraint old : addConstraint new <> restoreComments [TableConstraint t c, Index (QName t.schema c)]
       where
@@ -431,13 +448,16 @@ end |]
             | validatable def && def.validity == NotValidated = [plain [] def def.clause]
             | validatable def =
                 [ plain [] def (def.clause <> notValid)
-                , create (Own, []) (alterT <> "validate constraint " <> quoted c)
+                , undoneBy [] $ create (Own, []) (alterT <> "validate constraint " <> quoted c)
                 ]
             | Just (keyword, cols) <- simpleKey def
             , not (t `Set.member` ctx.partitionedTables) =
-                [ create (None, [IndexBuild]) (concurrentBuild (QName t.schema c) [i|create unique index concurrently #{quoted c} on #{qualified t} (#{cols})|])
-                , create (Shared, []) (alterT <> "add constraint " <> quoted c <> " " <> keyword <> " using index " <> quoted c)
-                ]
+                let build = create (None, [IndexBuild]) (concurrentBuild (QName t.schema c) [i|create unique index concurrently #{quoted c} on #{qualified t} (#{cols})|])
+                 in [ builds (QName t.schema c) build
+                    , -- Dropping the constraint drops its index, which the build before made.
+                      undoneBy [create (Shared, []) (alterT <> "drop constraint " <> quoted c), build]
+                        $ create (Shared, []) (alterT <> "add constraint " <> quoted c <> " " <> keyword <> " using index " <> quoted c)
+                    ]
             | otherwise = [plain [LongLock, IndexBuild] def def.clause]
         validatable def = def.kind `elem` [Check, ForeignKey]
         -- A primary key or unique constraint on plain columns and nothing more, which an
@@ -452,7 +472,7 @@ end |]
             pure (keyword, cols)
 
     domainConstraint d c = typed asConstraint \case
-        Added def -> add def
+        Added def -> add def <> restoreComments [DomainConstraint d c]
         Dropped _ -> [remove (Shared, []) (alterD <> "drop constraint " <> quoted c)]
         Changed old new
             | validates old new -> [validate]
@@ -460,13 +480,13 @@ end |]
             | otherwise -> remove (Shared, []) (alterD <> "drop constraint " <> quoted c) : add new <> restoreComments [DomainConstraint d c]
       where
         alterD = [i|alter domain #{typeText d} |]
-        validate = create (Own, []) (alterD <> "validate constraint " <> quoted c)
+        validate = undoneBy [] $ create (Own, []) (alterD <> "validate constraint " <> quoted c)
         add def
             | def.validity == NotValidated = [create (Shared, []) (alterD <> "add constraint " <> quoted c <> " " <> def.clause)]
             | otherwise = [create (Shared, []) (alterD <> "add constraint " <> quoted c <> " " <> def.clause <> notValid), validate]
 
     indexRecipe ix = typed asIndex \case
-        Added def -> addIndex def
+        Added def -> addIndex def <> restoreComments [Index ix]
         Dropped def
             | def.table `Set.member` ctx.droppedTables -> []
             | def.partitioned -> [remove (Shared, [LongLock]) ("drop index " <> qualified ix)]
@@ -480,11 +500,13 @@ end |]
             | otherwise =
                 let tmp = identifier (takeBytes 59 (nameText ix.name) <> "_new")
                     oldName = quoted ix.name
-                 in [ create
-                        (None, [IndexBuild])
-                        (concurrentBuild (QName ix.schema tmp) (replaceInCode [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoted tmp} ON |] new.statement))
-                    , create (None, []) ("drop index concurrently if exists " <> qualified ix)
-                    , create (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
+                 in [ builds (QName ix.schema tmp)
+                        $ create
+                            (None, [IndexBuild])
+                            (concurrentBuild (QName ix.schema tmp) (replaceInCode [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoted tmp} ON |] new.statement))
+                    , undoneBy (addIndex old <> restoreComments [Index ix]) $ create (None, []) ("drop index concurrently if exists " <> qualified ix)
+                    , undoneBy [create (Shared, []) ("alter index " <> qualified ix <> " rename to " <> quoted tmp)]
+                        $ create (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
                     ]
         addIndex def
             | def.partitioned =
@@ -494,7 +516,7 @@ end |]
                     [i|-- create index concurrently and attach partition for #{qualified ix}|]
                 ]
             | def.table `Set.member` ctx.newTables = [create (Shared, []) def.statement]
-            | otherwise = [create (None, [IndexBuild]) (concurrentBuild ix (replaceInCode " INDEX " " INDEX CONCURRENTLY " def.statement))]
+            | otherwise = [builds ix $ create (None, [IndexBuild]) (concurrentBuild ix (replaceInCode " INDEX " " INDEX CONCURRENTLY " def.statement))]
 
     sequenceRecipe s = typed asSequence \case
         Added def ->
@@ -566,15 +588,17 @@ end |]
         Dropped _ -> [remove (Shared, []) ("drop view " <> qualified v)]
 
     materializedView v = typed asView \case
-        Added def -> [create (Shared, []) ("create materialized view " <> viewSql v def)]
+        -- Created again by a revert, it gets back its indexes, grants and comments.
+        Added def -> create (Shared, []) ("create materialized view " <> viewSql v def) : restoreOnView v <> restoreViewComments v
         Changed _ new ->
             [ remove (Shared, [MayFail "fails when other objects depend on it"]) ("drop materialized view " <> qualified v)
             , create (Shared, [LongLock]) ("create materialized view " <> viewSql v new)
             ]
                 <> restoreOnView v
-                <> restoreComments (MaterializedView v : [o | o@(OtherColumn OfMaterializedView t _) <- Map.keys ctx.keptComments, t == v])
+                <> restoreViewComments v
         Dropped _ -> [remove (Shared, []) ("drop materialized view " <> qualified v)]
 
+    restoreViewComments v = restoreComments (MaterializedView v : [o | o@(OtherColumn OfMaterializedView t _) <- Map.keys ctx.keptComments, t == v])
     restoreOnView v = case Map.lookup v ctx.recreatedViews of
         Nothing -> []
         Just (indexes, grants) ->
@@ -584,7 +608,7 @@ end |]
                 <> maybe [] (\(k, def) -> privileges k k.object (Added def)) grants
 
     trigger t n = case textual of
-        Added def -> [create (Shared, []) def]
+        Added def -> create (Shared, []) def : restoreComments [Trigger t n]
         Changed old new
             | namesAlteredColumn t old -> [dropTrigger DropPhase, create (Shared, []) new] <> restoreComments [Trigger t n]
             | Just rest <- T.stripPrefix "CREATE TRIGGER " new -> [create (Shared, []) ("CREATE OR REPLACE TRIGGER " <> rest)]
@@ -592,10 +616,10 @@ end |]
         Dropped _ -> [dropTrigger DropPhase]
       where
         dropTrigger phase =
-            Step phase (if phase == DropPhase then dropRank object else createRank object) object ("drop trigger " <> quoted n <> " on " <> qualified t) Shared [] key change
+            Step phase (if phase == DropPhase then dropRank object else createRank object) object ("drop trigger " <> quoted n <> " on " <> qualified t) Shared [] key change UndoObject
 
     policy t n = case textual of
-        Added def -> [createPolicy def]
+        Added def -> createPolicy def : restoreComments [Policy t n]
         Changed old new
             | namesAlteredColumn t old -> [remove (Shared, []) dropPolicy, createPolicy new] <> restoreComments [Policy t n]
             | otherwise -> [create (Shared, []) dropPolicy, createPolicy new] <> restoreComments [Policy t n]
@@ -613,7 +637,7 @@ privileges key object change = case (target, traverse asAcl change) of
     (Just onObject, Just (Added new)) -> reconcile onObject DefaultAcl new
     (Just onObject, Just (Changed old new)) -> reconcile onObject old new
   where
-    step hazards sql = Step CreatePhase privilegesRank object sql Shared hazards key change
+    step hazards sql = Step CreatePhase privilegesRank object sql Shared hazards key change UndoObject
     target = case object of
         Table t -> Just ("table " <> qualified t)
         View t -> Just ("table " <> qualified t)
@@ -675,7 +699,7 @@ comment ctx key change = case (commentTarget key.object, printed <$> change) of
     (Just subject, Added new) -> [step (subject <> " is " <> literal new)]
     (Just subject, Changed _ new) -> [step (subject <> " is " <> literal new)]
   where
-    step sql = Step CreatePhase commentRank key.object ("comment on " <> sql) Shared [] key change
+    step sql = Step CreatePhase commentRank key.object ("comment on " <> sql) Shared [] key change UndoObject
 
 
 -- | What @comment on@ names the object as.

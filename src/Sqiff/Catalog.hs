@@ -141,6 +141,12 @@ describeOn conns excluded partitions onlyTable = do
             cross join lateral pg_identify_object_as_address(o.classid, o.objid, o.objsubid) a
             where ($3::text is null or o.relid = to_regclass($3::text))
                 and ($4::int4 is null or o.objid::int8 % 2 = $4::int4)
+                -- Functions a type makes for itself, such as a range type's constructors,
+                -- come and go with the type.
+                and not (
+                    o.classid = 'pg_proc'::regclass
+                    and exists (select from pg_depend d where d.classid = o.classid and d.objid = o.objid and d.deptype = 'i')
+                )
                 and not exists (
                     select
                     from pg_depend e

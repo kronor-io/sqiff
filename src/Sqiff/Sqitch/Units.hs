@@ -29,7 +29,7 @@ import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import Sqiff.Config (Names (..), fill)
 import Sqiff.Definition
-import Sqiff.Diff (Change (..))
+import Sqiff.Diff (Change (..), Changes)
 import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Plan (invert)
@@ -60,8 +60,8 @@ data Unit = Unit
 
 -- | Groups ordered steps into changes: conventional paths for steps that pass
 -- @conventional@, reworks of changes the plan has, and migrations for the rest.
-units :: Names -> (Step -> Bool) -> Context -> SqitchPlan -> UTCTime -> [Step] -> [Unit]
-units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: Int) (claimReverts Set.empty (foldr (merge . single) [] steps))
+units :: Names -> (Step -> Bool) -> Context -> Changes -> SqitchPlan -> UTCTime -> [Step] -> [Unit]
+units names conventional inverseCtx forward sqitchPlan now steps = nameMigrations (0 :: Int) (claimReverts (foldr (merge . single) [] steps))
   where
     existing = Set.fromList sqitchPlan.changes
 
@@ -86,11 +86,58 @@ units names conventional inverseCtx sqitchPlan now steps = nameMigrations (0 :: 
     sharable s = s.txn == Shared
     samePhase ss = length (nubOrd (map (.phase) ss)) <= 1
 
-    claimReverts _ [] = []
-    claimReverts claimed (u : rest) =
-        let keys = nubOrd [s.key | s <- u.deploy, s.key `Set.notMember` claimed]
-            inverse = map refill (concat [recipe inverseCtx k (invert c) | k <- reverse keys, Just c <- [lookup k [(s.key, s.change) | s <- u.deploy]]])
-         in u{revert = if u.kind == ReworkChange then [] else inverse} : claimReverts (claimed <> Set.fromList keys) rest
+    -- Each migration reverts its own steps, so reverting it returns to the state after
+    -- the one before. A rework keeps the revert sqitch gives it: the previous version.
+    claimReverts us =
+        [ u{revert = if u.kind == ReworkChange then [] else map refill (revertOf n u <> withTables u)}
+        | (n, u) <- zip [0 :: Int ..] us
+        ]
+      where
+        -- A migration's revert creates or drops only its own tables; another migration's
+        -- revert sees to the rest.
+        unitCtx u =
+            let own = Set.fromList [t | s <- u.deploy, s.key.aspect == Definition, Table t <- [s.object]]
+             in inverseCtx{droppedTables = Set.intersection inverseCtx.droppedTables own, newTables = Set.intersection inverseCtx.newTables own}
+        withSteps = Set.fromList [s.key | u <- us, s <- u.deploy]
+        -- What went with a table this migration drops, which has no steps of its own: its
+        -- constraints, indexes, triggers, policies, comments and grants.
+        withTables u =
+            let dropped = Set.fromList [t | s <- u.deploy, s.key.aspect == Definition, Table t <- [s.object], Dropped _ <- [s.change]]
+                belongs k d = case k.object of
+                    Table t -> k.aspect /= Definition && t `Set.member` dropped
+                    Index _ | Just ix <- asIndex d -> ix.table `Set.member` dropped
+                    o -> maybe False (`Set.member` dropped) (owningTable o) && not (isColumn o)
+                isColumn = \case Column{} -> True; _ -> False
+             in L.sortOn (.rank)
+                    $ concat
+                        [ recipe (unitCtx u) k (Added d)
+                        | not (Set.null dropped)
+                        , (k, Dropped d) <- Map.toList forward
+                        , k `Set.notMember` withSteps
+                        , belongs k d
+                        ]
+        -- The migrations holding steps of each object change that its inverse undoes.
+        objectUnits = Map.fromListWith (<>) [(s.key, Set.singleton n) | (n, u) <- zip [0 :: Int ..] us, s <- u.deploy, s.undo == UndoObject]
+        revertOf n u = concat [undoKey n u (filter ((== k) . (.key)) u.deploy) k | k <- reverse (nubOrd (map (.key) u.deploy))]
+        -- The key's steps here, undone last to first; a run of steps the object's
+        -- inverse undoes gets it once.
+        undoKey n u here k = go False (reverse here)
+          where
+            go _ [] = []
+            go done (s : rest) = case s.undo of
+                UndoBy undoing -> undoing <> go done rest
+                UndoObject
+                    | done -> go done rest
+                    | otherwise -> objectPart (unitCtx u) n k s.change [x | x <- here, x.undo == UndoObject] <> go True rest
+        objectPart ctx n k change mine
+            | Map.lookup k objectUnits == Just (Set.singleton n) = recipe ctx k (invert change)
+            -- The migration with the object's own drop, or create, reverts it; one that only
+            -- sets its grants, indexes or comments can be deployed again as it is.
+            | Changed old _ <- change, all ((== DropPhase) . (.phase)) mine = if any (\x -> x.rank == dropRank x.object) mine then recipe ctx k (Added old) else []
+            | Changed _ new <- change, all ((== CreatePhase) . (.phase)) mine = if any (\x -> x.rank == createRank x.object) mine then recipe ctx k (Dropped new) else []
+            -- Otherwise the last migration with a part of it reverts it all.
+            | Just n == (Map.lookup k objectUnits >>= Set.lookupMax) = recipe ctx k (invert change)
+            | otherwise = []
 
     refill s
         | Column t c <- s.object

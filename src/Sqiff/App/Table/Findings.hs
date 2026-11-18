@@ -34,7 +34,7 @@ import Sqiff.Diff (Change (..))
 import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Plan (DependencyCycle, planWith)
-import Sqiff.Recipe (Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..))
+import Sqiff.Recipe (Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), Undo (..))
 import Sqiff.Recreate (viewsAroundTypeChanges)
 import Sqiff.TableEdit (TableEdit (..), TableRewrite (..), TargetType (..), TypeChange (..))
 
@@ -139,7 +139,7 @@ findingsFor env migrate ev = do
     foreignKeysFor addr = Map.findWithDefault [] addr ev.foreignKeyBreaks
     renameHazard = MayFail ("breaks running code that still uses the old name" <> foldMap ("; " <>) env.config.renameHint)
     renameSteps =
-        [ Step DropPhase (-1) addr (renameSql table (old, new)) Shared [renameHazard] (definitionKey addr) (Changed def def)
+        [ Step DropPhase (-1) addr (renameSql table (old, new)) Shared [renameHazard] (definitionKey addr) (Changed def def) (UndoBy [Step DropPhase (-1) (Column table old) (renameSql table (new, old)) Shared [] (definitionKey addr) (Changed def def) UndoObject])
         | (old, new) <- ev.pendingRenames
         , let addr = Column table new
               def = Map.findWithDefault (Printed "") (definitionKey addr) edit.desired

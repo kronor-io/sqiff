@@ -41,7 +41,7 @@ import Sqiff.Git (findRepo, showFile)
 import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Plan (context, cycleMessage, invert, renderStep)
-import Sqiff.Recipe (Phase (..), Step (..), Txn (..))
+import Sqiff.Recipe (Step (..))
 import Sqiff.Recreate (standardBody)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
 import Sqiff.Sqitch (PreviousFile (..), moveToEnd, requireSqitch, reworkEdited, withProject, writeUnits)
@@ -272,15 +272,8 @@ writeMigration conn baseline edit f = do
     basePlan <- timed "write.basePlan" $ liftIO (parsePlan <$> showFile env.repo opts.base (planPath env.layout))
     now <- liftIO getCurrentTime
     let inverseCtx = f.withViews (context Map.empty edit.desired edit.current [] (Map.map invert edit.changes))
-        renameBack =
-            [ Step DropPhase (-1) (Column table old) (renameSql table (new, old)) Shared [] s.key s.change
-            | (s, (old, new)) <- zip f.renameSteps f.newRenames
-            ]
-        withRenameBack u
-            | any (`elem` f.renameSteps) u.deploy = u{revert = u.revert <> renameBack}
-            | otherwise = u
         isIndex s = case s.object of Index _ -> True; _ -> False
-        written = map withRenameBack (units env.config.names isIndex inverseCtx sqitchPlan now f.steps)
+        written = units env.config.names isIndex inverseCtx edit.changes sqitchPlan now f.steps
         tagging = Tagging{given = opts.tableTag, now}
         entries p = length (filter (== changeName) p.changes)
         alreadyReworked = entries sqitchPlan > entries basePlan

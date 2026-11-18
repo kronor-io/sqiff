@@ -1,0 +1,1 @@
+reverting a view that gained a column fails: create or replace view cannot drop a column, so the revert must drop and create the view

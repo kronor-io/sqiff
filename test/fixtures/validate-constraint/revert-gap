@@ -1,0 +1,1 @@
+a validated constraint cannot be made NOT VALID again, so after the revert it stays validated

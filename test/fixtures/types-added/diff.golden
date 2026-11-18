@@ -1,15 +1,5 @@
-added   function app.span(double precision, double precision)
-added   function app.span(double precision, double precision, pg_catalog.text)
-added   function app.span_multirange
-added   function app.span_multirange(app.span)
-added   function app.span_multirange(app.span[])
 added   type app.mood
 added   type app.pair
 added   type app.positive
 added   type app.span
-added   function app.span(double precision, double precision) (privileges)
-added   function app.span(double precision, double precision, pg_catalog.text) (privileges)
-added   function app.span_multirange (privileges)
-added   function app.span_multirange(app.span) (privileges)
-added   function app.span_multirange(app.span[]) (privileges)
-14 added, 0 dropped, 0 changed
+4 added, 0 dropped, 0 changed

@@ -94,8 +94,11 @@ runSqitch from toDb opts = do
     sqitchPlan <- liftIO (readPlan (planPath layout))
     planned <- planBoth from toDb
     now <- liftIO getCurrentTime
-    let inverseCtx = context Map.empty planned.toSchema planned.fromSchema planned.toEdges (Map.map invert planned.changes)
-        written = units config.names (const True) inverseCtx sqitchPlan now planned.steps
+    let inverse = Map.map invert planned.changes
+        -- A retype's views are the same on both sides, so its revert recreates them
+        -- around the column as the plan does.
+        inverseCtx = withViewsAround planned.fromSchema planned.fromEdges planned.changes (context Map.empty planned.toSchema planned.fromSchema planned.toEdges inverse)
+        written = units config.names (const True) inverseCtx planned.changes sqitchPlan now planned.steps
         tagging = Tagging{given = opts.tag, now}
     measure "sqitch.planUnits" (sum [length u.deploy + length u.revert | u <- written])
     if opts.dryRun
@@ -115,6 +118,7 @@ runSqitch from toDb opts = do
 -- | Both databases, what differs and the steps that migrate it.
 data Planned = Planned
     { fromSchema :: Schema
+    , fromEdges :: [Edge]
     , toSchema :: Schema
     , toEdges :: [Edge]
     , changes :: Changes
@@ -127,7 +131,7 @@ planBoth from toDb = do
     ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth from toDb ForPlan
     let changes = diff (sameDefinition checks) fromSchema toSchema
     steps <- either (failWith . cycleMessage) pure (planWith (withViewsAround fromSchema fromEdges changes) (checks :: Map ObjectKey BodyCheck) fromSchema toSchema fromEdges toEdges changes)
-    pure Planned{fromSchema, toSchema, toEdges, changes, steps}
+    pure Planned{fromSchema, fromEdges, toSchema, toEdges, changes, steps}
 
 
 report :: MonadIO m => ObjectKey -> Change Definition -> Set ObjectId -> m ()

@@ -316,6 +316,37 @@ Guiding rules:
   - A test shows two connections in a shared snapshot not seeing a table another
     connection created after it.
 
+- [x] **Each migration reverts its own steps (Codex 16).**
+  - `Step` has an `undo`:
+    - `UndoObject` (the default) uses the object's inverse recipe. When the object's
+      change is split over migrations, the one with its own drop recreates the old
+      object, and the one with its own create drops the new one. A migration that only
+      sets grants, indexes or comments on it reverts nothing, since redeploying it is
+      repeatable.
+    - `UndoBy` lists explicit steps. Concurrent index builds drop what they built. A
+      temporary index name is renamed back. A dropped old index is built again with its
+      comment. Validation and restored comments need nothing. A key attached with
+      `using index` drops the constraint and builds its index again. The `table`
+      command's column rename is undone by renaming back (formerly a special case in
+      `writeMigration`).
+  - A migration's revert uses a context in which only its own tables are created or
+    dropped.
+  - Reverting a dropped table also restores what went with it and had no steps of its
+    own: constraints, indexes, triggers, policies, comments and grants.
+  - Recreatable objects (materialized views, indexes, constraints, triggers, policies)
+    restore their unchanged indexes, grants and comments when created, which only a
+    revert's recreation ever has.
+  - `sqiff sqitch` reverts recreate the views around a retyped column, as the plan does.
+  - Functions a type makes for itself (a range type's constructors) are no longer
+    described, so they are not planned on their own. The `types-added` goldens lose them.
+  - Tests: the sqitch round trip now walks back from the last migration. Each is
+    reverted, deployed again with `--verify`, and reverted again; reverting them all
+    must give back `from`. Before these changes, 14 fixtures failed this walk.
+  - The walk is skipped when a revert stops at a step sqiff cannot write (enum labels,
+    resetting privileges), or when a `revert-gap` file names a change PostgreSQL cannot
+    undo: `change-view` (`create or replace view` cannot drop a column) and
+    `validate-constraint` (a validated constraint stays validated).
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**
