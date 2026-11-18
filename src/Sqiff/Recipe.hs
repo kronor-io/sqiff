@@ -693,9 +693,18 @@ privileges key object change = case (target, traverse asAcl change) of
             needsGrant grantable = \case
                 Nothing -> True
                 Just had -> grantable && not had
-            byOthersFirst = L.sortOn (\((grantor, _, _), _) -> grantor == ByOwner)
+            -- How far down a chain of grants a grant is: the owner's are first; one by a
+            -- role comes after the grant that gave that role the privilege.
+            depthIn held = go Set.empty
+              where
+                go seen (grantor, _, privilege) = case grantor of
+                    ByOwner -> 0 :: Int
+                    ByRole r
+                        | r `Set.member` seen -> 1
+                        | otherwise ->
+                            1 + fromMaybe 0 (L.maximumMaybe [go (Set.insert r seen) k | k@(_, grantee, p) <- Map.keys held, grantee == Role r, p == privilege])
             revokes =
-                byOthersFirst
+                L.sortOn (\(k, _) -> Down (depthIn before k))
                     $ [ (k, "revoke " <> onTarget privilege <> " from " <> granteeSql grantee)
                       | (k@(_, grantee, privilege), _) <- Map.toList (before `Map.difference` now)
                       ]
@@ -703,7 +712,7 @@ privileges key object change = case (target, traverse asAcl change) of
                        | (k@(_, grantee, privilege), (True, False)) <- Map.toList (Map.intersectionWith (,) before now)
                        ]
             grants =
-                L.sortOn (\((grantor, _, _), _) -> grantor /= ByOwner)
+                L.sortOn (\(k, _) -> depthIn now k)
                     $ [ (k, "grant " <> onTarget privilege <> " to " <> granteeSql grantee <> (if grantable then " with grant option" else ""))
                       | (k@(_, grantee, privilege), grantable) <- Map.toList now
                       , needsGrant grantable (Map.lookup k before)

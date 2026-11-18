@@ -272,7 +272,8 @@ Guiding rules:
   - Other roles' grants are revoked before the owner's and granted after them.
   - `grant-option-removed` passes, and its `known-bug` file is gone. The new fixture
     `grant-by-other-role` covers giving a grant as another role.
-  - Not handled: chains deeper than one role (A passes to B, B to C) when revoking.
+  - Chains of any depth are ordered by how far down the chain each grant is: revokes from
+    the end of the chain, grants from its start (`grant-chain-removed`).
 
 - [x] **`describe --out` file names (Codex 26).**
   - Names are escaped with `%` itself escaped too, so `a b` and `a-b`, or `/` and `%2F`,

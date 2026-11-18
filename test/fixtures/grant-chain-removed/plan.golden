@@ -1,0 +1,9 @@
+-- table public.chain
+do $$ begin set local role analyst; revoke SELECT on table public.chain from intern; reset role; end $$;
+
+-- table public.chain
+do $$ begin set local role reader; revoke SELECT on table public.chain from analyst; reset role; end $$;
+
+-- table public.chain
+revoke grant option for SELECT on table public.chain from reader;
+

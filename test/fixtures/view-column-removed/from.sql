@@ -1,4 +1,4 @@
-do $x$ begin create role reader; exception when duplicate_object then null; end $x$;
+do $x$ begin create role reader; exception when duplicate_object or unique_violation then null; end $x$;
 create table public.t (id int primary key, a int, b int);
 create view public.v as select id, a, b from public.t;
 comment on view public.v is 'the view';
