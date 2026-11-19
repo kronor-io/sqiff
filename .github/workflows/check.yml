@@ -10,20 +10,18 @@ permissions:
 
 jobs:
   check:
-    runs-on: [self-hosted, linux, arm64, builder]
+    # GitHub-hosted, as every public kronor repository's CI is: a self-hosted
+    # runner would run pull requests from forks on kronor's own machines.
+    # arm64, so the builds pushed to the cache serve aarch64-linux machines too.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Nix on PATH
-        run: |
-          echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
-          echo "/nix/var/nix/profiles/per-user/$USER/profile/bin" >> "$GITHUB_PATH"
-          echo "/home/ubuntu/.nix-profile/bin" >> "$GITHUB_PATH"
-      - name: Nix GitHub access token
-        env:
-          GH_TOKEN_FOR_NIX: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "NIX_CONFIG=access-tokens = github.com=$GH_TOKEN_FOR_NIX" >> "$GITHUB_ENV"
+      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
       # Reads from kronor-open and pushes what this job builds to it, as kronor's
       # other public packages do, so the dev shell, sqiff-lint's dependencies and
       # sqiff are built once.
@@ -36,6 +34,6 @@ jobs:
       - name: Check
         run: nix develop --print-build-logs --command scripts/check full
       - name: Build
-        run: nix build --print-build-logs -j8 .#sqiff
+        run: nix build --print-build-logs .#sqiff
       - name: Run
         run: ./result/bin/sqiff --help
