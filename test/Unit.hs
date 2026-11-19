@@ -545,6 +545,10 @@ sqitchChecks =
                 , "do $ begin perform 1 from app.orders_archive; end $"
                 ]
                 \statement -> (statement, changes statement) @?= (statement, False)
+        , testCase "words and lists keep quoted names whole" do
+            Sql.codeWords "()," "\"a, b\" int unique, -- note\n c text" @?= ["\"a, b\"", "int", "unique", "c", "text"]
+            Sql.parenthesised "unique (\"a)\", (b)) x" @?= Just "\"a)\", (b)"
+            Sql.splitTopLevel ',' "\"a, b\", f(c, d), 'e,f'" @?= ["\"a, b\"", "f(c, d)", "'e,f'"]
         , testCase "overloads of a new function make one change" do
             let names = either error id (Aeson.eitherDecode "{}")
                 ctx = context Map.empty Map.empty Map.empty [] Map.empty

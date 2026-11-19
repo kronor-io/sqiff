@@ -404,6 +404,15 @@ Guiding rules:
   longer rolls them back again on cancellation, which printed "there is no transaction
   in progress" once per connection. It still rolls back on ordinary errors.
 
+- [x] **The table-file rewriter keeps quoted names whole (Codex 20).**
+  - `Sqiff.Sql` gains `codeWords` (words split at whitespace and given separators where
+    they are code), `parenthesised` and `splitTopLevel`. Quoted names and literals stay
+    whole, and comments separate words.
+  - The rewriter classifies statements and table elements with them. A column such as
+    `"a, b"` or `"x(y)"` used to split into pieces, so retyping or dropping it was left
+    to the user ("still differs"). A run against a database showed the old build
+    failing and the new one rewriting the file.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

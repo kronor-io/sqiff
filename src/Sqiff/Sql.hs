@@ -10,6 +10,9 @@ module Sqiff.Sql (
     regions,
     codeOnly,
     topWords,
+    codeWords,
+    parenthesised,
+    splitTopLevel,
     replaceInCode,
     replaceAllInCode,
     literal,
@@ -17,7 +20,7 @@ module Sqiff.Sql (
     doBlock,
 ) where
 
-import Data.Char (isAlpha, isAlphaNum, isDigit)
+import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
 import Data.Text qualified as T
 import RIO
 import RIO.List qualified as L
@@ -88,6 +91,46 @@ topWords t = go (0 :: Int) (zip [0 ..] (regions t))
             let (w, more) = span (\(_, (ch, rr)) -> rr == Code && (isAlphaNum ch || ch == '_' || ch == '$')) xs
              in (k, T.toLower (T.pack (map (fst . snd) w))) : go depth more
         | otherwise = go depth rest
+
+
+-- | The words, split at whitespace and at the characters in @separators@ where they are
+-- code; a quoted name or literal stays inside its word, whatever it holds, and comments
+-- separate words.
+codeWords :: String -> Text -> [Text]
+codeWords separators t = map T.pack (go [] (regions t))
+  where
+    go acc [] = done acc []
+    go acc ((c, r) : rest)
+        | r == Remark || (r == Code && (isSpace c || c `elem` separators)) = done acc (go [] rest)
+        | otherwise = go (c : acc) rest
+    done acc more = if null acc then more else reverse acc : more
+
+
+-- | What the first parentheses in code hold, without them.
+parenthesised :: Text -> Maybe Text
+parenthesised t = case dropWhile (\(c, r) -> not (r == Code && c == '(')) (regions t) of
+    [] -> Nothing
+    _ : rest -> T.pack . map fst <$> inside (0 :: Int) [] rest
+  where
+    inside _ _ [] = Nothing
+    inside depth acc ((c, r) : more)
+        | r == Code && c == ')' && depth == 0 = Just (reverse acc)
+        | r == Code && c == ')' = inside (depth - 1) ((c, r) : acc) more
+        | r == Code && c == '(' = inside (depth + 1) ((c, r) : acc) more
+        | otherwise = inside depth ((c, r) : acc) more
+
+
+-- | The parts between @separator@s in code at the top level, outside quotes and
+-- parentheses, stripped.
+splitTopLevel :: Char -> Text -> [Text]
+splitTopLevel separator t = map (T.strip . T.pack) (go (0 :: Int) [] (regions t))
+  where
+    go _ acc [] = [reverse acc]
+    go depth acc ((c, r) : rest)
+        | r == Code && c == separator && depth == 0 = reverse acc : go depth [] rest
+        | r == Code && c == '(' = go (depth + 1) (c : acc) rest
+        | r == Code && c == ')' = go (depth - 1) (c : acc) rest
+        | otherwise = go depth (c : acc) rest
 
 
 -- | @old@ replaced by @new@ where all of it is code, outside quotes and comments.

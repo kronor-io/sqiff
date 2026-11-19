@@ -26,7 +26,7 @@ import Sqiff.Model
 import Sqiff.Recipe (columnSql)
 import Sqiff.Script (splitStatements)
 import Sqiff.Sqitch.Units (tidyConstraint, tidyIndex)
-import Sqiff.Sql (Region (..), codeOnly, regions, replaceInCode, topWords)
+import Sqiff.Sql (Region (..), codeWords, parenthesised, regions, replaceInCode, splitTopLevel, topWords)
 import Sqiff.Sql qualified as Sql
 
 
@@ -246,7 +246,7 @@ classify table code = case dropWords ["unlogged"] (drop 1 lower) of
         "create" : _ | Just (ix, target) <- indexOf (drop 1 ws), target == Just table -> CreatesIndex ix
         "comment" : "on" : _ | Just addr <- commentOn (drop 2 ws), belongs addr -> Comments addr
         _ -> OtherStatement
-    ws = T.words (codeOnly code)
+    ws = codeWords "" code
     lower = map T.toLower ws
     tableName = \case
         t : _ -> parseQName (T.takeWhile (/= '(') t)
@@ -441,11 +441,11 @@ elementKind table body = case ws of
   where
     -- The names PostgreSQL gives constraints declared without one.
     pkey = identifier (T.intercalate "_" [nameText table.name, "pkey"])
-    plain = codeOnly body
-    ws = T.words (T.map (\ch -> if ch == '(' || ch == ')' || ch == ',' then ' ' else ch) plain)
-    columnList = case T.splitOn "," (T.takeWhile (/= ')') (T.drop 1 (T.dropWhile (/= '(') plain))) of
-        [""] -> Nothing
-        cs -> Just (map (unquote . T.strip) cs)
+    ws = codeWords "()," body
+    columnList = case splitTopLevel ',' <$> parenthesised body of
+        Nothing -> Nothing
+        Just [""] -> Nothing
+        Just cs -> Just (map unquote cs)
     named suffix cs = identifier (T.intercalate "_" (nameText table.name : cs) <> "_" <> suffix)
 
 
