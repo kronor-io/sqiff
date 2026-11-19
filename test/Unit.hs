@@ -56,6 +56,7 @@ tests =
         , addresses
         , templates
         , scripts
+        , statementScanner
         , plans
         , ordering
         , diffing
@@ -251,6 +252,74 @@ scripts =
         , testCase "keeps ROLLBACK WORK TO"
             $ withoutTransactionControl ["rollback work to sp"]
             @?= Right ["rollback work to sp"]
+        ]
+
+
+-- | Exact outputs of 'splitStatements' for each construct its scanner tracks.
+statementScanner :: TestTree
+statementScanner =
+    testGroup
+        "statement scanner"
+        [ testCase "a nested block comment closes at its outer end"
+            $ splitStatements "select 1 /* a /* b; */ c; */; select 2;"
+            @?= Right ["select 1 /* a /* b; */ c; */", "select 2"]
+        , testCase "a dollar quote closes only at its own tag"
+            $ splitStatements "do $f$ begin perform $$;$$; end $f$; select $a$x;$a$;"
+            @?= Right ["do $f$ begin perform $$;$$; end $f$", "select $a$x;$a$"]
+        , testCase "a positional parameter and a dollar inside a name are no dollar quote"
+            $ splitStatements "select a$b$c, $1; select 2"
+            @?= Right ["select a$b$c, $1", "select 2"]
+        , testCase "an escape string keeps backslash-escaped and doubled quotes"
+            $ splitStatements "select E'a\\';b', e'c'';d'; select 2;"
+            @?= Right ["select E'a\\';b', e'c'';d'", "select 2"]
+        , testCase "a backslash ends a standard string"
+            $ splitStatements "select 'a\\'; select 2;"
+            @?= Right ["select 'a\\'", "select 2"]
+        , testCase "doubled quotes stay inside a string and a quoted name"
+            $ splitStatements "select 'a'';b' as \"c\"\";d\"; select 2;"
+            @?= Right ["select 'a'';b' as \"c\"\";d\"", "select 2"]
+        , testCase "a BEGIN ATOMIC body ends at its END, past CASE ... END"
+            $ splitStatements "create function f() returns int language sql BEGIN ATOMIC select case when true then 1 end; end; select 2;"
+            @?= Right ["create function f() returns int language sql BEGIN ATOMIC select case when true then 1 end; end", "select 2"]
+        , testCase "CASE ... END outside BEGIN ATOMIC does not hold the statement open"
+            $ splitStatements "select case when true then 1 end; select 2;"
+            @?= Right ["select case when true then 1 end", "select 2"]
+        , testCase "a comment between BEGIN and ATOMIC still starts a body"
+            $ splitStatements "begin/**/atomic select 1; end; select 2;"
+            @?= Right ["begin/**/atomic select 1; end", "select 2"]
+        , testCase "a quote between BEGIN and ATOMIC starts no body"
+            $ splitStatements "begin 'x' atomic; select 2;"
+            @?= Right ["begin 'x' atomic", "select 2"]
+        , testCase "psql output commands are skipped"
+            $ splitStatements "\\set ON_ERROR_STOP on\n\\pset pager off\n\\unset QUIET\nselect 1;"
+            @?= Right ["select 1"]
+        , testCase "other psql commands are refused"
+            $ splitStatements "\\i other.sql\nselect 1;"
+            @?= Left "psql's \\i cannot run outside psql"
+        , testCase "\\set of a lowercase variable is refused"
+            $ splitStatements "\\set foo bar\nselect 1;"
+            @?= Left "psql's \\set cannot run outside psql"
+        , testCase "a backslash after code is part of the statement"
+            $ splitStatements "select 1 \\x\n;"
+            @?= Right ["select 1 \\x"]
+        , testCase "an unterminated last statement is kept"
+            $ splitStatements "select 1; select 2 -- done"
+            @?= Right ["select 1", "select 2 -- done"]
+        , testCase "an unclosed dollar quote is an error"
+            $ splitStatements "select $$x;"
+            @?= Left "a quote, dollar quote or comment is not closed"
+        , testCase "an unclosed nested comment is an error"
+            $ splitStatements "select 1; /* a /* b */"
+            @?= Left "a quote, dollar quote or comment is not closed"
+        , testCase "an unclosed escape string is an error"
+            $ splitStatements "select E'a\\'"
+            @?= Left "a quote, dollar quote or comment is not closed"
+        , testCase "a BEGIN ATOMIC body without END is an error"
+            $ splitStatements "create function f() returns int language sql begin atomic select 1;"
+            @?= Left "a BEGIN ATOMIC body has no END"
+        , testCase "a BEGIN ATOMIC body whose END ends the input is closed"
+            $ splitStatements "create function f() returns int language sql begin atomic select 1; end"
+            @?= Right ["create function f() returns int language sql begin atomic select 1; end"]
         ]
 
 
