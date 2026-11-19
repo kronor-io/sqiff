@@ -33,7 +33,7 @@ import Sqiff.Graph (schedule)
 import Sqiff.Identifier (identifier, qname, quoteIdent, typeName)
 import Sqiff.Model (Address (..), Aspect (..), Edge (..), ObjectId (..), ObjectKey (..), RoutineKind (..), fromAddress, toAddress)
 import Sqiff.Plan (context, invert, topoOrder)
-import Sqiff.Recipe (Hazard (..), Phase (..), Step (..), Txn (..), Undo (..))
+import Sqiff.Recipe (Hazard (..), Phase (..), Role (..), Step (..), Txn (..), Undo (..))
 import Sqiff.Rewrite (fileDrift)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
 import Sqiff.Sqitch.Check (Tagging (..), batchProblems, changeNameProblem, chooseTag, tagNameProblem)
@@ -56,6 +56,7 @@ tests =
         , addresses
         , templates
         , scripts
+        , statementScanner
         , plans
         , ordering
         , diffing
@@ -254,6 +255,74 @@ scripts =
         ]
 
 
+-- | Exact outputs of 'splitStatements' for each construct its scanner tracks.
+statementScanner :: TestTree
+statementScanner =
+    testGroup
+        "statement scanner"
+        [ testCase "a nested block comment closes at its outer end"
+            $ splitStatements "select 1 /* a /* b; */ c; */; select 2;"
+            @?= Right ["select 1 /* a /* b; */ c; */", "select 2"]
+        , testCase "a dollar quote closes only at its own tag"
+            $ splitStatements "do $f$ begin perform $$;$$; end $f$; select $a$x;$a$;"
+            @?= Right ["do $f$ begin perform $$;$$; end $f$", "select $a$x;$a$"]
+        , testCase "a positional parameter and a dollar inside a name are no dollar quote"
+            $ splitStatements "select a$b$c, $1; select 2"
+            @?= Right ["select a$b$c, $1", "select 2"]
+        , testCase "an escape string keeps backslash-escaped and doubled quotes"
+            $ splitStatements "select E'a\\';b', e'c'';d'; select 2;"
+            @?= Right ["select E'a\\';b', e'c'';d'", "select 2"]
+        , testCase "a backslash ends a standard string"
+            $ splitStatements "select 'a\\'; select 2;"
+            @?= Right ["select 'a\\'", "select 2"]
+        , testCase "doubled quotes stay inside a string and a quoted name"
+            $ splitStatements "select 'a'';b' as \"c\"\";d\"; select 2;"
+            @?= Right ["select 'a'';b' as \"c\"\";d\"", "select 2"]
+        , testCase "a BEGIN ATOMIC body ends at its END, past CASE ... END"
+            $ splitStatements "create function f() returns int language sql BEGIN ATOMIC select case when true then 1 end; end; select 2;"
+            @?= Right ["create function f() returns int language sql BEGIN ATOMIC select case when true then 1 end; end", "select 2"]
+        , testCase "CASE ... END outside BEGIN ATOMIC does not hold the statement open"
+            $ splitStatements "select case when true then 1 end; select 2;"
+            @?= Right ["select case when true then 1 end", "select 2"]
+        , testCase "a comment between BEGIN and ATOMIC still starts a body"
+            $ splitStatements "begin/**/atomic select 1; end; select 2;"
+            @?= Right ["begin/**/atomic select 1; end", "select 2"]
+        , testCase "a quote between BEGIN and ATOMIC starts no body"
+            $ splitStatements "begin 'x' atomic; select 2;"
+            @?= Right ["begin 'x' atomic", "select 2"]
+        , testCase "psql output commands are skipped"
+            $ splitStatements "\\set ON_ERROR_STOP on\n\\pset pager off\n\\unset QUIET\nselect 1;"
+            @?= Right ["select 1"]
+        , testCase "other psql commands are refused"
+            $ splitStatements "\\i other.sql\nselect 1;"
+            @?= Left "psql's \\i cannot run outside psql"
+        , testCase "\\set of a lowercase variable is refused"
+            $ splitStatements "\\set foo bar\nselect 1;"
+            @?= Left "psql's \\set cannot run outside psql"
+        , testCase "a backslash after code is part of the statement"
+            $ splitStatements "select 1 \\x\n;"
+            @?= Right ["select 1 \\x"]
+        , testCase "an unterminated last statement is kept"
+            $ splitStatements "select 1; select 2 -- done"
+            @?= Right ["select 1", "select 2 -- done"]
+        , testCase "an unclosed dollar quote is an error"
+            $ splitStatements "select $$x;"
+            @?= Left "a quote, dollar quote or comment is not closed"
+        , testCase "an unclosed nested comment is an error"
+            $ splitStatements "select 1; /* a /* b */"
+            @?= Left "a quote, dollar quote or comment is not closed"
+        , testCase "an unclosed escape string is an error"
+            $ splitStatements "select E'a\\'"
+            @?= Left "a quote, dollar quote or comment is not closed"
+        , testCase "a BEGIN ATOMIC body without END is an error"
+            $ splitStatements "create function f() returns int language sql begin atomic select 1;"
+            @?= Left "a BEGIN ATOMIC body has no END"
+        , testCase "a BEGIN ATOMIC body whose END ends the input is closed"
+            $ splitStatements "create function f() returns int language sql begin atomic select 1; end"
+            @?= Right ["create function f() returns int language sql begin atomic select 1; end"]
+        ]
+
+
 plans :: TestTree
 plans =
     testGroup
@@ -370,7 +439,7 @@ columns =
         , testCase "drift ignores validity but not the words \"not valid\" in a comment" do
             let key o = ObjectKey Comment o
                 table = Table (qname "public" "t")
-                column validity = ColumnDefinition (ColumnDef (typeName "int") Nothing (NotNull validity Nothing) (PlainColumn Nothing) False (Position 1) False)
+                column validity = ColumnDefinition (plainColumn "int"){nullability = NotNull validity Nothing}
                 columnKey = ObjectKey Definition (Column (qname "public" "t") (identifier "c"))
             Map.keys (fileDrift Set.empty (Map.fromList [(key table, Printed "is not valid")]) (Map.fromList [(key table, Printed "is")])) @?= [key table]
             fileDrift Set.empty (Map.fromList [(columnKey, column NotValidated)]) (Map.fromList [(columnKey, column Validated)]) @?= Map.empty
@@ -494,27 +563,42 @@ sqitchChecks =
             length (batchProblems p [unitNamed ReworkChange "c"]) @?= 1
             batchProblems p [unitNamed ReworkChange "a", unitNamed AddChange "b"] @?= []
         , testCase "a column's position does not make it differ" do
-            let at n = ColumnDefinition (ColumnDef (typeName "int") Nothing Nullable (PlainColumn Nothing) False (Position n) False)
+            let at n = ColumnDefinition (plainColumn "int"){position = Position n}
                 key = ObjectKey Definition (Column (qname "public" "t") (identifier "a"))
             diff (\_ a b -> a == b) (Map.fromList [(key, at 1)]) (Map.fromList [(key, at 3)]) @?= Map.empty
         , testCase "verify checks a column's full type, not only its base type" do
-            let col ty = ColumnDefinition (ColumnDef (typeName ty) Nothing Nullable (PlainColumn Nothing) False (Position 1) False)
+            let col ty = ColumnDefinition (plainColumn ty)
                 object = Column (qname "public" "t") (identifier "a")
-                retype = Step CreatePhase 6 object "alter table public.t alter column a type character varying(20)" Shared [] (ObjectKey Definition object) (Changed (col "character varying(10)") (col "character varying(20)")) UndoObject
+                retype =
+                    (createStep object "alter table public.t alter column a type character varying(20)")
+                        { rank = 6
+                        , change = Changed (col "character varying(10)") (col "character varying(20)")
+                        }
                 script = verifyScript "-- verify" [retype]
             ("format_type(atttypid, atttypmod)" `T.isInfixOf` script, "= 'character varying(20)'" `T.isInfixOf` script) @?= (True, True)
         , testCase "verify checks routines, types, schemas and extensions" do
-            let made object = Step CreatePhase 1 object "create" Shared [] (ObjectKey Definition object) (Added (Printed "x")) UndoObject
+            let made object = (createStep object "create"){rank = 1, change = Added (Printed "x")}
                 script = verifyScript "-- verify" (map made [Routine Function (qname "app" "f") [typeName "integer"], Type (typeName "app.mood"), Schema (identifier "app"), Extension (identifier "pgcrypto"), Table (qname "app" "t")])
             for_ ["to_regprocedure('app.f(integer)') is not null", "to_regtype('app.mood') is not null", "nspname = 'app'", "extname = 'pgcrypto'", "to_regclass('app.t') is not null"] \check ->
                 (check, check `T.isInfixOf` script) @?= (check, True)
         , testCase "verify does not expect an object dropped to be created again to be gone" do
             let object = MaterializedView (qname "app" "mv")
-                drop' = Step DropPhase 1 object "drop materialized view app.mv" Shared [] (ObjectKey Definition object) (Changed (Printed "a") (Printed "b")) UndoObject
+                drop' =
+                    (createStep object "drop materialized view app.mv")
+                        { phase = DropPhase
+                        , role = Drops
+                        , rank = 1
+                        , change = Changed (Printed "a") (Printed "b")
+                        }
             ("still exists" `T.isInfixOf` verifyScript "-- verify" [drop']) @?= False
         , testCase "a step sqiff cannot write stops the deploy" do
             let object = Type (typeName "app.mood")
-                manual = Step CreatePhase 8 object "-- only adding enum values is automated" Shared [Manual "only adding enum values is automated"] (ObjectKey Definition object) (Changed (Printed "a") (Printed "b")) UndoObject
+                manual =
+                    (createStep object "-- only adding enum values is automated")
+                        { rank = 8
+                        , hazards = [Manual "only adding enum values is automated"]
+                        , change = Changed (Printed "a") (Printed "b")
+                        }
             ("raise exception" `T.isInfixOf` renderScript "-- deploy" Migration [manual]) @?= True
         , testCase "a table's migrations are found by its name as migration names write it" do
             let names = either error id (Aeson.eitherDecode "{}")
@@ -555,7 +639,7 @@ sqitchChecks =
                 ctx = context Map.empty Map.empty Map.empty noDependencies Map.empty
                 overload arg =
                     let object = Routine Function (qname "public" "f") [typeName arg]
-                     in Step CreatePhase 9 object ("create function public.f(" <> arg <> ")") Shared [] (ObjectKey Definition object) (Added (Printed arg)) UndoObject
+                     in (createStep object ("create function public.f(" <> arg <> ")")){rank = 9, change = Added (Printed arg)}
                 written = units names (const True) ctx Map.empty (plan "") (UTCTime (fromGregorian 2026 11 18) 0) [overload "int", overload "text"]
             map (\u -> (u.changeName, length u.deploy)) written @?= [("public/function/f", 2)]
         , testCase "the layout: the target's setting beats the engine's, which beats the core's" do
@@ -624,3 +708,35 @@ folderExport =
 -- | 'schedule' over characters keyed by themselves, with the priorities given.
 scheduleChars :: [(Int, Char)] -> [(Char, Char)] -> Either (String, String) String
 scheduleChars items pairs = bimap (bimap (map snd) (map snd)) (map snd) (schedule snd fst items pairs)
+
+
+-- | A shared create-phase step that creates @object@ with @sql@ and is undone by its
+-- inverse; tests change the fields they are about.
+createStep :: ObjectId -> Text -> Step
+createStep object sql =
+    Step
+        { phase = CreatePhase
+        , role = Creates
+        , rank = 0
+        , object
+        , sql
+        , txn = Shared
+        , hazards = []
+        , key = ObjectKey Definition object
+        , change = Added (Printed sql)
+        , undo = UndoObject
+        }
+
+
+-- | A nullable column of type @ty@, first in its table, with nothing else set.
+plainColumn :: Text -> ColumnDef
+plainColumn ty =
+    ColumnDef
+        { colType = typeName ty
+        , collation = Nothing
+        , nullability = Nullable
+        , value = PlainColumn Nothing
+        , rewritesOnAdd = False
+        , position = Position 1
+        , inheritedOnly = False
+        }

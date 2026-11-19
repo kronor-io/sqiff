@@ -22,7 +22,7 @@ import Sqiff.Definition (Definition (..))
 import Sqiff.Diff (Change (..))
 import Sqiff.Identifier (qname)
 import Sqiff.Model (Aspect (..), ObjectId (..), ObjectKey (..))
-import Sqiff.Recipe (Phase (..), Step (..), Txn (..), Undo (..))
+import Sqiff.Recipe (Phase (..), Role (..), Step (..), Txn (..), Undo (..))
 import Sqiff.Sqitch (withProject, writeUnits)
 import Sqiff.Sqitch.Check (Tagging (..))
 import Sqiff.Sqitch.Layout (findLayout)
@@ -72,7 +72,18 @@ withSqitchProject action = withSystemTempDirectory "sqiff-writing" \dir -> do
 step :: Text -> Text -> Step
 step name sql =
     let object = Table (qname "public" name)
-     in Step CreatePhase 4 object sql Shared [] (ObjectKey Definition object) (Added (Printed sql)) UndoObject
+     in Step
+            { phase = CreatePhase
+            , role = Creates
+            , rank = 4
+            , object
+            , sql
+            , txn = Shared
+            , hazards = []
+            , key = ObjectKey Definition object
+            , change = Added (Printed sql)
+            , undo = UndoObject
+            }
 
 
 unit :: UnitKind -> Text -> Text -> Unit

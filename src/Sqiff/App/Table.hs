@@ -24,14 +24,14 @@ import RIO.FilePath (makeRelative, normalise, (</>))
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
-import Sqiff.App.Dependents (Dependents (..), dependentsIn, dependentsScope)
+import Sqiff.App.Dependents (Dependents (..), dependentsIn, dependentsScope, exactDependentsOf)
 import Sqiff.App.Env (say)
 import Sqiff.App.Options (Comparison (..), MigrateOptions (..), Output (..), TableMode (..), TableOptions (..), renamesOf)
 import Sqiff.App.Read (Connected (..), routineWords, withDatabase)
 import Sqiff.App.Table.Env
 import Sqiff.App.Table.Findings
 import Sqiff.App.Table.Rewrite
-import Sqiff.Catalog.PlpgsqlCheck (bodyErrors, notChecked)
+import Sqiff.Catalog.PlpgsqlCheck (BodyError (..), Outcome (..), bodyErrorText, bodyErrors)
 import Sqiff.Config (Config (..), Names (..), fill, loadConfig, match)
 import Sqiff.Connection (failWith)
 import Sqiff.ConnectionString (ConnectionString)
@@ -173,32 +173,90 @@ branchChangesFor comparison = do
 bodyResultsFor :: Connection.Connection -> Baseline -> Dependents -> RIO TableEnv BodyResults
 bodyResultsFor conn baseline deps = do
     env <- ask
-    let table = env.table
-        definitionOf a = printed <$> Map.lookup (definitionKey a) deps.dbSchema
-        takesRowType = \case
-            Routine _ _ args -> any ((`elem` [qualified table, qualified table <> "[]"]) . typeText) args
-            _ -> False
-        routines = Set.toList (Set.filter (\a -> isRoutine a && not (takesRowType a)) (fold deps.named <> fold deps.exact))
-        plpgsql = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE plpgsql" `T.isInfixOf` def]
-        sqlBodies = [a | a <- routines, Just def <- [definitionOf a], "LANGUAGE sql" `T.isInfixOf` def, not (standardBody def)]
-        signature a = case a of
-            Routine _ q args -> let list = T.intercalate ", " (map typeText args) in [i|#{qualified q}(#{list})|]
-            _ -> render a
-        bySignature = Map.fromList [(signature a, a) | a <- plpgsql <> sqlBodies]
-        check made = timed [i|table.bodyErrors n=#{Map.size bySignature}|] $ bodyErrors conn (nameText aside) (qualified table) made (map signature plpgsql) (map signature sqlBodies)
-        rowTypeCall message = "function " `T.isPrefixOf` message && any (\end -> (qualified table <> end) `T.isInfixOf` message) [")", ","]
-    results <-
-        if null plpgsql && null sqlBodies
+    let candidates = bodyCandidates env.table deps
+        functions = Set.size (Set.fromList (map (.signature) (candidates.plpgsql <> candidates.sqlBodies)))
+        check made =
+            timed [i|table.bodyErrors n=#{functions}|]
+                $ bodyErrors conn (nameText aside) (qualified env.table) made (map (.signature) candidates.plpgsql) (map (.signature) candidates.sqlBodies)
+    comparison <-
+        if null candidates.plpgsql && null candidates.sqlBodies
             then pure Nothing
             else
                 timed "table.compare2"
                     . liftIO
-                    $ withEditedTable conn baseline table env.statements (check deps.dbTempTables) (\before -> (\after -> (,) <$> before <*> after) <$> check (pure Nothing))
-    let checked = Set.filter (\(_, _, message) -> not (rowTypeCall message)) . uncurry (flip Set.difference) <$> results
-        unchecked = Set.fromList [s | Just (_, after) <- [results], (s, _, message) <- Set.toList after, notChecked `T.isPrefixOf` message]
-        breaking = Map.fromListWith (\_ earlier -> earlier) [(a, message) | (s, _, message) <- maybe [] Set.toList checked, Just a <- [Map.lookup s bySignature]]
-        passed = Set.fromList [a | isJust checked, a <- plpgsql <> sqlBodies, a `Map.notMember` breaking, signature a `Set.notMember` unchecked, Just def <- [definitionOf a], not ("execute" `T.isInfixOf` T.toLower def)]
-    pure BodyResults{breaking, passed}
+                    $ withEditedTable conn baseline env.table env.statements (check deps.dbTempTables) (\before -> (\after -> BodyComparison <$> before <*> after) <$> check (pure Nothing))
+    pure (classifyBodyResults env.table candidates comparison)
+
+
+-- | A function whose body the check reads.
+data Checkable = Checkable
+    { object :: ObjectId
+    , signature :: Text
+    , definition :: Text
+    }
+
+
+-- | The functions to check: PL/pgSQL ones, and SQL ones with a string body, which
+-- PostgreSQL validates when asked.
+data BodyCandidates = BodyCandidates
+    { plpgsql :: [Checkable]
+    , sqlBodies :: [Checkable]
+    }
+
+
+-- | What the check found before the edit and after it.
+data BodyComparison = BodyComparison
+    { before :: Set BodyError
+    , after :: Set BodyError
+    }
+
+
+-- | The routines that depend on the edit or name it, except ones taking the table's row
+-- type, which the check cannot call with the edited table.
+bodyCandidates :: QName -> Dependents -> BodyCandidates
+bodyCandidates table deps =
+    BodyCandidates
+        { plpgsql = [c | c <- checkable, "LANGUAGE plpgsql" `T.isInfixOf` c.definition]
+        , sqlBodies = [c | c <- checkable, "LANGUAGE sql" `T.isInfixOf` c.definition, not (standardBody c.definition)]
+        }
+  where
+    routines = Set.toList (Set.filter (\a -> isRoutine a && not (takesRowType a)) (fold deps.named <> fold deps.exact))
+    checkable = [Checkable{object = a, signature = routineSignature a, definition = printed def} | a <- routines, Just def <- [Map.lookup (definitionKey a) deps.dbSchema]]
+    takesRowType = \case
+        Routine _ _ args -> any ((`elem` [qualified table, qualified table <> "[]"]) . typeText) args
+        _ -> False
+
+
+-- | How the check names a routine.
+routineSignature :: ObjectId -> Text
+routineSignature = \case
+    Routine _ q args -> let list = T.intercalate ", " (map typeText args) in [i|#{qualified q}(#{list})|]
+    a -> render a
+
+
+-- | The functions the edit breaks, with the first new error of each, and the ones the
+-- check passes: checked, with no new error, and running no dynamic SQL it cannot see.
+classifyBodyResults :: QName -> BodyCandidates -> Maybe BodyComparison -> BodyResults
+classifyBodyResults table candidates comparison =
+    BodyResults{breaking, passed}
+  where
+    all' = candidates.plpgsql <> candidates.sqlBodies
+    bySignature = Map.fromList [(c.signature, c.object) | c <- all']
+    newErrors = (\b -> Set.filter (not . callsWithRowType) (Set.difference b.after b.before)) <$> comparison
+    unchecked = Set.fromList [e.signature | Just b <- [comparison], e <- Set.toList b.after, e.outcome == NotChecked]
+    breaking = Map.fromListWith (\_ earlier -> earlier) [(a, bodyErrorText e) | e <- maybe [] Set.toList newErrors, Just a <- [Map.lookup e.signature bySignature]]
+    passed =
+        Set.fromList
+            [ c.object
+            | isJust newErrors
+            , c <- all'
+            , c.object `Map.notMember` breaking
+            , c.signature `Set.notMember` unchecked
+            , not ("execute" `T.isInfixOf` T.toLower c.definition)
+            ]
+    -- An error about calling a function with the table's row type, which the check
+    -- cannot make with the edited table.
+    callsWithRowType e = let message = bodyErrorText e in "function " `T.isPrefixOf` message && any (\end -> (qualified table <> end) `T.isInfixOf` message) [")", ","]
 
 
 -- | The foreign keys on retyped columns that cannot be rebuilt with the new types, with
@@ -211,7 +269,7 @@ foreignKeyBreaksFor conn deps retyped =
         <$> for
             [ (addr, k, types)
             | addr <- map retypedObject retyped
-            , k@(TableConstraint onTable _) <- Set.toList (Map.findWithDefault Set.empty addr deps.exact)
+            , k@(TableConstraint onTable _) <- Set.toList (exactDependentsOf addr deps)
             , Just (ConstraintDefinition def) <- [Map.lookup (definitionKey k) deps.dbSchema]
             , Just types <- [foreignKeyTypes typeIn onTable def]
             ]

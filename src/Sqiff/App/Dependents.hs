@@ -7,6 +7,8 @@
 -- | What depends on an edit's dropped or changed objects, in the database it runs on.
 module Sqiff.App.Dependents (
     Dependents (..),
+    exactDependentsOf,
+    routinesNaming,
     dependentsScope,
     dependentsIn,
 ) where
@@ -28,7 +30,11 @@ import Sqiff.Timing (measure, timed)
 
 data Dependents = Dependents
     { exact :: Map ObjectId (Set ObjectId)
+    -- ^ For each object the edit drops or changes, what depends on it, directly or not,
+    -- by @pg_depend@ and by the PL/pgSQL bodies plpgsql_check reads.
     , named :: Map ObjectId (Set ObjectId)
+    -- ^ For each such object, the routines whose bodies name it, which the catalog does
+    -- not track.
     , dbSchema :: Schema
     , dbDeps :: Dependencies
     , dbTempTables :: IO (Maybe Text)
@@ -39,6 +45,16 @@ data Dependents = Dependents
 -- | How 'dependentsIn' describes the database, leaving out @excluded@ schemas.
 dependentsScope :: [Text] -> Scope
 dependentsScope excluded = Scope{excluded, partitions = SkipPartitions, bodyCheck = SkipBodyChecks}
+
+
+-- | What depends on @object@, by @pg_depend@ and PL/pgSQL bodies.
+exactDependentsOf :: ObjectId -> Dependents -> Set ObjectId
+exactDependentsOf object deps = Map.findWithDefault Set.empty object deps.exact
+
+
+-- | The routines whose bodies name @object@.
+routinesNaming :: ObjectId -> Dependents -> Set ObjectId
+routinesNaming object deps = Map.findWithDefault Set.empty object deps.named
 
 
 -- | For each dropped or changed definition, its dependents by @pg_depend@ and PL/pgSQL

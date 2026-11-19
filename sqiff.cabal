@@ -14,6 +14,7 @@ common shared
   default-language:   GHC2021
   default-extensions:
     BlockArguments
+    StrictData
     DerivingStrategies
     LambdaCase
 
@@ -105,6 +106,7 @@ test-suite sqiff-test
   other-modules:
     Integration
     Postgres
+    Rewriting
     Unit
     Writing
 

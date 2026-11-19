@@ -91,9 +91,9 @@ planWith adjust checks fromSchema toSchema fromDeps toDeps changes = do
                 , waiting <- waitingSteps phase a' b (stepsOf a')
                 , waited <- if phase == CreatePhase then mainStep b else take 1 (reverse (stepsOf b))
                 ]
-            -- The step that makes or replaces the object, not one that changes its
-            -- settings, grants or comment.
-            mainStep b = take 1 [n | n <- stepsOf b, Just s <- [Map.lookup n stepAt], s.rank == createRank b]
+            -- The first step that creates, replaces or drops the object itself, not
+            -- one that sets its settings, grants or comment.
+            mainStep b = take 1 [n | n <- stepsOf b, Just s <- [Map.lookup n stepAt], defines s]
          in case schedule fst priority numbered (chained <> waits) of
                 Right placed -> Right (map snd placed)
                 Left (_, (_, b) : bs) -> Left (DependencyCycle (b.object :| filter (/= b.object) (nubOrd (map ((.object) . snd) bs))))
@@ -105,7 +105,7 @@ planWith adjust checks fromSchema toSchema fromDeps toDeps changes = do
     -- column, the step that sets the owner. The sequence itself comes first, as the
     -- column's default uses it.
     waitingSteps phase a b ns
-        | phase == CreatePhase, owns a b = [n | n <- ns, Just s <- [Map.lookup n stepAt], s.rank == sequenceOwnerRank]
+        | phase == CreatePhase, owns a b = [n | n <- ns, Just s <- [Map.lookup n stepAt], s.role == OwnsSequence]
         | otherwise = take 1 ns
 
     -- A sequence owned by a column: dropping the column drops the sequence.
@@ -123,7 +123,7 @@ context checks fromSchema toSchema fromDeps changes =
         , withDependents = Set.fromList [e.referenced | e <- edges fromDeps]
         , recreatedViews =
             Map.fromList
-                [ (v, (indexesOn v, (grantsKey,) <$> mfilter explicit (Map.lookup grantsKey toSchema)))
+                [ (v, KeptOnView{keptIndexes = indexesOn v, keptGrants = (grantsKey,) <$> mfilter explicit (Map.lookup grantsKey toSchema)})
                 | (k, Changed _ _) <- Map.toList changes
                 , k.aspect == Definition
                 , let grantsKey = k{aspect = Privileges}
@@ -151,7 +151,7 @@ context checks fromSchema toSchema fromDeps changes =
             Set.fromList
                 [ (t, c)
                 | (Column t c, Changed (ColumnDefinition o) (ColumnDefinition n)) <- definitions
-                , o.colType /= n.colType || o.collation /= n.collation
+                , columnTypeChanged o n
                 ]
         , viewsAround = Map.empty
         , droppedObjects = Set.fromList [k.object | (k, Dropped _) <- Map.toList changes, k.aspect == Definition]

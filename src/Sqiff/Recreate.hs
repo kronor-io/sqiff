@@ -1,12 +1,14 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE NoFieldSelectors #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | What has to go and come back around a column whose type changes: PostgreSQL refuses
 -- to retype a column that views, or the policies, triggers and routines bound to them,
 -- still use.
 module Sqiff.Recreate (
+    Recreation (..),
     viewsAroundTypeChanges,
     withViewsAround,
     withViewsReplaced,
@@ -26,14 +28,14 @@ import Sqiff.Graph (topoOrder)
 import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Plan (context)
-import Sqiff.Recipe (Context (..), Step (..), recipe, revokeGranted)
+import Sqiff.Recipe (Context (..), Step (..), Surrounding (..), recipe, revokeGranted)
 
 
 -- | Adds to the context what to drop and create again around each retyped column, by
 -- what depends on it in @schema@ by @deps@.
 withViewsAround :: Schema -> Dependencies -> Changes -> Context -> Context
 withViewsAround schema deps changes ctx =
-    ctx{viewsAround = Map.map snd (viewsAroundTypeChanges exact schema deps (retypedIn changes))}
+    ctx{viewsAround = Map.map (.statements) (viewsAroundTypeChanges exact schema deps (retypedIn changes))}
   where
     known = Set.fromList [k.object | k <- Map.keys schema, k.aspect == Definition]
     exact = affected known deps changes
@@ -54,16 +56,23 @@ retypedIn changes =
     | (k, Changed (ColumnDefinition old) (ColumnDefinition new)) <- Map.toList changes
     , k.aspect == Definition
     , Column t c <- [k.object]
-    , old.colType /= new.colType || old.collation /= new.collation
+    , columnTypeChanged old new
     ]
 
 
--- | For each retyped column, the statements that drop the views, policies, triggers and
--- routines that hold it, and the ones that create them again.
-viewsAroundTypeChanges :: Map ObjectId (Set ObjectId) -> Schema -> Dependencies -> [(QName, Identifier, ObjectId)] -> Map (QName, Identifier) (Set ObjectId, ([Text], [Text]))
+-- | The objects dropped and created again around a retyped column.
+data Recreation = Recreation
+    { members :: Set ObjectId
+    , statements :: Surrounding
+    }
+
+
+-- | For each retyped column, the views, policies, triggers and routines that hold it,
+-- with the statements that drop them and the ones that create them again.
+viewsAroundTypeChanges :: Map ObjectId (Set ObjectId) -> Schema -> Dependencies -> [(QName, Identifier, ObjectId)] -> Map (QName, Identifier) Recreation
 viewsAroundTypeChanges exact schema deps retyped =
     Map.fromList
-        [ ((t, c), (members, (map dropStatement (reverse order), concatMap (createAgain attached) order)))
+        [ ((t, c), Recreation{members, statements = Surrounding{dropBefore = map dropStatement (reverse order), createAfter = concatMap (createAgain attached) order}})
         | (t, c, column) <- retyped
         , let closure = Map.findWithDefault Set.empty column exact
               onColumn = Set.filter (\a -> isPolicyOrTrigger a && dependsOn deps a column) closure
@@ -83,10 +92,10 @@ viewsAroundTypeChanges exact schema deps retyped =
 -- @create or replace view@ refuses, the statements that drop what depends on it in the
 -- database being changed, and the ones that create those again as @toSchema@ has them;
 -- one the plan drops is not created again.
-viewsToRecreate :: Schema -> Dependencies -> Changes -> Map QName ([Text], [Text])
+viewsToRecreate :: Schema -> Dependencies -> Changes -> Map QName Surrounding
 viewsToRecreate toSchema deps changes =
     Map.fromList
-        [ (v, (map (dropWith " if exists") (reverse order), concatMap (createAgain attached) (filter wanted order)))
+        [ (v, Surrounding{dropBefore = map (dropWith " if exists") (reverse order), createAfter = concatMap (createAgain attached) (filter wanted order)})
         | (k, Changed (ViewDefinition old) (ViewDefinition new)) <- Map.toList changes
         , k.aspect == Definition
         , View v <- [k.object]

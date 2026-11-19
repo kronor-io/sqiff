@@ -26,7 +26,7 @@ import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import Sqiff.App.Env (AppEnv (..), Scope (..), Source, say)
 import Sqiff.App.Options (DescribeOptions (..), SqitchOptions (..))
-import Sqiff.App.Read (Purpose (..), describeConnections, readBoth)
+import Sqiff.App.Read (ComparisonInputs (..), Purpose (..), SchemaSnapshot (..), describeConnections, readBoth)
 import Sqiff.Body (BodyCheck, sameDefinition)
 import Sqiff.Catalog (describeOn)
 import Sqiff.Config (Config (..))
@@ -64,8 +64,10 @@ runDescribe opts = do
 -- | Lists what differs, with what depends on it; exits 1 when something does.
 runDiff :: Source -> ConnectionString -> RIO AppEnv ()
 runDiff from toDb = do
-    ((fromSchema, deps), (toSchema, _), checks) <- timed "readBoth" $ readBoth from toDb ForDiff
-    let changes = diff (sameDefinition checks) fromSchema toSchema
+    inputs <- timed "readBoth" $ readBoth from toDb ForDiff
+    let fromSchema = inputs.source.schema
+        deps = inputs.source.dependencies
+        changes = diff (sameDefinition inputs.bodyChecks) fromSchema inputs.target.schema
         known = Set.fromList [k.object | k <- Map.keys fromSchema, k.aspect == Definition]
         affectedBy = affected known deps changes
         dependentsOf key = case key.aspect of
@@ -132,8 +134,11 @@ data Planned = Planned
 
 planBoth :: Source -> ConnectionString -> RIO AppEnv Planned
 planBoth from toDb = do
-    ((fromSchema, fromDeps), (toSchema, toDeps), checks) <- timed "readBoth" $ readBoth from toDb ForPlan
-    let changes = diff (sameDefinition checks) fromSchema toSchema
+    inputs <- timed "readBoth" $ readBoth from toDb ForPlan
+    let SchemaSnapshot{schema = fromSchema, dependencies = fromDeps} = inputs.source
+        SchemaSnapshot{schema = toSchema, dependencies = toDeps} = inputs.target
+        checks = inputs.bodyChecks
+        changes = diff (sameDefinition checks) fromSchema toSchema
         adjust = withViewsReplaced toSchema fromDeps changes . withViewsAround fromSchema fromDeps changes
     steps <- either (failWith . cycleMessage) pure (planWith adjust (checks :: Map ObjectKey BodyCheck) fromSchema toSchema fromDeps toDeps changes)
     pure Planned{fromSchema, fromDeps, toSchema, toDeps, changes, steps}
