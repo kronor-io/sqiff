@@ -7,6 +7,8 @@
 -- | What depends on an edit's dropped or changed objects, in the database it runs on.
 module Sqiff.App.Dependents (
     Dependents (..),
+    catalogDependentsOf,
+    routinesNaming,
     dependentsScope,
     dependentsIn,
 ) where
@@ -28,7 +30,11 @@ import Sqiff.Timing (measure, timed)
 
 data Dependents = Dependents
     { exact :: Map ObjectId (Set ObjectId)
+    -- ^ For each object the edit drops or changes, what the catalog records as
+    -- depending on it, directly or not.
     , named :: Map ObjectId (Set ObjectId)
+    -- ^ For each such object, the routines whose bodies name it, which the catalog does
+    -- not track.
     , dbSchema :: Schema
     , dbDeps :: Dependencies
     , dbTempTables :: IO (Maybe Text)
@@ -45,6 +51,16 @@ dependentsScope excluded = Scope{excluded, partitions = SkipPartitions, bodyChec
 -- bodies, and the other functions whose text names it. @described@ is the database, as
 -- 'dependentsScope' reads it, with its functions' words; it is only asked for when
 -- something is dropped or changed.
+-- | What the catalog records as depending on @object@.
+catalogDependentsOf :: ObjectId -> Dependents -> Set ObjectId
+catalogDependentsOf object deps = Map.findWithDefault Set.empty object deps.exact
+
+
+-- | The routines whose bodies name @object@.
+routinesNaming :: ObjectId -> Dependents -> Set ObjectId
+routinesNaming object deps = Map.findWithDefault Set.empty object deps.named
+
+
 dependentsIn :: [Text] -> IO (Connected, Map ObjectId BodyText) -> Changes -> IO Dependents
 dependentsIn excluded described changes
     | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty noDependencies (pure Nothing))
