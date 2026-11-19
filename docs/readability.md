@@ -173,19 +173,38 @@ performance thresholds in CI. Each of these would be met by worse code.
 
 | Rule | Check |
 |---|---|
-| H1, H2 (signatures), exhaustive matches | GHC: `-Werror` for missing signatures, missing fields, incomplete patterns and partial record selectors and updates (`sqiff.cabal`) |
-| R3 for steps | HLint: no reading a step's `.sql` (`.hlint.yaml`), with the known exceptions listed there |
-| R6 | HLint: `exactDependentsOf`, `routinesNaming` |
+| R1 | `SqiffSmallWhere`: a where block of at most twelve bindings |
+| R2 | `SqiffNamedTuples`: no tuple of three or more, or tuple in a tuple, in a top-level signature |
+| R3 for steps | `SqiffStepRole`: no reading a step's `.sql` with a text test |
+| R6 | `SqiffNamedQueries`: `exactDependentsOf` and `routinesNaming`, not the maps behind them |
+| H1 | `SqiffNamedFields`: no constructor applied to more than four positional arguments |
+| H2 (signatures), exhaustive matches | GHC: `-Werror` for missing signatures, missing fields, incomplete patterns and partial record selectors and updates (`sqiff.cabal`) |
 | Layout | fourmolu (`fourmolu.yaml`) |
 | Everything else | Review, with `.claude/skills/readability-review` |
 
-`scripts/check fast` runs fourmolu and the HLint gate; `scripts/check full` also
-builds and runs every test. `scripts/check advice` prints HLint's other
-suggestions without failing.
+The `Sqiff*` rules are sqiff's own [hopinion](https://github.com/NorfairKing/hopinion)
+rules, in `lint/`. hopinion parses each module with GHC's parser and reads the
+`.hie` files the build writes, so a rule sees the code as the compiler does rather
+than as text. Each rule carries its text, why it exists and how to fix a finding;
+`sqiff-lint explain SqiffNamedFields` prints them. hopinion's own built-in rules
+are not used: they are another project's style.
 
-A rule moves from review to a check only when review keeps missing it. Checks
-that need the syntax tree — positional construction of records with many fields,
-tuple-heavy signatures, where-block size — would go in a checker built on
-`ghc-lib-parser`; [hopinion](https://github.com/NorfairKing/hopinion) is a
-candidate framework for one. Existing code would be grandfathered with a recorded
-baseline, so only new or growing findings fail.
+A finding that is right to leave says so where it is, directly above the line:
+
+```haskell
+-- [allow:SqiffStepRole] writing the statement out: a "--" placeholder takes no semicolon
+```
+
+The reason is required, and an annotation that suppresses nothing fails the check,
+so exceptions cannot outlive their code. Code that broke a rule when the rules were
+adopted carries the reason `pre-existing at adoption`: that is the debt, and
+`grep -rn "pre-existing at adoption" src test` lists it. Fix it when you next
+change that code, and remove the annotation; do not add new ones with that reason.
+
+`scripts/check fast` runs fourmolu. `scripts/check lint` builds sqiff and runs the
+rules over it. `scripts/check full` runs both, then every test. `scripts/check
+advice` prints HLint's suggestions without failing.
+
+A rule moves from review to a check when review keeps missing it. A new rule is a
+module in `lint/src/Sqiff/Lint/Rule/`, listed in `Sqiff.Lint.rules`; it has to hold
+on sqiff, with every existing finding fixed or annotated with its reason.
