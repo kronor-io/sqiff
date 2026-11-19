@@ -72,7 +72,7 @@ marker = ".sqiff"
 
 
 objectPath :: ObjectKey -> FilePath
-objectPath key = segment addr.objectType </> joinPath (map segment parents) </> (segment name <> args) <.> extension
+objectPath key = kindSegment addr.objectType </> joinPath (map segment parents) </> (segment name <> args) <.> extension
   where
     addr = toAddress key.object
 
@@ -91,6 +91,13 @@ objectPath key = segment addr.objectType </> joinPath (map segment parents) </> 
         Definition -> "sql"
         Privileges -> "privileges"
         Comment -> "comment"
+
+
+-- | A kind of object as a folder name, @table column@ as @table-column@. Kinds are
+-- PostgreSQL's words for them, letters and spaces only, so the dashes cannot make two
+-- kinds alike.
+kindSegment :: Text -> FilePath
+kindSegment = T.unpack . T.replace " " "-"
 
 
 shortHash :: Text -> Text

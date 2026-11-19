@@ -138,18 +138,18 @@ schema/schema/public.privileges
 schema/schema/public.sql
 schema/sequence/public/orders_id_seq.privileges
 schema/.sqiff
-schema/table%20column/public/orders/amount.sql
-schema/table%20column/public/orders/created_at.sql
-schema/table%20column/public/orders/customer_email.sql
-schema/table%20column/public/orders/id.sql
-schema/table%20column/public/orders/status.sql
-schema/table%20constraint/public/orders/orders_pkey.sql
+schema/table-column/public/orders/amount.sql
+schema/table-column/public/orders/created_at.sql
+schema/table-column/public/orders/customer_email.sql
+schema/table-column/public/orders/id.sql
+schema/table-column/public/orders/status.sql
+schema/table-constraint/public/orders/orders_pkey.sql
 schema/table/public/orders.privileges
 schema/table/public/orders.sql
 schema/view/public/daily_revenue.privileges
 schema/view/public/daily_revenue.sql
 
-$ cat "schema/table%20column/public/orders/amount.sql"
+$ cat schema/table-column/public/orders/amount.sql
 type numeric(12,2)
 not null
 ```
