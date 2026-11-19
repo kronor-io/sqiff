@@ -13,6 +13,7 @@ module Sqiff.Sqitch.Units (
     slug,
     Shape (..),
     shapeOf,
+    TemplateUse (..),
     templateOf,
     indexPrefix,
     renderScript,
@@ -272,7 +273,7 @@ nameMigrations names now = go 0
         | u.placement == Migration =
             let stamp = T.pack (formatTime defaultTimeLocale (T.unpack names.migrationStamp) (addUTCTime (fromIntegral i) now))
                 description = describe u
-                template = maybe "migration" fst (templateOf u)
+                template = maybe "migration" (.name) (templateOf u)
              in u{changeName = fill names.migration [("stamp", stamp), ("slug", slug description)], note = [S.i|#{template}: #{description}|]} : go (i + 1) rest
         | otherwise = u : go i rest
 
@@ -361,13 +362,20 @@ indexPrefix :: QName -> Text
 indexPrefix t = let name = nameText t.name in [S.i|idx_#{name}_|]
 
 
+-- | A create-migration template and the variables it is filled with.
+data TemplateUse = TemplateUse
+    { name :: Text
+    , variables :: [(Text, Text)]
+    }
+
+
 -- | The template and its variables, as create-migration would pass them.
-templateOf :: Unit -> Maybe (Text, [(Text, Text)])
+templateOf :: Unit -> Maybe TemplateUse
 templateOf u = case shapeOf u of
-    AddColumnShape t c _ -> Just ("add_column", [("schema", nameText t.schema), ("table_name", nameText t.name), ("column_name", nameText c)])
-    ValidateShape t c -> Just ("validate_constraint", [("schema", nameText t.schema), ("table_name", nameText t.name), ("constraint_name", nameText c)])
-    AddIndexShape t ix -> Just ("add_index", [("schema", nameText t.schema), ("table_name", nameText t.name), ("index_name", fromMaybe (nameText ix) (T.stripPrefix (indexPrefix t) (nameText ix)))])
-    OtherShape | u.placement == Migration -> Just ("migration", [])
+    AddColumnShape t c _ -> Just (TemplateUse "add_column" [("schema", nameText t.schema), ("table_name", nameText t.name), ("column_name", nameText c)])
+    ValidateShape t c -> Just (TemplateUse "validate_constraint" [("schema", nameText t.schema), ("table_name", nameText t.name), ("constraint_name", nameText c)])
+    AddIndexShape t ix -> Just (TemplateUse "add_index" [("schema", nameText t.schema), ("table_name", nameText t.name), ("index_name", fromMaybe (nameText ix) (T.stripPrefix (indexPrefix t) (nameText ix)))])
+    OtherShape | u.placement == Migration -> Just (TemplateUse "migration" [])
     OtherShape -> Nothing
 
 

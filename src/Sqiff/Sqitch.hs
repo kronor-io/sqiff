@@ -1,6 +1,8 @@
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE NoFieldSelectors #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Writes changes to a sqitch project with sqitch's own commands. Every write happens
@@ -141,55 +143,83 @@ writeUnits project templateDir' sqitchPlan tagging us = do
     case batchProblems sqitchPlan us of
         [] -> pure ()
         problems -> failWith (T.intercalate "; " problems)
-    templates <- maybe (pure False) doesDirectoryExist templateDir
+    templateDir <- case (project.layout.root </>) <$> templateDir' of
+        Just dir -> (\exists -> if exists then Just dir else Nothing) <$> doesDirectoryExist dir
+        Nothing -> pure Nothing
     for_ (L.find (\u -> u.kind == ReworkChange && u.changeName `Set.notMember` sqitchPlan.tagged) us) \u ->
         tagBefore project sqitchPlan tagging u.changeName
-    for_ us \u -> do
-        let template = if templates && u.kind == AddChange then templateOf u else Nothing
-            projectName = sqitchPlan.project
-            engine = layout.engine
-            name = u.changeName
-            deploy = script Deploy [S.i|-- Deploy #{projectName}:#{name} to #{engine}|] u.deploy u
-            revert = script Revert [S.i|-- Revert #{projectName}:#{name} from #{engine}|] u.revert u
-            verify = write (path Verify u) (verifyScript [S.i|-- Verify #{projectName}:#{name} on #{engine}|] u.deploy)
-        case u.kind of
-            AddChange -> sqitch (["add", u.changeName, "-n", u.note] <> foldMap templateArgs template)
-            ReworkChange -> sqitch ["rework", u.changeName, "-n", u.note]
-        case (template, shapeOf u) of
-            (Just _, ValidateShape _ _) -> pure ()
-            (Just _, AddColumnShape _ _ options) -> do
-                rendered <- readFileUtf8 (path Deploy u)
-                let hazards = T.unlines [[S.i|-- #{hazardText h}|] | s <- u.deploy, h <- s.hazards]
-                write (path Deploy u)
-                    . T.replace "__your_type_here__ null" options
-                    . T.replace "\nalter table " [S.i|\n#{hazards}alter table |]
-                    $ rendered
-            (Just (_, vars), AddIndexShape t index)
-                | any (\s -> EveryPartition `elem` s.hazards) u.deploy -> do
-                    deploy >> revert
-                    write (path Verify u) (verifyScript [S.i|-- Verify #{projectName}:#{name} on #{engine}|] u.deploy)
-                | otherwise -> do
-                    deploy
-                    let ix = nameText index
-                        templated = indexPrefix t <> fromMaybe ix (lookup "index_name" vars)
-                    for_ [Revert, Verify] \script' -> do
-                        rendered <- readFileUtf8 (path script' u)
-                        write (path script' u) (T.replace templated ix rendered)
-            (Just _, OtherShape) -> deploy >> revert >> verify
-            (Nothing, _) -> do
+    for_ us (writeUnit WriteContext{project, sqitchPlan, templateDir})
+
+
+-- | What each change of a batch is written with, in 'writeUnits'.
+data WriteContext = WriteContext
+    { project :: Project
+    , sqitchPlan :: SqitchPlan
+    , templateDir :: Maybe FilePath
+    -- ^ create-migration's templates, when the project has the directory.
+    }
+
+
+-- | Adds or reworks one change with sqitch, then writes its scripts over the ones sqitch made.
+writeUnit :: WriteContext -> Unit -> IO ()
+writeUnit ctx u = do
+    let template = if isJust ctx.templateDir && u.kind == AddChange then templateOf u else Nothing
+    case u.kind of
+        AddChange -> runSqitch ctx.project (["add", u.changeName, "-n", u.note] <> foldMap (templateArgs ctx) template)
+        ReworkChange -> runSqitch ctx.project ["rework", u.changeName, "-n", u.note]
+    writeUnitScripts ctx template u
+
+
+-- | The arguments that make @sqitch add@ start from a create-migration template.
+templateArgs :: WriteContext -> TemplateUse -> [Text]
+templateArgs ctx template =
+    ["--template", template.name]
+        <> foldMap (\d -> ["--template-directory", T.pack d]) ctx.templateDir
+        <> concat [["-s", [S.i|#{k}=#{v}|]] | (k, v) <- template.variables]
+
+
+-- | Writes a change's scripts once sqitch has made them. From a template, sqiff patches
+-- what the template rendered or writes over it; without one, it writes the deploy, and
+-- the revert and verify only for a new change, so a rework keeps the ones sqitch copied.
+writeUnitScripts :: WriteContext -> Maybe TemplateUse -> Unit -> IO ()
+writeUnitScripts ctx template u =
+    case (template, shapeOf u) of
+        (Just _, ValidateShape _ _) -> pure ()
+        (Just _, AddColumnShape _ _ options) -> do
+            rendered <- readFileUtf8 (path Deploy)
+            let hazards = T.unlines [[S.i|-- #{hazardText h}|] | s <- u.deploy, h <- s.hazards]
+            write (path Deploy)
+                . T.replace "__your_type_here__ null" options
+                . T.replace "\nalter table " [S.i|\n#{hazards}alter table |]
+                $ rendered
+        (Just use, AddIndexShape t index)
+            | any (\s -> EveryPartition `elem` s.hazards) u.deploy -> do
+                deploy >> revert
+                write (path Verify) (verifyScript [S.i|-- Verify #{projectName}:#{name} on #{engine}|] u.deploy)
+            | otherwise -> do
                 deploy
-                when (u.kind == AddChange) (revert >> verify)
+                let ix = nameText index
+                    templated = indexPrefix t <> fromMaybe ix (lookup "index_name" use.variables)
+                for_ [Revert, Verify] \script' -> do
+                    rendered <- readFileUtf8 (path script')
+                    write (path script') (T.replace templated ix rendered)
+        (Just _, OtherShape) -> deploy >> revert >> verify
+        (Nothing, _) -> do
+            deploy
+            when (u.kind == AddChange) (revert >> verify)
   where
-    layout = project.layout
-    sqitch = runSqitch project
-    write = writeTracked project
-    path script' u = scriptPath layout script' u.changeName
-    templateDir = (layout.root </>) <$> templateDir'
-    templateArgs (template, vars) =
-        ["--template", template] <> foldMap (\d -> ["--template-directory", T.pack d]) templateDir <> concat [["-s", [S.i|#{k}=#{v}|]] | (k, v) <- vars]
-    script script' header steps u
-        | null steps = write (path script' u) [S.i|#{header}\n\n-- Nothing to revert.\n|]
-        | otherwise = write (path script' u) (renderScript header u.placement steps)
+    layout = ctx.project.layout
+    write = writeTracked ctx.project
+    path script' = scriptPath layout script' u.changeName
+    projectName = ctx.sqitchPlan.project
+    engine = layout.engine
+    name = u.changeName
+    deploy = script Deploy [S.i|-- Deploy #{projectName}:#{name} to #{engine}|] u.deploy
+    revert = script Revert [S.i|-- Revert #{projectName}:#{name} from #{engine}|] u.revert
+    verify = write (path Verify) (verifyScript [S.i|-- Verify #{projectName}:#{name} on #{engine}|] u.deploy)
+    script script' header steps
+        | null steps = write (path script') [S.i|#{header}\n\n-- Nothing to revert.\n|]
+        | otherwise = write (path script') (renderScript header u.placement steps)
 
 
 -- | Reworks a change whose deploy script was already edited in place, putting the edit
