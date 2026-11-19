@@ -685,6 +685,9 @@ folderExport =
                 folded = Set.fromList (map (T.toLower . T.pack) paths)
             (length paths, Set.size folded) @?= (3, 3)
             ("table/public/other.sql" `elem` paths) @?= True
+        , testCase "a kind of two words is a folder with a dash" do
+            let paths = Map.keys (exportManifest (Map.fromList [(ObjectKey Definition (Column (qname "public" "orders") (identifier "amount")), Printed "integer")]))
+            paths @?= ["table-column/public/orders/amount.sql"]
         , testCase "an empty schema writes the folder and its marker" do
             withSystemTempDirectory "sqiff-folder" \dir -> do
                 writeFolder KeepExisting (dir </> "out") Map.empty
