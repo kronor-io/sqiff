@@ -305,7 +305,11 @@ Guiding rules:
   - The state file records the commit and a hash of the deploy settings from
     `sqiff.yaml` (compose file, service, user, database, environment, sqitch steps;
     not the password). A change in those settings rebuilds from an empty volume.
-  - Not run against Docker here; only built.
+  - Run against Docker with a throwaway repository (`postgres:18`, sqitch on the host):
+    - The first run built the baseline.
+    - A second run reused it.
+    - Two runs at once both succeeded, one waiting with the message.
+    - Changing the baseline environment in `sqiff.yaml` rebuilt it from an empty volume.
 
 - [x] **One snapshot per described database (Codex 25).**
   - `withSharedSnapshot` starts a repeatable-read transaction on the first connection
