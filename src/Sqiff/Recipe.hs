@@ -879,46 +879,86 @@ privileges key object change = case (target, traverse asAcl change) of
         DefaultAcl
             | isRoutine object -> Set.singleton (Grant Public "EXECUTE" False ByOwner)
             | otherwise -> Set.empty
-    -- Grants another role gave are revoked first, and given last: a role passes on only
-    -- what it holds with the grant option. PostgreSQL takes no GRANTED BY but the
-    -- current role's, so those statements run as that role.
-    grantChanges onObject old new =
-        let byKey gs = Map.fromList [((g.grantor, g.grantee, g.privilege), g.grantable) | g <- Set.toList gs]
-            before = byKey old
-            now = byKey new
-            onTarget privilege = privilege <> " on " <> onObject
-            -- Granted anew, or given the grant option it lacked.
-            needsGrant grantable = \case
-                Nothing -> True
-                Just had -> grantable && not had
-            -- How far down a chain of grants a grant is: the owner's are first; one by a
-            -- role comes after the grant that gave that role the privilege.
-            depthIn held = go Set.empty
-              where
-                go seen (grantor, _, privilege) = case grantor of
-                    ByOwner -> 0 :: Int
-                    ByRole r
-                        | r `Set.member` seen -> 1
-                        | otherwise ->
-                            1 + fromMaybe 0 (L.maximumMaybe [go (Set.insert r seen) k | k@(_, grantee, p) <- Map.keys held, grantee == Role r, p == privilege])
-            revokes =
-                L.sortOn (\(k, _) -> Down (depthIn before k))
-                    $ [ (k, "revoke " <> onTarget privilege <> " from " <> granteeSql grantee)
-                      | (k@(_, grantee, privilege), _) <- Map.toList (before `Map.difference` now)
-                      ]
-                    <> [ (k, "revoke grant option for " <> onTarget privilege <> " from " <> granteeSql grantee)
-                       | (k@(_, grantee, privilege), (True, False)) <- Map.toList (Map.intersectionWith (,) before now)
-                       ]
-            grants =
-                L.sortOn (\(k, _) -> depthIn now k)
-                    $ [ (k, "grant " <> onTarget privilege <> " to " <> granteeSql grantee <> (if grantable then " with grant option" else ""))
-                      | (k@(_, grantee, privilege), grantable) <- Map.toList now
-                      , needsGrant grantable (Map.lookup k before)
-                      ]
-            asGrantor ((grantor, _, _), sql) = case grantor of
-                ByOwner -> step [] sql
-                ByRole r -> step [] (doBlock [i| begin set local role #{quoted r}; #{sql}; reset role; end |])
-         in map asGrantor (revokes <> grants)
+    -- PostgreSQL takes no GRANTED BY but the current role's, so a grant another role
+    -- gave runs as that role.
+    grantChanges onObject old new = map asGrantor (grantEdits old new)
+      where
+        asGrantor edit = case (grantEditKey edit).grantor of
+            ByOwner -> step [] (grantEditSql onObject edit)
+            ByRole r -> step [] (doBlock [i| begin set local role #{quoted r}; #{grantEditSql onObject edit}; reset role; end |])
+
+
+-- | One grant of a privilege on an object: who gave it, to whom, and what.
+data GrantKey = GrantKey
+    { grantor :: Grantor
+    , grantee :: Grantee
+    , privilege :: Text
+    }
+    deriving stock (Eq, Ord)
+
+
+-- | A change to an object's grants.
+data GrantEdit
+    = RevokeGrant GrantKey
+    | RevokeGrantOption GrantKey
+    | -- | Grants it, with the grant option when the flag is set.
+      GiveGrant GrantKey Bool
+
+
+grantEditKey :: GrantEdit -> GrantKey
+grantEditKey = \case
+    RevokeGrant k -> k
+    RevokeGrantOption k -> k
+    GiveGrant k _ -> k
+
+
+-- | What turns the grants @old@ into @new@. Grants another role gave are revoked first,
+-- and given last: a role passes on only what it holds with the grant option.
+grantEdits :: Set Grant -> Set Grant -> [GrantEdit]
+grantEdits old new = revokes <> grants
+  where
+    before = grantOptions old
+    now = grantOptions new
+    revokes =
+        L.sortOn (Down . grantDepth before . grantEditKey)
+            $ [RevokeGrant k | k <- Map.keys (before `Map.difference` now)]
+            <> [RevokeGrantOption k | (k, (True, False)) <- Map.toList (Map.intersectionWith (,) before now)]
+    grants =
+        L.sortOn
+            (grantDepth now . grantEditKey)
+            [GiveGrant k grantable | (k, grantable) <- Map.toList now, needsGrant grantable (Map.lookup k before)]
+    -- Granted anew, or given the grant option it lacked.
+    needsGrant grantable = \case
+        Nothing -> True
+        Just had -> grantable && not had
+
+
+-- | Each grant, with whether it has the grant option.
+grantOptions :: Set Grant -> Map GrantKey Bool
+grantOptions gs = Map.fromList [(GrantKey{grantor = g.grantor, grantee = g.grantee, privilege = g.privilege}, g.grantable) | g <- Set.toList gs]
+
+
+-- | How far down a chain of grants a grant is: the owner's are first; one by a role
+-- comes after the grant that gave that role the privilege.
+grantDepth :: Map GrantKey Bool -> GrantKey -> Int
+grantDepth held = go Set.empty
+  where
+    go seen k = case k.grantor of
+        ByOwner -> 0
+        ByRole r
+            | r `Set.member` seen -> 1
+            | otherwise ->
+                1 + fromMaybe 0 (L.maximumMaybe [go (Set.insert r seen) other | other <- Map.keys held, other.grantee == Role r, other.privilege == k.privilege])
+
+
+-- | The statement for a grant edit on @onObject@.
+grantEditSql :: Text -> GrantEdit -> Text
+grantEditSql onObject = \case
+    RevokeGrant k -> "revoke " <> onTarget k <> " from " <> granteeSql k.grantee
+    RevokeGrantOption k -> "revoke grant option for " <> onTarget k <> " from " <> granteeSql k.grantee
+    GiveGrant k grantable -> "grant " <> onTarget k <> " to " <> granteeSql k.grantee <> (if grantable then " with grant option" else "")
+  where
+    onTarget k = k.privilege <> " on " <> onObject
 
 
 comment :: Context -> ObjectKey -> Change Definition -> [Step]
