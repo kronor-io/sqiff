@@ -24,7 +24,7 @@ module Sqiff.Recipe (
 
 import Data.ByteString qualified as B
 import Data.Char (isAlphaNum)
-import Data.String.Interpolate (i)
+import Data.String.Interpolate (i, __i)
 import Data.Text qualified as T
 import RIO
 import RIO.List qualified as L
@@ -1086,18 +1086,16 @@ concurrentBuild index build =
         message = literal [i|index #{qualified index} is invalid from an earlier failed build; drop it first|]
         failIfInvalid =
             doBlock
-                ( T.unlines
-                    [ ""
-                    , "begin"
-                    , "    if exists ("
-                    , "        select from pg_index"
-                    , [i|        where indexrelid = to_regclass(#{regclass}) and not indisvalid|]
-                    , "    ) then"
-                    , [i|        raise exception using message = #{message};|]
-                    , "    end if;"
-                    , "end"
-                    ]
-                )
+                [__i|
+                    \nbegin
+                        if exists (
+                            select from pg_index
+                            where indexrelid = to_regclass(#{regclass}) and not indisvalid
+                        ) then
+                            raise exception using message = #{message};
+                        end if;
+                    end\n
+                |]
      in [i|#{failIfInvalid};\n\n#{build}|]
 
 

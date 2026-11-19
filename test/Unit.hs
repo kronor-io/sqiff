@@ -11,7 +11,7 @@ module Unit (tests) where
 
 import Data.Aeson (FromJSON)
 import Data.Aeson qualified as Aeson
-import Data.String.Interpolate (i)
+import Data.String.Interpolate (i, __i)
 import Data.Time (UTCTime (..), fromGregorian)
 import Hedgehog (Gen, forAll, property, (===))
 import Hedgehog.Gen qualified as Gen
@@ -333,20 +333,27 @@ plans =
         [ testCase "reads the project, changes and tags" do
             let p =
                     parsePlan
-                        . T.unlines
-                        $ [ "%syntax-version=1.0.0"
-                          , "%project=demo"
-                          , ""
-                          , "a 2024-01-01T00:00:00Z Me <me@example.com> # first"
-                          , "b [a] 2024-01-02T00:00:00Z Me <me@example.com> # second"
-                          , "@v1 2024-01-03T00:00:00Z Me <me@example.com> # tag"
-                          , "c 2024-01-04T00:00:00Z Me <me@example.com> # third"
-                          ]
+                        [__i|
+                            %syntax-version=1.0.0
+                            %project=demo
+
+                            a 2024-01-01T00:00:00Z Me <me@example.com> \# first
+                            b [a] 2024-01-02T00:00:00Z Me <me@example.com> \# second
+                            @v1 2024-01-03T00:00:00Z Me <me@example.com> \# tag
+                            c 2024-01-04T00:00:00Z Me <me@example.com> \# third\n
+                        |]
             p.project @?= "demo"
             p.changes @?= ["a", "b", "c"]
             p.tagged @?= Set.fromList ["a", "b"]
         , testCase "a reworked change is tagged only if its last entry is" do
-            let p = parsePlan (T.unlines ["%project=demo", "a x", "@v1 x", "a x"])
+            let p =
+                    parsePlan
+                        [__i|
+                            %project=demo
+                            a x
+                            @v1 x
+                            a x\n
+                        |]
             p.changes @?= ["a", "a"]
             p.tagged @?= Set.empty
         ]
@@ -419,7 +426,13 @@ columns =
         "definitions"
         [ testCase "a column decodes and prints as before" do
             c <- decode @ColumnDef "{\"type\": \"integer\", \"collation\": \"C\", \"not_null\": {\"validated\": true, \"name\": \"x_nn\"}, \"expression\": \"42\"}"
-            printed (ColumnDefinition c) @?= T.intercalate "\n" ["type integer", "collate \"C\"", "not null constraint x_nn", "default 42"]
+            printed (ColumnDefinition c)
+                @?= [__i|
+                    type integer
+                    collate "C"
+                    not null constraint x_nn
+                    default 42
+                |]
         , testCase "NOT VALID, identity and its options" do
             c <- decode @ColumnDef "{\"type\": \"bigint\", \"not_null\": {\"validated\": false}, \"identity\": \"by default\", \"identity_options\": [\"increment by 5\"]}"
             c.nullability @?= NotNull NotValidated Nothing

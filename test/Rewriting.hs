@@ -1,12 +1,14 @@
 {-# LANGUAGE DisambiguateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Byte-for-byte tests of rewriting a table's deploy file: the text it keeps, where it
 -- puts what it adds, what it removes with a statement, and the differences it leaves.
 module Rewriting (tests) where
 
+import Data.String.Interpolate (__i)
 import RIO
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
@@ -113,26 +115,26 @@ notNull = NotNull Validated Nothing
 unchanged :: Assertion
 unchanged = do
     let file =
-            T.unlines
-                [ "-- Deploy app:widgets to pg"
-                , ""
-                , "begin;"
-                , ""
-                , "create table app.widgets ("
-                , "    id bigint not null,"
-                , "    -- what it is called"
-                , "    name text, -- shown to people"
-                , "    qty integer,"
-                , "    constraint widgets_qty_check check (qty > 0)"
-                , ");"
-                , ""
-                , "create index widgets_name_idx"
-                , "    on app.widgets (name);"
-                , ""
-                , "comment on table app.widgets is 'Things';"
-                , ""
-                , "commit;"
-                ]
+            [__i|
+                -- Deploy app:widgets to pg
+
+                begin;
+
+                create table app.widgets (
+                    id bigint not null,
+                    -- what it is called
+                    name text, -- shown to people
+                    qty integer,
+                    constraint widgets_qty_check check (qty > 0)
+                );
+
+                create index widgets_name_idx
+                    on app.widgets (name);
+
+                comment on table app.widgets is 'Things';
+
+                commit;\n
+            |]
         schema =
             Map.fromList
                 [ tableRow plainTable
@@ -149,30 +151,30 @@ unchanged = do
 mixed :: Assertion
 mixed = do
     let file =
-            T.unlines
-                [ "-- Deploy app:widgets to pg"
-                , ""
-                , "begin;"
-                , ""
-                , "create table app.widgets ("
-                , "    id bigint not null,"
-                , "    -- the old name"
-                , "    label text,"
-                , "    qty integer, -- how many"
-                , "    constraint widgets_qty_check check (qty > 0)"
-                , ");"
-                , ""
-                , "create index widgets_label_idx"
-                , "    on app.widgets (label);"
-                , ""
-                , "create index widgets_qty_idx on app.widgets (qty);"
-                , ""
-                , "comment on table app.widgets is 'Things';"
-                , ""
-                , "comment on column app.widgets.label is 'Old label';"
-                , ""
-                , "commit;"
-                ]
+            [__i|
+                -- Deploy app:widgets to pg
+
+                begin;
+
+                create table app.widgets (
+                    id bigint not null,
+                    -- the old name
+                    label text,
+                    qty integer, -- how many
+                    constraint widgets_qty_check check (qty > 0)
+                );
+
+                create index widgets_label_idx
+                    on app.widgets (label);
+
+                create index widgets_qty_idx on app.widgets (qty);
+
+                comment on table app.widgets is 'Things';
+
+                comment on column app.widgets.label is 'Old label';
+
+                commit;\n
+            |]
         fromFile =
             Map.fromList
                 [ tableRow plainTable
@@ -198,31 +200,31 @@ mixed = do
                 , commentRow (Column widgets (identifier "title")) "What it is called"
                 ]
     rewrite fromFile live file
-        `rewritesTo` ( T.unlines
-                        [ "-- Deploy app:widgets to pg"
-                        , ""
-                        , "begin;"
-                        , ""
-                        , "create table app.widgets ("
-                        , "    id bigint not null,"
-                        , "    qty bigint, -- how many"
-                        , "    title text not null,"
-                        , "    constraint widgets_qty_check check ((qty >= 0))"
-                        , ");"
-                        , ""
-                        , "create index if not exists widgets_qty_idx"
-                        , "    on app.widgets (qty DESC);"
-                        , ""
-                        , "create unique index if not exists widgets_title_idx"
-                        , "    on app.widgets (title);"
-                        , ""
-                        , "comment on table app.widgets is 'Widgets, it''s said';"
-                        , ""
-                        , "comment on column app.widgets.title is"
-                        , "    'What it is called';"
-                        , ""
-                        , "commit;"
-                        ]
+        `rewritesTo` ( [__i|
+                           -- Deploy app:widgets to pg
+
+                           begin;
+
+                           create table app.widgets (
+                               id bigint not null,
+                               qty bigint, -- how many
+                               title text not null,
+                               constraint widgets_qty_check check ((qty >= 0))
+                           );
+
+                           create index if not exists widgets_qty_idx
+                               on app.widgets (qty DESC);
+
+                           create unique index if not exists widgets_title_idx
+                               on app.widgets (title);
+
+                           comment on table app.widgets is 'Widgets, it''s said';
+
+                           comment on column app.widgets.title is
+                               'What it is called';
+
+                           commit;\n
+                       |]
                      , []
                      )
 
@@ -230,30 +232,30 @@ mixed = do
 removals :: Assertion
 removals = do
     let file =
-            T.unlines
-                [ "begin;"
-                , ""
-                , "create table app.widgets ("
-                , "    id bigint not null,"
-                , ""
-                , "    -- Kept for old clients."
-                , "    -- Remove after the migration."
-                , "    legacy text,"
-                , "    -- Details"
-                , ""
-                , "    notes text,"
-                , "    name text"
-                , ");"
-                , ""
-                , "-- Lookups by name."
-                , "create index widgets_name_idx on app.widgets (name);"
-                , ""
-                , "-- The legacy column's comment."
-                , "comment on column app.widgets.legacy is 'Old';"
-                , "comment on column app.widgets.name is 'Name';"
-                , ""
-                , "commit;"
-                ]
+            [__i|
+                begin;
+
+                create table app.widgets (
+                    id bigint not null,
+
+                    -- Kept for old clients.
+                    -- Remove after the migration.
+                    legacy text,
+                    -- Details
+
+                    notes text,
+                    name text
+                );
+
+                -- Lookups by name.
+                create index widgets_name_idx on app.widgets (name);
+
+                -- The legacy column's comment.
+                comment on column app.widgets.legacy is 'Old';
+                comment on column app.widgets.name is 'Name';
+
+                commit;\n
+            |]
         fromFile =
             Map.fromList
                 [ tableRow plainTable
@@ -273,20 +275,20 @@ removals = do
                 , commentRow (Column widgets (identifier "name")) "Name"
                 ]
     rewrite fromFile live file
-        `rewritesTo` ( T.unlines
-                        [ "begin;"
-                        , ""
-                        , "create table app.widgets ("
-                        , "    id bigint not null,"
-                        , "    -- Details"
-                        , ""
-                        , "    name text"
-                        , ");"
-                        , ""
-                        , "comment on column app.widgets.name is 'Name';"
-                        , ""
-                        , "commit;"
-                        ]
+        `rewritesTo` ( [__i|
+                           begin;
+
+                           create table app.widgets (
+                               id bigint not null,
+                               -- Details
+
+                               name text
+                           );
+
+                           comment on column app.widgets.name is 'Name';
+
+                           commit;\n
+                       |]
                      , []
                      )
 
@@ -294,17 +296,17 @@ removals = do
 anchoredOnTable :: Assertion
 anchoredOnTable = do
     let file =
-            T.unlines
-                [ "begin;"
-                , ""
-                , "create table app.widgets ("
-                , "    id bigint not null"
-                , ");"
-                , ""
-                , "create index widgets_old_idx on app.widgets (id);"
-                , ""
-                , "commit;"
-                ]
+            [__i|
+                begin;
+
+                create table app.widgets (
+                    id bigint not null
+                );
+
+                create index widgets_old_idx on app.widgets (id);
+
+                commit;\n
+            |]
         fromFile =
             Map.fromList
                 [ tableRow plainTable
@@ -320,25 +322,25 @@ anchoredOnTable = do
                 , commentRow (Column widgets (identifier "id")) "Line one\nline two"
                 ]
     rewrite fromFile live file
-        `rewritesTo` ( T.unlines
-                        [ "begin;"
-                        , ""
-                        , "create table app.widgets ("
-                        , "    id bigint not null"
-                        , ");"
-                        , ""
-                        , "create index if not exists widgets_id_idx"
-                        , "    on app.widgets using hash (id);"
-                        , ""
-                        , "comment on table app.widgets is"
-                        , "    'Things';"
-                        , ""
-                        , "comment on column app.widgets.id is"
-                        , "    $comment$Line one"
-                        , "line two$comment$;"
-                        , ""
-                        , "commit;"
-                        ]
+        `rewritesTo` ( [__i|
+                           begin;
+
+                           create table app.widgets (
+                               id bigint not null
+                           );
+
+                           create index if not exists widgets_id_idx
+                               on app.widgets using hash (id);
+
+                           comment on table app.widgets is
+                               'Things';
+
+                           comment on column app.widgets.id is
+                               $comment$Line one
+                           line two$comment$;
+
+                           commit;\n
+                       |]
                      , []
                      )
 
@@ -346,13 +348,13 @@ anchoredOnTable = do
 noTable :: Assertion
 noTable = do
     let file =
-            T.unlines
-                [ "begin;"
-                , ""
-                , "select 1;"
-                , ""
-                , "commit;"
-                ]
+            [__i|
+                begin;
+
+                select 1;
+
+                commit;\n
+            |]
         fromFile =
             Map.fromList
                 [ tableRow plainTable
@@ -379,17 +381,17 @@ noTable = do
 settings :: Assertion
 settings = do
     let file =
-            T.unlines
-                [ "begin;"
-                , ""
-                , "create table app.widgets ("
-                , "    id bigint not null"
-                , ");"
-                , ""
-                , "create index widgets_id_idx on app.widgets (id);"
-                , ""
-                , "commit;"
-                ]
+            [__i|
+                begin;
+
+                create table app.widgets (
+                    id bigint not null
+                );
+
+                create index widgets_id_idx on app.widgets (id);
+
+                commit;\n
+            |]
         fromFile =
             Map.fromList
                 [ tableRow plainTable
@@ -403,20 +405,20 @@ settings = do
                 , indexRow "widgets_id_idx" "CREATE INDEX widgets_id_idx ON app.widgets USING btree (id)"
                 ]
     rewrite fromFile live file
-        `rewritesTo` ( T.unlines
-                        [ "begin;"
-                        , ""
-                        , "create table app.widgets ("
-                        , "    id bigint not null"
-                        , ") with (fillfactor=70);"
-                        , ""
-                        , "alter table app.widgets enable row level security;"
-                        , ""
-                        , "alter table app.widgets force row level security;"
-                        , ""
-                        , "create index widgets_id_idx on app.widgets (id);"
-                        , ""
-                        , "commit;"
-                        ]
+        `rewritesTo` ( [__i|
+                           begin;
+
+                           create table app.widgets (
+                               id bigint not null
+                           ) with (fillfactor=70);
+
+                           alter table app.widgets enable row level security;
+
+                           alter table app.widgets force row level security;
+
+                           create index widgets_id_idx on app.widgets (id);
+
+                           commit;\n
+                       |]
                      , []
                      )
