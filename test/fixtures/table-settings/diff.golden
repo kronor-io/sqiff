@@ -1,0 +1,7 @@
+changed table public.t
+  - with (fillfactor=70)
+  + unlogged
+  + row level security
+  + force row level security
+  + with (fillfactor=80, autovacuum_enabled=false)
+0 added, 0 dropped, 1 changed

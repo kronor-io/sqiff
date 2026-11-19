@@ -1,0 +1,12 @@
+changed table public.t (privileges)
+  - default
+  + reader SELECT
+  + sqiff DELETE
+  + sqiff INSERT
+  + sqiff MAINTAIN
+  + sqiff REFERENCES
+  + sqiff SELECT
+  + sqiff TRIGGER
+  + sqiff TRUNCATE
+  + sqiff UPDATE
+0 added, 0 dropped, 1 changed

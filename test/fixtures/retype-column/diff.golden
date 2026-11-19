@@ -1,0 +1,4 @@
+changed table column public.t.amount
+  - type integer
+  + type bigint
+0 added, 0 dropped, 1 changed

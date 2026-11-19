@@ -11,7 +11,7 @@ import RIO
 import RIO.Directory (canonicalizePath, doesDirectoryExist, doesFileExist, makeAbsolute)
 import RIO.FilePath (makeRelative, takeDirectory, (</>))
 import RIO.Text qualified as T
-import Sqiff.Catalog (failWith)
+import Sqiff.Connection (failWith)
 import System.Process.Typed (ProcessConfig, nullStream, proc, readProcess, setStdin, setWorkingDir)
 
 

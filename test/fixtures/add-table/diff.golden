@@ -1,0 +1,9 @@
+added   table app.account
+added   table column app.account.created_at
+added   table column app.account.email
+added   table column app.account.id
+added   table constraint app.account.account_email_key
+added   table constraint app.account.account_pkey
+added   sequence app.account_id_seq (privileges)
+added   table app.account (privileges)
+8 added, 0 dropped, 0 changed

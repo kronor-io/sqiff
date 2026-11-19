@@ -1,0 +1,15 @@
+-- function app.next_code
+CREATE OR REPLACE FUNCTION app.next_code()
+ RETURNS text
+ LANGUAGE sql
+AS $function$select md5(random()::text)$function$;
+
+-- table app.voucher
+create table app.voucher (
+    id integer not null,
+    code text not null default app.next_code()
+);
+
+-- table constraint app.voucher.voucher_pkey
+alter table app.voucher add constraint voucher_pkey PRIMARY KEY (id);
+

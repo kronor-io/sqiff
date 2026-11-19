@@ -1,6 +1,8 @@
--- Like depend.sql, limited to edges whose referenced end is in $4, $5 and $6. The
--- pg_depend rows are found through the reference index, for each target and for every
--- view rule, column default and type that stands for one.
+-- Like depend.sql, for the pg_depend rows that reference one of $1, $2 and $3, or a view
+-- rule, column default or type that stands for one. The caller keeps the edges whose
+-- referenced end is a target and whose ends are both described: done here, those checks
+-- compare every edge with every target, as the planner cannot tell how many the arrays
+-- hold.
 with remap (classid, objid, toclassid, toobjid, tosubid) as (
     select 'pg_rewrite'::regclass::oid, rw.oid, 'pg_class'::regclass::oid, rw.ev_class, 0
     from pg_rewrite rw
@@ -26,7 +28,7 @@ with remap (classid, objid, toclassid, toobjid, tosubid) as (
 ),
 target as (
     select k.classid::oid, k.objid::oid, k.objsubid
-    from unnest($4::int8[], $5::int8[], $6::int4[]) as k (classid, objid, objsubid)
+    from unnest($1::int8[], $2::int8[], $3::int4[]) as k (classid, objid, objsubid)
 ),
 referenced as (
     select t.classid, t.objid from target t
@@ -50,10 +52,6 @@ edge as (
     where d.deptype in ('n', 'a', 'i')
         and d.objid >= 16384
         and d.refobjid >= 16384
-),
-described as (
-    select k.classid::oid, k.objid::oid, k.objsubid
-    from unnest($1::int8[], $2::int8[], $3::int4[]) as k (classid, objid, objsubid)
 )
 select
     coalesce(array_agg(e.classid::int8), '{}'),
@@ -64,6 +62,3 @@ select
     coalesce(array_agg(e.refobjsubid::int4), '{}')
 from edge e
 where (e.classid, e.objid, e.objsubid) is distinct from (e.refclassid, e.refobjid, e.refobjsubid)
-    and exists (select from target k where k.classid = e.refclassid and k.objid = e.refobjid and k.objsubid = e.refobjsubid)
-    and exists (select from described k where k.classid = e.classid and k.objid = e.objid and k.objsubid = e.objsubid)
-    and exists (select from described k where k.classid = e.refclassid and k.objid = e.refobjid and k.objsubid = e.refobjsubid)

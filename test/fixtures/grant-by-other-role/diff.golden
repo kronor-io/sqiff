@@ -1,0 +1,3 @@
+changed table public.u (privileges)
+  + analyst SELECT granted by reader
+0 added, 0 dropped, 1 changed

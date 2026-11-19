@@ -1,0 +1,6 @@
+-- table public.t
+comment on table public.t is 'new';
+
+-- table column public.t.a
+comment on column public.t.a is 'the a';
+

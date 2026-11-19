@@ -33,10 +33,14 @@ import Hasql.TH (singletonStatement, vectorStatement)
 import RIO
 import RIO.Char (isAlphaNum, isSpace)
 import RIO.List (scanl)
+import RIO.List qualified as L
 import RIO.Map qualified as Map
-import Sqiff.Catalog (Address (..), Aspect (..), ObjectKey (..), Partitions (..), Schema, describeOn, errorPosition, errorText, failWith, serverError)
-import Sqiff.Diff (Change (..), diff)
-import Sqiff.Object
+import Sqiff.Catalog (Partitions (..), describeOn)
+import Sqiff.Connection (errorPosition, errorText, failWith, inRolledBackTransaction, serverError)
+import Sqiff.Definition (Definition (..), IndexDef (..), TableDef (..), mapNames, mapText)
+import Sqiff.Diff (Change (..), Changes, diff)
+import Sqiff.Identifier
+import Sqiff.Model
 import Sqiff.Timing (timed)
 
 
@@ -98,10 +102,17 @@ typeChangeFacts conn old new =
         altered <- Connection.use conn (Session.script [i|alter table pg_temp.sqiff_retype alter column c type #{new} using c::#{new}|])
         after <- fileNode
         domain <- Connection.use conn (Session.statement new isDomain)
-        pure case (made, before, altered, after, domain) of
-            (Right (), Right b, Right (), Right a, Right d) -> Just (TypeChange (if a /= b then RewritesFiles else KeepsFiles) (if d then DomainType else PlainType))
-            _ -> Nothing
+        case (made, before, altered, after, domain) of
+            (Right (), Right b, Right (), Right a, Right d) -> pure (Just (TypeChange (if a /= b then RewritesFiles else KeepsFiles) (if d then DomainType else PlainType)))
+            results -> do
+                -- PostgreSQL refusing the probe means the facts are unknown; losing the
+                -- connection is an error.
+                let errors = lefts' results
+                for_ (L.find (isNothing . serverError) errors) \e -> failWith [i|the type change check failed: #{errorText e}|]
+                pure Nothing
   where
+    lefts' (a, b, c, d, e) = catMaybes [leftOf a, leftOf b, leftOf c, leftOf d, leftOf e]
+    leftOf = either Just (const Nothing)
     fileNode =
         Connection.use conn
             $ Session.statement
@@ -119,16 +130,14 @@ typeChangeFacts conn old new =
 
 -- | Runs @action@ in a transaction that is always rolled back.
 rolledBack :: Connection.Connection -> Text -> IO a -> IO a
-rolledBack conn label action = do
-    Connection.use conn (Session.script "begin") >>= either (\e -> failWith [i|#{label} could not start: #{errorText e}|]) pure
-    action `finally` void (Connection.use conn (Session.script "rollback"))
+rolledBack = inRolledBackTransaction
 
 
 -- | The table's column names in the table's order.
-columnOrder :: Connection.Connection -> QName -> IO [Text]
+columnOrder :: Connection.Connection -> QName -> IO [Identifier]
 columnOrder conn table =
     Connection.use conn (Session.statement (qualified table) query)
-        >>= either (\e -> failWith [i|could not read the columns of #{qualified table}: #{errorText e}|]) (pure . toList)
+        >>= either (\e -> failWith [i|could not read the columns of #{qualified table}: #{errorText e}|]) (pure . map identifier . toList)
   where
     query =
         [vectorStatement|
@@ -157,14 +166,15 @@ firstFailure conn statements = do
 data TableEdit = TableEdit
     { current :: Schema
     , desired :: Schema
-    , changes :: Map ObjectKey Change
+    , changes :: Changes
     , ignored :: [(ObjectKey, Text)]
     -- ^ Differences left out, with the reason.
     }
 
 
-aside :: Text
-aside = "sqiff_aside"
+-- | The schema the table moves to while the file builds it again.
+aside :: Identifier
+aside = identifier "sqiff_aside"
 
 
 -- | What the edited file is compared with.
@@ -212,8 +222,7 @@ withEditedTable conn baseline table statements beforeEdit afterEdit = snd <$> ed
 editTable :: Describing -> Connection.Connection -> Baseline -> QName -> [Text] -> IO b -> (b -> IO a) -> IO (TableEdit, a)
 editTable describing conn baseline table statements beforeEdit afterEdit = do
     (current, desired, afterResult) <-
-        ( do
-            script "begin"
+        inRolledBackTransaction conn "the table comparison" do
             xact <- currentXact
             script "set local lock_timeout = '5s'"
             exists <-
@@ -226,8 +235,8 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
                     >>= either setupFailed (pure . toList)
             for_ (filter (\s -> any ((s `T.isInfixOf`) . withoutLineComments) (statements <> baseStatements)) owned) \s ->
                 script [i|alter sequence #{tableSchemaRef}#{quoteIdent s} owned by none|]
-            script [i|create schema #{aside}|]
-            script [i|alter table #{qualified table} set schema #{aside}|]
+            script [i|create schema #{quoted aside}|]
+            script [i|alter table #{qualified table} set schema #{quoted aside}|]
             current <- timed "tableEdit.current" case baseline of
                 _ | describing == SkipDescribe -> pure Map.empty
                 BaseFile base -> do
@@ -244,8 +253,6 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             desired <- timed "tableEdit.desired" $ build xact "" statements
             afterResult <- timed "tableEdit.after" $ afterEdit beforeResult
             pure (current, desired, afterResult)
-        )
-            `finally` void (Connection.use conn (Session.script "rollback"))
     let kept = case baseline of
             BaseFile _ -> desired
             LiveTable _ _ -> Map.mapWithKey (keepSettings current) desired
@@ -309,33 +316,37 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
         let within = maybe "" (\c -> [i|, in constraint #{c}|]) (constraintAt statement =<< errorPosition e) :: Text
          in [i|the deploy file#{label} failed on --db at statement #{n}#{within}: #{errorText e}|]
 
-    asideRef = [i|#{quoteIdent aside}.|] :: Text
-    tableSchemaRef = let schema = quoteIdent table.schema in [i|#{schema}.|] :: Text
+    asideRef = quoted aside <> "."
+    tableSchemaRef = quoted table.schema <> "."
 
-    moveBack k = case k.address.objectNames of
-        s : rest | s == aside -> k{address = k.address{objectNames = table.schema : rest}}
-        _ -> k
+    fromAside q = if q.schema == aside then q{schema = table.schema} else q
 
-    restore = T.replace asideRef tableSchemaRef
+    moveBack k = k{object = mapQNames fromAside k.object}
 
-    belongsTo q k def = case fromAddress k.address of
+    restore = mapNames fromAside . mapText (T.replace asideRef tableSchemaRef)
+
+    belongsTo q k def = case k.object of
         Table t -> t == q
-        Index _ -> any (`T.isInfixOf` def) [[i| ON #{qualified q} |], [i| ON ONLY #{qualified q} |]]
+        Index _ | IndexDefinition ix <- def -> ix.table == q
         Sequence _ -> False
         o -> owningTable o == Just q
 
-    keepSettings current k def = case (fromAddress k.address, k.aspect, Map.lookup k current) of
-        (Table _, Definition, Just old) ->
-            let settings = filter (\l -> l `elem` ["row level security", "force row level security"] || "with (" `T.isPrefixOf` l) (T.lines old)
-                missing = filter (`notElem` T.lines def) settings
-                hasOptions = any ("with (" `T.isPrefixOf`) (T.lines def)
-             in T.intercalate "\n" (T.lines def <> filter (\l -> not ("with (" `T.isPrefixOf` l && hasOptions)) missing)
+    keepSettings current k def = case (k.object, k.aspect, Map.lookup k current) of
+        -- Settings the file leaves out stay as the table has them.
+        (Table _, Definition, Just (TableDefinition old))
+            | TableDefinition new <- def ->
+                TableDefinition
+                    new
+                        { rowSecurity = new.rowSecurity || old.rowSecurity
+                        , forceRowSecurity = new.forceRowSecurity || old.forceRowSecurity
+                        , options = if null new.options then old.options else new.options
+                        }
         _ -> def
 
     leftOut k c
         | BaseFile _ <- baseline = Nothing
         | k.aspect == Privileges = Just "grants are kept outside table files"
-        | otherwise = case (fromAddress k.address, c) of
+        | otherwise = case (k.object, c) of
             (Index _, Dropped _) -> Just "not in the file; indexes are often kept in their own files"
             (Trigger _ _, Dropped _) -> Just "not in the file; triggers are kept in their own files"
             (Policy _ _, Dropped _) -> Just "not in the file; policies may be kept in other files"

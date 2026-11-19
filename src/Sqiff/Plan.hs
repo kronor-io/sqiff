@@ -3,141 +3,196 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
--- | Orders recipe steps: drops before creates, then by rank, then by dependencies.
-module Sqiff.Plan (plan, planWith, context, invert, renderStep, topoOrder) where
+-- | Orders recipe steps: drops before creates, each after what it depends on.
+module Sqiff.Plan (
+    plan,
+    planWith,
+    DependencyCycle (..),
+    cycleMessage,
+    context,
+    invert,
+    renderStep,
+    topoOrder,
+) where
 
-import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import Sqiff.Body (BodyCheck)
-import Sqiff.Catalog (Aspect (..), Edge (..), ObjectKey (..), Schema, render)
-import Sqiff.Diff (Change (..))
-import Sqiff.Object
+import Sqiff.Definition
+import Sqiff.Dependencies (Dependencies, edges)
+import Sqiff.Diff (Change (..), Changes, invert)
+import Sqiff.Graph (schedule, topoOrder)
+import Sqiff.Model
 import Sqiff.Recipe
 
 
--- | @fromEdges@ come from the database being changed; @toEdges@ and @checks@ from the desired one.
-plan :: Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> [Edge] -> Map ObjectKey Change -> [Step]
+-- | Objects whose steps depend on each other in a circle, so no order works.
+newtype DependencyCycle = DependencyCycle (NonEmpty ObjectId)
+    deriving stock (Eq, Show)
+
+
+cycleMessage :: DependencyCycle -> Text
+cycleMessage (DependencyCycle objects) =
+    "no order satisfies the dependencies between these objects; change them by hand: "
+        <> T.intercalate ", " (map render (toList objects))
+
+
+-- | @fromDeps@ come from the database being changed; @toDeps@ and @checks@ from the desired one.
+plan :: Map ObjectKey BodyCheck -> Schema -> Schema -> Dependencies -> Dependencies -> Changes -> Either DependencyCycle [Step]
 plan = planWith id
 
 
 -- | 'plan' with the context adjusted first.
-planWith :: (Context -> Context) -> Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> [Edge] -> Map ObjectKey Change -> [Step]
-planWith adjust checks fromSchema toSchema fromEdges toEdges changes =
-    map snd
-        $ L.sortOn
-            fst
-            [ ((s.phase, s.rank, position s, n), s)
-            | (n, s) <- zip [0 :: Int ..] (concatMap (uncurry (recipe (adjust (context checks fromSchema toSchema fromEdges changes)))) (Map.toList changes))
-            ]
+--
+-- Drops come before creates. Within each phase a step waits for what it depends on:
+-- creating an object waits for the objects it uses, and dropping one waits for its
+-- dependents' drops. Among the steps that are ready, the kind of object decides (its
+-- rank), then the dependency order of the objects, then the order the recipes gave.
+planWith :: (Context -> Context) -> Map ObjectKey BodyCheck -> Schema -> Schema -> Dependencies -> Dependencies -> Changes -> Either DependencyCycle [Step]
+planWith adjust checks fromSchema toSchema fromDeps toDeps changes = do
+    drops <- inPhase DropPhase [(b, a) | (a, b) <- withOwners fromDeps, not (owns a b)]
+    creates <- inPhase CreatePhase (withOwners toDeps)
+    pure (drops <> creates)
   where
-    stepObjects = Set.fromList [fromAddress k.address | k <- Map.keys changes]
+    ctx = adjust (context checks fromSchema toSchema fromDeps changes)
+    steps = concatMap (uncurry (recipe ctx)) (Map.toList changes)
+    stepObjects = Set.fromList [k.object | k <- Map.keys changes]
 
-    withOwners edges =
-        [(fromAddress e.dependent, fromAddress e.referenced) | e <- edges]
+    withOwners deps =
+        [(e.dependent, e.referenced) | e <- edges deps]
             <> [(o, Table t) | o <- Set.toList stepObjects, Just t <- [owningTable o]]
 
-    createOrder = indexOf (topoOrder stepObjects (withOwners toEdges))
-    dropOrder = indexOf (topoOrder stepObjects [(b, a) | (a, b) <- withOwners fromEdges])
+    createOrder = indexOf (topoOrder stepObjects (withOwners toDeps))
+    dropOrder = indexOf (topoOrder stepObjects [(b, a) | (a, b) <- withOwners fromDeps])
     indexOf xs = Map.fromList (zip xs [0 :: Int ..])
-
     position s = Map.findWithDefault maxBound s.object (if s.phase == DropPhase then dropOrder else createOrder)
 
+    -- The phase's steps in order, where @(a, b)@ in @pairs@ means a's steps wait for b's.
+    -- Steps are known by their number in 'steps'.
+    inPhase phase pairs =
+        let numbered = [(n, s) | (n, s) <- zip [0 :: Int ..] steps, s.phase == phase]
+            priority (n, s) = (s.rank, position s, n)
+            byObject = Map.fromListWith (flip (<>)) [(s.object, [n]) | (n, s) <- L.sortOn priority numbered]
+            stepsOf o = Map.findWithDefault [] o byObject
+            -- An object's own steps keep their order.
+            chained = [(later, earlier) | ns <- Map.elems byObject, (earlier, later) <- zip ns (drop 1 ns)]
+            -- a's first step waits for b's main step when creating, as b exists from
+            -- then on, and for b's last step when dropping, as b is gone after it. A new
+            -- table's columns have no steps: the table's waits for what they use.
+            waits =
+                [ (waiting, waited)
+                | (a, b) <- pairs
+                , a /= b
+                , let a' = if null (stepsOf a) then maybe a Table (owningTable a) else a
+                , a' /= b
+                , waiting <- waitingSteps phase a' b (stepsOf a')
+                , waited <- if phase == CreatePhase then mainStep b else take 1 (reverse (stepsOf b))
+                ]
+            -- The step that makes or replaces the object, not one that changes its
+            -- settings, grants or comment.
+            mainStep b = take 1 [n | n <- stepsOf b, Just s <- [Map.lookup n stepAt], s.rank == createRank b]
+         in case schedule fst priority numbered (chained <> waits) of
+                Right placed -> Right (map snd placed)
+                Left (_, (_, b) : bs) -> Left (DependencyCycle (b.object :| filter (/= b.object) (nubOrd (map ((.object) . snd) bs))))
+                Left (placed, []) -> Right (map snd placed)
 
--- | @checks@ were made against @toSchema@'s definitions; @fromEdges@ come from the
+    stepAt = Map.fromList (zip [0 :: Int ..] steps)
+
+    -- The steps of a that wait for b: its first, or, for a sequence's ownership by a
+    -- column, the step that sets the owner. The sequence itself comes first, as the
+    -- column's default uses it.
+    waitingSteps phase a b ns
+        | phase == CreatePhase, owns a b = [n | n <- ns, Just s <- [Map.lookup n stepAt], s.rank == sequenceOwnerRank]
+        | otherwise = take 1 ns
+
+    -- A sequence owned by a column: dropping the column drops the sequence.
+    owns a b = case (a, b) of
+        (Sequence _, Column{}) -> True
+        _ -> False
+
+
+-- | @checks@ were made against @toSchema@'s definitions; @fromDeps@ come from the
 -- database being changed.
-context :: Map ObjectKey BodyCheck -> Schema -> Schema -> [Edge] -> Map ObjectKey Change -> Context
-context checks fromSchema toSchema fromEdges changes =
+context :: Map ObjectKey BodyCheck -> Schema -> Schema -> Dependencies -> Changes -> Context
+context checks fromSchema toSchema fromDeps changes =
     Context
-        { bodyChecks = Map.intersectionWith (,) toSchema checks
-        , withDependents = Set.fromList [fromAddress e.referenced | e <- fromEdges]
+        { bodyChecks = Map.intersectionWith (,) (Map.map printed toSchema) checks
+        , withDependents = Set.fromList [e.referenced | e <- edges fromDeps]
         , recreatedViews =
             Map.fromList
-                [ (v, (indexesOn v, (grantsKey,) <$> Map.lookup grantsKey toSchema))
+                [ (v, (indexesOn v, (grantsKey,) <$> mfilter explicit (Map.lookup grantsKey toSchema)))
                 | (k, Changed _ _) <- Map.toList changes
                 , k.aspect == Definition
                 , let grantsKey = k{aspect = Privileges}
-                , MaterializedView v <- [fromAddress k.address]
+                , Just v <- [case k.object of MaterializedView v -> Just v; View v -> Just v; _ -> Nothing]
+                ]
+        , keptComments =
+            Map.fromList
+                [ (k.object, printed def)
+                | (k, def) <- Map.toList toSchema
+                , k.aspect == Comment
+                , k `Map.notMember` changes
                 ]
         , newTables = tablesWith isAdded
         , droppedTables = tablesWith isDropped
         , partitionedTables =
             Set.fromList
                 [ t
-                | (k, def) <- Map.toList fromSchema <> Map.toList toSchema
+                | (k, TableDefinition def) <- Map.toList fromSchema <> Map.toList toSchema
                 , k.aspect == Definition
-                , any ("partition by " `T.isPrefixOf`) (T.lines def)
-                , Table t <- [fromAddress k.address]
+                , isJust def.partitionBy
+                , Table t <- [k.object]
                 ]
         , droppedColumns = Set.fromList [(t, c) | (Column t c, Dropped _) <- definitions]
         , retypedColumns =
             Set.fromList
                 [ (t, c)
-                | (Column t c, Changed old new) <- definitions
-                , let o = parseColumn old
-                      n = parseColumn new
+                | (Column t c, Changed (ColumnDefinition o) (ColumnDefinition n)) <- definitions
                 , o.colType /= n.colType || o.collation /= n.collation
                 ]
         , viewsAround = Map.empty
-        , droppedObjects = Set.fromList [k.address | (k, Dropped _) <- Map.toList changes, k.aspect == Definition]
+        , droppedObjects = Set.fromList [k.object | (k, Dropped _) <- Map.toList changes, k.aspect == Definition]
+        , viewDependents = Map.empty
+        , convertedSequences =
+            Set.fromList
+                [ s
+                | (Sequence s, change) <- definitions
+                , Just def <- [asSequence (case change of Added d -> d; Dropped d -> d; Changed _ d -> d)]
+                , Just (t, c) <- [def.ownedBy]
+                , Just (Changed (ColumnDefinition old) (ColumnDefinition new)) <- [lookup (Column t c) definitions]
+                , isJust (identityKindOf old) /= isJust (identityKindOf new)
+                ]
         , newTableColumns =
-            Map.fromListWith
-                (flip (<>))
-                [(t, [(c, parseColumn def)]) | (Column t c, Added def) <- definitions, t `Set.member` tablesWith isAdded]
+            Map.map (L.sortOn (\(_, def) -> positionNumber def.position))
+                . Map.fromListWith (flip (<>))
+                $ [(t, [(c, def)]) | (Column t c, Added (ColumnDefinition def)) <- definitions, t `Set.member` tablesWith isAdded]
         }
   where
-    definitions = [(fromAddress k.address, change) | (k, change) <- Map.toList changes, k.aspect == Definition]
+    definitions = [(k.object, change) | (k, change) <- Map.toList changes, k.aspect == Definition]
     indexesOn v =
-        [ def
-        | (k, def) <- Map.toList toSchema
+        [ (q, def.statement)
+        | (k, IndexDefinition def) <- Map.toList toSchema
         , k.aspect == Definition
         , k `Map.notMember` changes
-        , [i| ON #{qualified v} |] `T.isInfixOf` def
-        , Index _ <- [fromAddress k.address]
+        , Index q <- [k.object]
+        , def.table == v
         ]
+    -- A view created again starts with the default privileges.
+    explicit = \case
+        AclDefinition (ExplicitAcl _) -> True
+        _ -> False
     tablesWith p = Set.fromList [t | (Table t, change) <- definitions, p change]
     isAdded = \case Added _ -> True; _ -> False
     isDropped = \case Dropped _ -> True; _ -> False
 
 
--- | The change that undoes this one.
-invert :: Change -> Change
-invert = \case
-    Added new -> Dropped new
-    Dropped old -> Added old
-    Changed old new -> Changed new old
-
-
--- | Kahn's algorithm over @(x, y)@ pairs meaning x comes after y. Ties go to the smaller
--- node; nodes caught in a cycle come last.
-topoOrder :: Ord a => Set a -> [(a, a)] -> [a]
-topoOrder nodes pairs = go ready0 indegree0 []
-  where
-    relevant = Set.fromList [(x, y) | (x, y) <- pairs, x /= y, x `Set.member` nodes, y `Set.member` nodes]
-    successors = Map.fromListWith (<>) [(y, Set.singleton x) | (x, y) <- Set.toList relevant]
-    indegree0 = Map.unionWith (+) (Map.fromSet (const (0 :: Int)) nodes) (Map.fromListWith (+) [(x, 1) | (x, _) <- Set.toList relevant])
-    ready0 = Map.keysSet (Map.filter (== 0) indegree0)
-
-    go ready indegree acc = case Set.minView ready of
-        Nothing ->
-            let done = reverse acc
-             in done <> Set.toList (nodes `Set.difference` Set.fromList done)
-        Just (n, rest) ->
-            let (indegree', newlyReady) = foldl' release (indegree, Set.empty) (Map.findWithDefault Set.empty n successors)
-             in go (rest <> newlyReady) indegree' (n : acc)
-
-    release (m, r) s =
-        let d = Map.findWithDefault 0 s m - 1
-         in (Map.insert s d m, if d == 0 then Set.insert s r else r)
-
-
 renderStep :: Step -> Text
 renderStep s =
     T.unlines
-        $ ["-- " <> render s.address]
+        $ ["-- " <> render s.object]
         <> ["-- " <> note | note <- txnNote <> map hazardText s.hazards]
         <> [s.sql <> if "--" `T.isPrefixOf` s.sql then "" else ";"]
   where

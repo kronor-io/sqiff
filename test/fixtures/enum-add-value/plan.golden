@@ -1,0 +1,4 @@
+-- type public.mood
+-- own transaction
+alter type public.mood add value 'ok' after 'sad';
+

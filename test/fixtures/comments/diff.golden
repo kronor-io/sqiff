@@ -1,0 +1,5 @@
+changed table public.t (comment)
+  - old
+  + new
+added   table column public.t.a (comment)
+1 added, 0 dropped, 1 changed

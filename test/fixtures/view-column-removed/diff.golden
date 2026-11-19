@@ -1,0 +1,11 @@
+changed view public.uses_b
+  -  SELECT id,
+  -     b
+  +  SELECT id
+changed view public.v
+  -     a,
+  -     b
+  +     a
+  depended on by:
+    view public.keeps
+0 added, 0 dropped, 2 changed

@@ -1,0 +1,14 @@
+-- table public.t
+-- hazard: may rewrite the table
+-- hazard: holds an ACCESS EXCLUSIVE lock, which blocks reads and writes, while it runs
+alter table public.t set unlogged;
+
+-- table public.t
+alter table public.t enable row level security;
+
+-- table public.t
+alter table public.t force row level security;
+
+-- table public.t
+alter table public.t set (fillfactor=80, autovacuum_enabled=false);
+

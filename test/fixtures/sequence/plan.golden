@@ -1,0 +1,3 @@
+-- sequence public.counter
+create sequence public.counter as bigint increment by 5 minvalue 1 maxvalue 9223372036854775807 start with 100 cache 1 no cycle;
+

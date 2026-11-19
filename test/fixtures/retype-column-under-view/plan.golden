@@ -1,0 +1,13 @@
+-- table column public.t.amount
+-- hazard: may rewrite the table
+-- hazard: holds an ACCESS EXCLUSIVE lock, which blocks reads and writes, while it runs
+-- hazard: fails when an existing value does not convert to the new type
+-- hazard: recreating a view fails when its query relies on the old type; then edit the view
+drop view public.v;
+alter table public.t alter column amount type bigint using amount::bigint;
+create view public.v as
+SELECT id,
+    amount
+   FROM public.t;
+comment on view public.v is 'amounts';
+

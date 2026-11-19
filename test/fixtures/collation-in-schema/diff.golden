@@ -1,0 +1,4 @@
+changed table column app.names.name
+  + collate app.c_copy
+added   table column app.names.other
+1 added, 0 dropped, 1 changed

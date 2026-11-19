@@ -1,0 +1,16 @@
+-- table column public.t.id
+do $$
+declare last bigint; called boolean; acl aclitem[];
+begin
+    execute format('select last_value, is_called from %s', pg_get_serial_sequence('public.t', 'id')) into last, called;
+    select relacl into acl from pg_class where oid = pg_get_serial_sequence('public.t', 'id')::regclass;
+    alter table public.t alter column id drop identity;
+    create sequence public.t_id_seq as integer owned by public.t.id;
+    perform setval('public.t_id_seq', last, called);
+    alter table public.t alter column id set default nextval('public.t_id_seq'::regclass);
+    execute coalesce((select string_agg(format('grant %s on sequence %s to %s', x.privilege_type, 'public.t_id_seq', case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end), '; ') from aclexplode(acl) x where x.grantee <> x.grantor), 'select');
+end $$;
+
+-- sequence public.t_id_seq
+alter sequence public.t_id_seq as integer increment by 1 minvalue 1 maxvalue 2147483647 start with 1 cache 1 no cycle owned by public.t.id;
+

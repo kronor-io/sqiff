@@ -1,0 +1,7 @@
+added   table public.child
+added   table column public.child.extra
+added   table column public.child.id
+added   table column public.child.made
+added   table constraint public.child.base_id_positive
+added   table public.child (privileges)
+6 added, 0 dropped, 0 changed

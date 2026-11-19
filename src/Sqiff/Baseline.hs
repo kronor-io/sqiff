@@ -6,19 +6,21 @@
 
 -- | A scratch PostgreSQL holding the schema a revision's sqitch plan produces, run from a
 -- git worktree at that revision with the revision's own compose file.
-module Sqiff.Baseline (ensureBaseline) where
+module Sqiff.Baseline (withBaseline) where
 
 import Crypto.Hash (SHA256 (..), hashWith)
 import Data.Char (isDigit)
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import GHC.IO.Handle.Lock (LockMode (..), hLock, hTryLock, hUnlock)
 import RIO
 import RIO.Directory (XdgDirectory (..), canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist, doesPathExist, findExecutable, getXdgDirectory, removeDirectoryRecursive, removeFile)
 import RIO.FilePath (takeDirectory, (</>))
 import RIO.Map qualified as Map
-import Sqiff.Catalog (failWith)
 import Sqiff.Config (BaselineConfig (..), DeployStep (..), Password (..), SqitchPlace (..), fill)
+import Sqiff.Connection (failWith)
+import Sqiff.ConnectionString (ConnectionString, fromPairs)
 import Sqiff.Git (Repo, commonDir, findRepo, git, resolveCommit)
 import System.Environment (getEnvironment, lookupEnv)
 import System.Process.Typed (ProcessConfig, nullStream, proc, readProcess, runProcess, setEnv, setStdin, setStdout, setWorkingDir, useHandleOpen)
@@ -32,10 +34,13 @@ data Paths = Paths
     }
 
 
--- | Makes sure the baseline database holds the schema of @rev@'s sqitch plan and
--- returns its connection string.
-ensureBaseline :: BaselineConfig -> Text -> IO Text
-ensureBaseline cfg rev = do
+-- | Runs @action@ with the baseline database holding the schema of @rev@'s sqitch plan.
+--
+-- A lock in the cache keeps runs apart: the database is brought up to date under an
+-- exclusive lock, then used under a shared one, so runs that need the same revision share
+-- it and a run that needs another waits until they are done.
+withBaseline :: BaselineConfig -> Text -> (ConnectionString -> IO a) -> IO a
+withBaseline cfg rev action = do
     for_ ["docker", "git"] \tool -> do
         found <- findExecutable tool
         when (isNothing found) $ failWith [i|#{tool} is not on PATH; the baseline database needs it|]
@@ -43,28 +48,99 @@ ensureBaseline cfg rev = do
     common <- commonDir repo
     let key = T.take 12 (tshow (hashWith SHA256 (encodeUtf8 (T.pack common))))
     cache <- getXdgDirectory XdgCache ("sqiff" </> T.unpack key)
-    let p = Paths{project = "sqiff-" <> key, checkout = cache </> "checkout", stateFile = cache </> "baseline-commit"}
+    createDirectoryIfMissing True cache
+    let p = Paths{project = "sqiff-" <> key, checkout = cache </> "checkout", stateFile = cache </> "baseline-state"}
     commit <- resolveCommit repo rev
-    recorded <- doesFileExist p.stateFile >>= bool (pure Nothing) (Just . T.strip <$> readFileUtf8 p.stateFile)
-    hasCheckout <- doesPathExist (p.checkout </> ".git")
-    running <- if hasCheckout then isRunning cfg p else pure False
-    if recorded == Just commit && running
-        then connInfo cfg p
-        else do
-            note [i|bringing the baseline database to #{T.take 12 commit} (#{rev})|]
-            whenM (doesFileExist p.stateFile) $ removeFile p.stateFile
-            checkoutAt cfg repo common p commit
-            start cfg p
-            stale <- staleDeploy cfg p
-            when stale do
-                note "the deployed changes are not all in this revision's plan; rebuilding from scratch"
-                compose cfg p ["down", "-v"]
-                start cfg p
-            for_ cfg.deploy \step -> do
-                present <- maybe (pure True) (doesPathExist . (p.checkout </>)) step.ifExists
-                when present $ sqitchIn cfg p step.args
-            writeFileUtf8 p.stateFile (commit <> "\n")
-            connInfo cfg p
+    let wanted = BaselineState{commit, settings = settingsFingerprint cfg}
+    withBinaryFile (cache </> "lock") ReadWriteMode \lock -> do
+        let locked :: LockMode -> Text -> IO ()
+            locked mode what = do
+                free <- hTryLock lock mode
+                unless free do
+                    note [i|waiting for another sqiff run #{what} the baseline database|]
+                    hLock lock mode
+            ready = do
+                state <- readState p
+                running <- doesPathExist (p.checkout </> ".git") >>= bool (pure False) (isRunning cfg p)
+                pure (state == Just wanted && running)
+            loop = do
+                locked ExclusiveLock "using"
+                ( do
+                        isReady <- ready
+                        unless isReady $ bringTo cfg repo common p rev wanted
+                    )
+                    `finally` hUnlock lock
+                -- Another run may bring it elsewhere between the two locks.
+                locked SharedLock "changing"
+                isReady <- ready `onException` hUnlock lock
+                if isReady
+                    then (connInfo cfg p >>= action) `finally` hUnlock lock
+                    else hUnlock lock >> loop
+        loop
+
+
+-- | What the baseline database was built from: the commit, and the settings that shape the
+-- deploy.
+data BaselineState = BaselineState
+    { commit :: Text
+    , settings :: Text
+    }
+    deriving stock (Eq)
+
+
+readState :: Paths -> IO (Maybe BaselineState)
+readState p =
+    doesFileExist p.stateFile >>= \case
+        False -> pure Nothing
+        True ->
+            T.lines <$> readFileUtf8 p.stateFile <&> \case
+                [commit, settings] -> Just BaselineState{commit, settings}
+                _ -> Nothing
+
+
+-- | A hash of the settings that decide what the deploy produces, without the password.
+settingsFingerprint :: BaselineConfig -> Text
+settingsFingerprint cfg =
+    T.take 16
+        . tshow
+        . hashWith SHA256
+        . encodeUtf8
+        . T.unlines
+        $ [ T.pack cfg.composeFile
+          , cfg.service
+          , tshow cfg.containerPort
+          , cfg.user
+          , cfg.database
+          , case cfg.sqitch of OnHost -> "host"; InService -> "service"
+          , tshow (Map.toList cfg.environment)
+          , tshow [(step.args, step.ifExists) | step <- cfg.deploy]
+          , tshow cfg.status
+          ]
+
+
+-- | Brings the baseline database to @wanted@: moves the checkout and deploys what the plan
+-- adds, or starts from an empty volume when the deploy settings changed or the deployed
+-- changes are not all in the plan.
+bringTo :: BaselineConfig -> Repo -> FilePath -> Paths -> Text -> BaselineState -> IO ()
+bringTo cfg repo common p rev wanted = do
+    let commit = wanted.commit
+    note [i|bringing the baseline database to #{T.take 12 commit} (#{rev})|]
+    previous <- readState p
+    whenM (doesFileExist p.stateFile) $ removeFile p.stateFile
+    checkoutAt cfg repo common p commit
+    when (maybe False ((/= wanted.settings) . (.settings)) previous) do
+        note "the baseline settings in sqiff.yaml changed; rebuilding from scratch"
+        compose cfg p ["down", "-v"]
+    start cfg p
+    stale <- staleDeploy cfg p
+    when stale do
+        note "the deployed changes are not all in this revision's plan; rebuilding from scratch"
+        compose cfg p ["down", "-v"]
+        start cfg p
+    for_ cfg.deploy \step -> do
+        present <- maybe (pure True) (doesPathExist . (p.checkout </>)) step.ifExists
+        when present $ sqitchIn cfg p step.args
+    writeFileUtf8 p.stateFile (commit <> "\n" <> wanted.settings <> "\n")
 
 
 note :: Text -> IO ()
@@ -72,12 +148,12 @@ note message = TIO.hPutStrLn stderr ("sqiff: " <> message)
 
 
 -- | The connection string for the port Docker published the service on.
-connInfo :: BaselineConfig -> Paths -> IO Text
+connInfo :: BaselineConfig -> Paths -> IO ConnectionString
 connInfo cfg p = do
     port <- publishedPort cfg p
     password <- passwordOf cfg
     let pairs = [("host", "localhost"), ("port", port), ("user", cfg.user), ("dbname", cfg.database)] <> [("password", pw) | pw <- maybeToList password]
-    pure (T.unwords [k <> "='" <> T.replace "'" "\\'" (T.replace "\\" "\\\\" v) <> "'" | (k, v) <- pairs])
+    pure (fromPairs pairs)
 
 
 passwordOf :: BaselineConfig -> IO (Maybe Text)
@@ -126,7 +202,9 @@ checkoutAt cfg repo common p commit =
 
 
 -- | Starts the server and waits until it accepts connections over TCP, which it does
--- once the init scripts are done.
+-- once the init scripts are done: the image's temporary server for them listens on the
+-- Unix socket only. The check runs in the container, so it asks its loopback, on the
+-- port the server listens on there.
 start :: BaselineConfig -> Paths -> IO ()
 start cfg p = do
     compose cfg p ["up", "-d", service]
@@ -135,7 +213,7 @@ start cfg p = do
     service = T.unpack cfg.service
     project = p.project
     awaitReady n = do
-        (code, _, _) <- readCompose cfg p ["exec", "-T", service, "pg_isready", "-q", "-h", "127.0.0.1"]
+        (code, _, _) <- readCompose cfg p ["exec", "-T", service, "pg_isready", "-q", "-h", "127.0.0.1", "-p", show cfg.containerPort]
         unless (code == ExitSuccess) do
             (_, state, _) <- readCompose cfg p ["ps", "-a", "--format", "{{.State}}", service]
             when (T.strip state `elem` ["exited", "dead"] || n >= 900)

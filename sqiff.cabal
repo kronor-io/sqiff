@@ -23,19 +23,42 @@ library
   import:          shared
   hs-source-dirs:  src
   exposed-modules:
+    Sqiff.App.Compare
+    Sqiff.App.Dependents
+    Sqiff.App.Env
+    Sqiff.App.Options
+    Sqiff.App.Read
+    Sqiff.App.Table
+    Sqiff.App.Table.Env
+    Sqiff.App.Table.Findings
+    Sqiff.App.Table.Rewrite
     Sqiff.Baseline
     Sqiff.Body
     Sqiff.Catalog
+    Sqiff.Catalog.PlpgsqlCheck
+    Sqiff.Catalog.Rows
     Sqiff.Config
+    Sqiff.Connection
+    Sqiff.ConnectionString
+    Sqiff.Definition
+    Sqiff.Dependencies
     Sqiff.Diff
     Sqiff.Folder
     Sqiff.Git
-    Sqiff.Object
+    Sqiff.Graph
+    Sqiff.Identifier
+    Sqiff.Model
     Sqiff.Plan
     Sqiff.Recipe
+    Sqiff.Recreate
     Sqiff.Rewrite
     Sqiff.Script
+    Sqiff.Sql
     Sqiff.Sqitch
+    Sqiff.Sqitch.Check
+    Sqiff.Sqitch.Layout
+    Sqiff.Sqitch.Plan
+    Sqiff.Sqitch.Units
     Sqiff.TableEdit
     Sqiff.Timing
 
@@ -45,10 +68,12 @@ library
     , bytestring
     , containers
     , crypton
+    , Diff
     , file-embed
     , filepath
     , hasql
     , hasql-th
+    , opt-env-conf
     , pqi-ffi
     , rio
     , string-interpolate
@@ -67,13 +92,43 @@ executable sqiff
 
   build-depends:
     , base
-    , containers
-    , Diff
-    , filepath
-    , hasql
-    , sqiff
-    , optparse-applicative
     , rio
+    , sqiff
     , string-interpolate
     , text
+
+test-suite sqiff-test
+  import:             shared
+  type:               exitcode-stdio-1.0
+  hs-source-dirs:     test
+  main-is:            Main.hs
+  other-modules:
+    Integration
+    Postgres
+    Unit
+    Writing
+
+  ghc-options:        -threaded -rtsopts -with-rtsopts=-N4
+  build-tool-depends: sqiff:sqiff
+  build-depends:
+    , aeson
+    , base
+    , bytestring
+    , containers
+    , directory
+    , filepath
+    , hasql
+    , hasql-th
+    , hedgehog
+    , rio
+    , sqiff
+    , string-interpolate
+    , tasty
+    , tasty-expected-failure
+    , tasty-golden
+    , tasty-hedgehog
+    , tasty-hunit
+    , temporary
+    , text
     , time
+    , typed-process

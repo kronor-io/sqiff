@@ -1,0 +1,16 @@
+-- index public.t_email
+-- outside a transaction
+-- hazard: builds an index
+do $$
+begin
+    if exists (
+        select from pg_index
+        where indexrelid = to_regclass('public.t_email') and not indisvalid
+    ) then
+        raise exception using message = 'index public.t_email is invalid from an earlier failed build; drop it first';
+    end if;
+end
+$$;
+
+CREATE INDEX CONCURRENTLY t_email ON public.t USING btree (lower(email)) WHERE (NOT deleted);
+

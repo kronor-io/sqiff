@@ -1,0 +1,5 @@
+added   table app.events
+added   table column app.events.at
+added   table column app.events.id
+added   table app.events (privileges)
+4 added, 0 dropped, 0 changed

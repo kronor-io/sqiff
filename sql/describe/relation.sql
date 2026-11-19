@@ -5,32 +5,43 @@ select
     c.oid as relid,
     case
         when c.relkind in ('v', 'm') then
-            concat_ws(
-                E'\n',
-                case when c.reloptions is not null then 'with (' || array_to_string(c.reloptions, ', ') || ')' end,
-                pg_get_viewdef(c.oid)
+            jsonb_build_object(
+                'kind', 'view',
+                'options', c.reloptions,
+                'query', pg_get_viewdef(c.oid),
+                'columns', (
+                    select coalesce(jsonb_agg(jsonb_build_array(a.attname, format_type(a.atttypid, a.atttypmod)) order by a.attnum), '[]')
+                    from pg_attribute a
+                    where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+                )
             )
-        else concat_ws(
-            E'\n',
-            case when c.relpersistence = 'u' then 'unlogged' end,
-            case when c.relkind = 'p' then 'partition by ' || pg_get_partkeydef(c.oid) end,
-            case
-                when c.relispartition then
-                    'partition of '
-                    || (select h.inhparent::regclass::text from pg_inherits h where h.inhrelid = c.oid)
-                    || ' '
-                    || pg_get_expr(c.relpartbound, c.oid)
+        else jsonb_build_object(
+            'kind', 'table',
+            'unlogged', c.relpersistence = 'u',
+            'partition_by', case when c.relkind = 'p' then pg_get_partkeydef(c.oid) end,
+            'partition_of', case
+                when c.relispartition then (
+                    select jsonb_build_object('schema', pn.nspname, 'name', p.relname, 'bound', pg_get_expr(c.relpartbound, c.oid))
+                    from pg_inherits h
+                    join pg_class p on p.oid = h.inhparent
+                    join pg_namespace pn on pn.oid = p.relnamespace
+                    where h.inhrelid = c.oid
+                )
             end,
-            case when c.relrowsecurity then 'row level security' end,
-            case when c.relforcerowsecurity then 'force row level security' end,
-            case
-                when c.reloptions is not null or toast.reloptions is not null then
-                    'with ('
-                    || array_to_string(c.reloptions || array(select 'toast.' || o from unnest(toast.reloptions) o), ', ')
-                    || ')'
-            end
+            -- Parents by inherits, not by partitioning, in order.
+            'inherits', (
+                select coalesce(jsonb_agg(jsonb_build_object('schema', pn.nspname, 'name', p.relname) order by h.inhseqno), '[]')
+                from pg_inherits h
+                join pg_class p on p.oid = h.inhparent
+                join pg_namespace pn on pn.oid = p.relnamespace
+                where h.inhrelid = c.oid and not c.relispartition
+            ),
+            'row_security', c.relrowsecurity,
+            'force_row_security', c.relforcerowsecurity,
+            -- The table's storage options, then its TOAST table's with a toast. prefix.
+            'options', coalesce(c.reloptions, '{}') || array(select 'toast.' || o from unnest(toast.reloptions) o)
         )
-    end as definition
+    end::text as definition
 from pg_class c
 join pg_namespace n on n.oid = c.relnamespace
 left join pg_class toast on toast.oid = c.reltoastrelid

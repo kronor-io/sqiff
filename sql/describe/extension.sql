@@ -3,5 +3,8 @@ select
     e.oid as objid,
     0 as objsubid,
     null::oid as relid,
-    'version ' || e.extversion || ' schema ' || e.extnamespace::regnamespace::text as definition
+    jsonb_build_object(
+        'version', e.extversion,
+        'schema', (select n.nspname from pg_namespace n where n.oid = e.extnamespace)
+    )::text as definition
 from pg_extension e

@@ -1,0 +1,13 @@
+-- type app.words
+create type app.words as range (subtype = text, collation = pg_catalog."C", multirange_type_name = app.words_multirange);
+
+-- function app.float_diff(double precision, double precision)
+CREATE OR REPLACE FUNCTION app.float_diff(a double precision, b double precision)
+ RETURNS double precision
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$select a - b$function$;
+
+-- type app.span
+create type app.span as range (subtype = double precision, subtype_diff = app.float_diff, multirange_type_name = app.spans);
+

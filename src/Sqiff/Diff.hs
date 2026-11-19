@@ -4,12 +4,13 @@
 
 module Sqiff.Diff (
     Change (..),
+    Changes,
+    invert,
+    after,
     diff,
     affected,
     BodyText (..),
     bodyText,
-    dependentsBy,
-    reachedFrom,
     bodiesToAnalyse,
 ) where
 
@@ -21,18 +22,43 @@ import RIO.Map qualified as Map
 import RIO.NonEmpty qualified as L
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
-import Sqiff.Catalog (Address (..), Aspect (..), Edge (..), ObjectKey (..), Schema)
+import Sqiff.Definition (Definition)
+import Sqiff.Dependencies (Dependencies, directDependents, reachableFrom, restrictedTo)
+import Sqiff.Graph (reachedFrom)
+import Sqiff.Identifier (QName (..), TypeName, nameText, typeText)
+import Sqiff.Model
 
 
-data Change
-    = Added Text
-    | Dropped Text
-    | Changed Text Text
-    deriving stock (Eq, Show)
+-- | How one aspect of one object differs between two schemas.
+data Change a
+    = Added a
+    | Dropped a
+    | Changed a a
+    deriving stock (Eq, Show, Functor, Foldable, Traversable)
+
+
+-- | What differs between two schemas.
+type Changes = Map ObjectKey (Change Definition)
+
+
+-- | The change that undoes this one.
+invert :: Change a -> Change a
+invert = \case
+    Added new -> Dropped new
+    Dropped old -> Added old
+    Changed old new -> Changed new old
+
+
+-- | The definition a change leaves, if it leaves one.
+after :: Change a -> Maybe a
+after = \case
+    Added new -> Just new
+    Changed _ new -> Just new
+    Dropped _ -> Nothing
 
 
 -- | What turns @from@ into @to@, with @same key old new@ deciding when two definitions match.
-diff :: (ObjectKey -> Text -> Text -> Bool) -> Schema -> Schema -> Map ObjectKey Change
+diff :: Eq a => (ObjectKey -> a -> a -> Bool) -> Map ObjectKey a -> Map ObjectKey a -> Map ObjectKey (Change a)
 diff same =
     Merge.merge
         (Merge.mapMissing \_ old -> Dropped old)
@@ -41,37 +67,23 @@ diff same =
 
 
 -- | For each dropped or changed definition, the objects in @known@ that depend on it,
--- directly or through others, and are not in the diff themselves.
-affected :: Set Address -> [Edge] -> Map ObjectKey Change -> Map Address (Set Address)
-affected known edges changes =
+-- directly or through others, and whose definitions are not in the diff themselves.
+affected :: Set ObjectId -> Dependencies -> Map ObjectKey (Change a) -> Map ObjectId (Set ObjectId)
+affected known deps changes =
     Map.filter (not . Set.null)
         $ Map.fromList
-            [ (key.address, closure key.address `Set.difference` inDiff)
+            [ (key.object, closure key.object `Set.difference` inDiff)
             | (key, change) <- Map.toList changes
             , key.aspect == Definition
             , removesOrChanges change
             ]
   where
-    inDiff = Set.fromList (map (.address) (Map.keys changes))
+    -- Objects whose own definition changes are planned by their own recipes; one whose
+    -- comment or grants change still stands in the way.
+    inDiff = Set.fromList [k.object | k <- Map.keys changes, k.aspect == Definition]
 
-    dependents =
-        Map.fromListWith
-            (<>)
-            [ (edge.referenced, Set.singleton edge.dependent)
-            | edge <- edges
-            , edge.referenced `Set.member` known
-            , edge.dependent `Set.member` known
-            ]
-
-    direct addr = Map.findWithDefault Set.empty addr dependents
-
-    closure start = go Set.empty (direct start)
-      where
-        go seen frontier
-            | Set.null frontier = seen
-            | otherwise =
-                let seen' = seen <> frontier
-                 in go seen' (foldMap direct frontier `Set.difference` seen')
+    amongKnown = restrictedTo known deps
+    closure start = reachedFrom (Set.toList . directDependents amongKnown) (Set.singleton start)
 
     removesOrChanges = \case
         Added _ -> False
@@ -98,45 +110,59 @@ wordsOf = HS.fromList . filter (not . T.null) . T.split (not . identifierChar)
     identifierChar c = isAlphaNum c || c == '_' || c == '$'
 
 
--- | Who depends on an object by the edges given; a relation also counts what depends on
--- its columns.
-dependentsBy :: [Edge] -> Address -> [Address]
-dependentsBy edges = \addr -> direct addr <> concatMap direct (columnsOf addr)
-  where
-    deps = Map.fromListWith (<>) [(e.referenced, [e.dependent]) | e <- edges]
-    direct addr = Map.findWithDefault [] addr deps
-    columns = Map.fromListWith (<>) [((s, t), Set.singleton e.referenced) | e <- edges, e.referenced.objectType == "table column", [s, t, _] <- [e.referenced.objectNames]]
-    columnsOf addr = case addr.objectNames of
-        [s, n] | addr.objectType `elem` ["table", "view", "materialized view", "foreign table"] -> maybe [] Set.toList (Map.lookup (s, n) columns)
-        _ -> []
-
-
--- | The objects reachable from @starts@ by one step or more of @dependents@.
-reachedFrom :: (Address -> [Address]) -> Set Address -> Set Address
-reachedFrom dependents starts = go Set.empty (Set.fromList (concatMap dependents (Set.toList starts)))
-  where
-    go seen frontier
-        | Set.null frontier = seen
-        | otherwise =
-            let seen' = seen <> frontier
-             in go seen' (Set.fromList (concatMap dependents (Set.toList frontier)) `Set.difference` seen')
-
-
 -- | Of @functions@, those whose body edges 'affected' can follow from @starts@: their
 -- definition names a reached object, or they are a trigger function on the closure.
-bodiesToAnalyse :: (Address -> [Address]) -> Set Address -> [(a, Address, BodyText, Maybe Address)] -> [a]
-bodiesToAnalyse dependents starts functions =
+bodiesToAnalyse :: Dependencies -> Set ObjectId -> [(a, ObjectId, BodyText, Maybe ObjectId)] -> [a]
+bodiesToAnalyse deps starts functions =
     [f | (f, _, def, trigger) <- functions, named def || maybe False (`Set.member` closure) trigger]
   where
-    reached = reachedFrom dependents starts
+    reached = reachableFrom deps starts
     closure = starts <> reached
-    counted = Set.toList reached <> filter target (Set.toList starts)
-    names = HS.toList (foldMap nameWords counted)
-    operators = [op | a <- counted, a.objectType == "operator", [_, op] <- [a.objectNames]]
+    counted = Set.toList reached <> filter namedInBodies (Set.toList starts)
+    names = HS.toList (foldMap (wordsOf . T.toLower . bodyName) counted)
+    operators = [op | Unknown a <- counted, a.objectType == "operator", [_, op] <- [a.objectNames]]
     named def = any (`HS.member` def.wordSet) names || any (`T.isInfixOf` def.lowered) operators
-    target addr = addr.objectType `notElem` ["table column", "table constraint", "domain constraint", "trigger", "policy", "index", "schema", "extension"]
-    nameWords addr = wordsOf $ T.toLower case addr.objectNames of
+
+
+-- | Whether a body names this object itself when it uses it, rather than its table or type.
+namedInBodies :: ObjectId -> Bool
+namedInBodies = \case
+    Column{} -> False
+    TableConstraint{} -> False
+    DomainConstraint{} -> False
+    Trigger{} -> False
+    Policy{} -> False
+    Index _ -> False
+    Schema _ -> False
+    Extension _ -> False
+    _ -> True
+
+
+-- | The name a function body would use for the object: a part's table, a type's last name.
+bodyName :: ObjectId -> Text
+bodyName = \case
+    Schema s -> nameText s
+    Extension e -> nameText e
+    Type t -> lastPart t
+    DomainConstraint d _ -> lastPart d
+    Column t _ -> tableName t
+    OtherColumn _ t _ -> tableName t
+    TableConstraint t _ -> tableName t
+    Trigger t _ -> tableName t
+    Policy t _ -> tableName t
+    Table q -> tableName q
+    View q -> tableName q
+    MaterializedView q -> tableName q
+    Index q -> tableName q
+    Sequence q -> tableName q
+    Routine _ q _ -> tableName q
+    Unknown a -> case a.objectNames of
         [n] -> L.last ("" :| T.split (== '.') n)
         [_, n] -> n
         _ : t : _ -> t
         [] -> ""
+  where
+    tableName :: QName -> Text
+    tableName q = nameText q.name
+    lastPart :: TypeName -> Text
+    lastPart t = L.last ("" :| T.split (== '.') (typeText t))

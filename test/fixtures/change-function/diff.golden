@@ -1,0 +1,4 @@
+changed function public.add(integer, integer)
+  - AS $function$ select a + b $function$
+  + AS $function$ select a + b + 0 $function$
+0 added, 0 dropped, 1 changed

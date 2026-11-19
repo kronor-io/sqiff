@@ -1,0 +1,6 @@
+changed table public.chain (privileges)
+  - analyst SELECT with grant option granted by reader
+  - intern SELECT granted by analyst
+  - reader SELECT with grant option
+  + reader SELECT
+0 added, 0 dropped, 1 changed

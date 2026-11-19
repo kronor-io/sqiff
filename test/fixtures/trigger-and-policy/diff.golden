@@ -1,0 +1,5 @@
+added   policy public.t.own
+changed table public.t
+  + row level security
+added   trigger public.t.t_touch
+2 added, 0 dropped, 1 changed

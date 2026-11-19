@@ -3,7 +3,33 @@ select
     con.oid as objid,
     0 as objsubid,
     nullif(con.conrelid, 0) as relid,
-    pg_get_constraintdef(con.oid) as definition
+    jsonb_build_object(
+        'clause', pg_get_constraintdef(con.oid),
+        'kind', con.contype,
+        'validated', con.convalidated,
+        'inherited', not con.conislocal,
+        'columns', (
+            select jsonb_agg(a.attname order by k.n)
+            from unnest(con.conkey) with ordinality k (attnum, n)
+            join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.attnum
+        ),
+        'references', case
+            when con.contype = 'f' then (
+                select jsonb_build_object(
+                    'schema', rn.nspname,
+                    'table', rc.relname,
+                    'columns', (
+                        select jsonb_agg(a.attname order by k.n)
+                        from unnest(con.confkey) with ordinality k (attnum, n)
+                        join pg_attribute a on a.attrelid = con.confrelid and a.attnum = k.attnum
+                    )
+                )
+                from pg_class rc
+                join pg_namespace rn on rn.oid = rc.relnamespace
+                where rc.oid = con.confrelid
+            )
+        end
+    )::text as definition
 from pg_constraint con
 join pg_namespace n on n.oid = con.connamespace
 left join pg_class tc on tc.oid = con.conrelid

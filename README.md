@@ -91,3 +91,11 @@ In `deploy` and `status` arguments, `{host}`, `{port}`, `{user}` and `{database}
 The password reaches sqitch as `PGPASSWORD` and sqiff's own connections in the connection string; it is never put in sqitch's arguments.
 
 With `templates`, `--write` adds a change that adds a column, adds an index or validates a constraint from the matching template, passing `schema`, `table_name` and `column_name`, `index_name` or `constraint_name`; other new migrations use `migration`. In `add_column`, sqiff puts the column's type and options where `__your_type_here__ null` is, and it expects `add_index` to name the index `idx_<table_name>_<index_name>`. create-migration's templates already fit, so `templates` can point at them. Without `templates`, `--write` uses sqitch's own templates and writes the scripts itself. Each repository gets its own baseline, shared by its worktrees and jj workspaces, under `~/.cache/sqiff`.
+
+## Tests
+
+```bash
+cabal test
+```
+
+The unit tests are pure. The integration tests start a throwaway PostgreSQL cluster (`initdb` from `PATH`, or the directory in `SQIFF_TEST_PG_BIN`), and for each directory under `test/fixtures` they build `from.sql` and `to.sql` and compare `sqiff diff` and `sqiff plan` with the golden files. They then apply the plan to `from` and expect `diff` to find nothing left, and do the same through `sqitch deploy`, verify and revert (`sqitch` from `PATH`, or the directory in `SQIFF_TEST_SQITCH_BIN`). A `known-bug` file marks a fixture that fails today, and a `revert-gap` file one whose changes PostgreSQL cannot fully revert; each says why. Refresh golden files with `cabal test --test-options=--accept`.

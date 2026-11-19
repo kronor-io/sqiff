@@ -1,0 +1,4 @@
+changed function public.greet(pg_catalog.text)
+  - AS $function$ begin return 'hi ' || n; end $function$
+  + AS $function$ begin return 'hello ' || n; end $function$
+0 added, 0 dropped, 1 changed

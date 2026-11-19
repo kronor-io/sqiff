@@ -1,0 +1,16 @@
+-- materialized view public.mv
+-- hazard: fails when other objects depend on it
+drop materialized view public.mv;
+
+-- materialized view public.mv
+-- hazard: holds an ACCESS EXCLUSIVE lock, which blocks reads and writes, while it runs
+create materialized view public.mv as
+SELECT id,
+    a,
+    (a * 2) AS b
+   FROM public.t;
+
+-- materialized view public.mv
+-- hazard: builds an index
+CREATE INDEX mv_a ON public.mv USING btree (a);
+

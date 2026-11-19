@@ -1,0 +1,12 @@
+-- type app.mood
+create type app.mood as enum ('it''s fine', 'ok');
+
+-- type app.pair
+create type app.pair as (x integer, "Y" text);
+
+-- type app.positive
+create domain app.positive as integer not null default 1;
+
+-- type app.span
+create type app.span as range (subtype = double precision, multirange_type_name = app.span_multirange);
+

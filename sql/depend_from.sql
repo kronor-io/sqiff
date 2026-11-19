@@ -43,7 +43,15 @@ step (classid, objid, objsubid, refclassid, refobjid, refobjsubid, edge) as (
             from pg_type te
             where p.classid = 'pg_type'::regclass and te.oid = p.objid and te.typarray <> 0
         ) r
-        join pg_depend d on d.refclassid = r.classid and d.refobjid = r.objid
+        -- Looked up per object that stands for p, through the reference index. As a plain
+        -- join the planner may scan every pg_depend row for each p instead, which grows
+        -- with the catalog at every step; offset 0 keeps the subquery, and so this order.
+        cross join lateral (
+            select d0.classid, d0.objid, d0.objsubid, d0.refclassid, d0.refobjid, d0.refobjsubid, d0.deptype
+            from pg_depend d0
+            where d0.refclassid = r.classid and d0.refobjid = r.objid
+            offset 0
+        ) d
         -- The dependent and referenced ends after the same remap as depend.sql.
         cross join lateral (
             select coalesce(ma.toclassid, d.classid) as classid, coalesce(ma.toobjid, d.objid) as objid, coalesce(ma.tosubid, d.objsubid) as objsubid

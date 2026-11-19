@@ -1,0 +1,5 @@
+-- table public.child
+create table public.child (
+    extra text
+) inherits (public.base);
+

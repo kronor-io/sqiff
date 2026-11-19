@@ -1,0 +1,5 @@
+added   function app.float_diff(double precision, double precision)
+added   type app.span
+added   type app.words
+added   function app.float_diff(double precision, double precision) (privileges)
+4 added, 0 dropped, 0 changed

@@ -12,10 +12,8 @@ module Sqiff.Config (
     Password (..),
     SqitchPlace (..),
     DeployStep (..),
-    Layout (..),
     loadConfig,
     configFile,
-    sqitchLayout,
     fill,
     match,
 ) where
@@ -31,8 +29,7 @@ import RIO hiding (view)
 import RIO.Directory (doesFileExist)
 import RIO.FilePath ((</>))
 import RIO.Map qualified as Map
-import Sqiff.Catalog (failWith)
-import System.Process.Typed (nullStream, proc, readProcess, setStdin, setWorkingDir)
+import Sqiff.Connection (failWith)
 
 
 data Config = Config
@@ -89,13 +86,6 @@ data SqitchPlace = OnHost | InService
 data DeployStep = DeployStep
     { args :: [Text]
     , ifExists :: Maybe FilePath
-    }
-
-
--- | Where sqitch keeps the project's scripts and plan, relative to the project root.
-data Layout = Layout
-    { topDir :: FilePath
-    , planFile :: FilePath
     }
 
 
@@ -181,28 +171,20 @@ known keys o = case [k | k <- map Key.toText (KeyMap.keys o), k `notElem` keys] 
     unknown -> let ks = T.intercalate ", " unknown in fail [i|unknown settings: #{ks}|]
 
 
--- | The top directory and plan file sqitch uses in @root@, from @sqitch config --list@.
-sqitchLayout :: FilePath -> IO Layout
-sqitchLayout root = do
-    (code, out, err) <- readProcess (setStdin nullStream (setWorkingDir root (proc "sqitch" ["config", "--list"])))
-    unless (code == ExitSuccess) $ failWith [i|sqitch config --list in #{root} failed: #{decode err}|]
-    let settings = Map.fromList [(T.toLower k, T.drop 1 v) | l <- T.lines (decode out), let (k, v) = T.breakOn "=" l, not (T.null v)]
-        topDir = maybe "." T.unpack (Map.lookup "core.top_dir" settings)
-        planFile = maybe (topDir </> "sqitch.plan") T.unpack (Map.lookup "core.plan_file" settings)
-    pure Layout{topDir, planFile}
-  where
-    decode = T.strip . decodeUtf8Lenient . toStrictBytes
-
-
--- | @pattern@ with each @{key}@ replaced by its value.
+-- | @pattern@ with each @{key}@ replaced by its value, in one pass, so a value is never
+-- read as a placeholder itself; a key without a value stays as written.
 fill :: Text -> [(Text, Text)] -> Text
-fill = foldl' (\t (k, v) -> T.replace ("{" <> k <> "}") v t)
+fill pattern values = T.concat (map piece (templatePieces pattern))
+  where
+    piece = \case
+        Left text -> text
+        Right key -> fromMaybe ("{" <> key <> "}") (lookup key values)
 
 
 -- | The values @pattern@'s placeholders take in @text@; a placeholder matches one or more
 -- characters other than @/@.
 match :: Text -> Text -> Maybe [(Text, Text)]
-match pattern text = go (pieces pattern) text
+match pattern text = go (templatePieces pattern) text
   where
     go [] rest = if T.null rest then Just [] else Nothing
     go (Left literal : ps) rest = T.stripPrefix literal rest >>= go ps
@@ -218,8 +200,12 @@ match pattern text = go (pieces pattern) text
                 , Just bound <- [go ps after]
                 ]
     breaks literal rest = [(T.dropEnd (T.length r) rest, r) | r <- T.tails rest, literal `T.isPrefixOf` r]
-    pieces p = case T.breakOn "{" p of
-        (literal, "") -> [Left literal | not (T.null literal)]
-        (literal, rest) ->
-            let (key, after) = T.breakOn "}" (T.drop 1 rest)
-             in [Left literal | not (T.null literal)] <> [Right key] <> pieces (T.drop 1 after)
+
+
+-- | A template's literal text and its @{key}@ placeholders, in order.
+templatePieces :: Text -> [Either Text Text]
+templatePieces p = case T.breakOn "{" p of
+    (literal, "") -> [Left literal | not (T.null literal)]
+    (literal, rest) ->
+        let (key, after) = T.breakOn "}" (T.drop 1 rest)
+         in [Left literal | not (T.null literal)] <> [Right key] <> templatePieces (T.drop 1 after)

@@ -1,5 +1,5 @@
 with acl as (
-    select 'pg_class'::regclass::oid as classid, c.oid as objid, c.relacl as acl
+    select 'pg_class'::regclass::oid as classid, c.oid as objid, c.relacl as acl, c.relowner as owner
     from pg_class c
     join pg_namespace n on n.oid = c.relnamespace
     where c.relkind in ('r', 'p', 'v', 'm', 'S')
@@ -7,13 +7,13 @@ with acl as (
         and n.nspname <> 'information_schema'
         and n.nspname !~ '^pg_'
     union all
-    select 'pg_proc'::regclass::oid, p.oid, p.proacl
+    select 'pg_proc'::regclass::oid, p.oid, p.proacl, p.proowner
     from pg_proc p
     join pg_namespace n on n.oid = p.pronamespace
     where n.nspname <> 'information_schema'
         and n.nspname !~ '^pg_'
     union all
-    select 'pg_namespace'::regclass::oid, n.oid, n.nspacl
+    select 'pg_namespace'::regclass::oid, n.oid, n.nspacl, n.nspowner
     from pg_namespace n
     where n.nspname <> 'information_schema'
         and n.nspname !~ '^pg_'
@@ -23,18 +23,23 @@ select
     acl.objid,
     0 as objsubid,
     case when acl.classid = 'pg_class'::regclass then acl.objid end as relid,
-    coalesce(
-        (
-            select string_agg(g.line, E'\n' order by g.line)
-            from (
-                select
-                    case when x.grantee = 0 then 'public' else pg_get_userbyid(x.grantee) end
-                    || ' '
-                    || x.privilege_type
-                    || case when x.is_grantable then ' with grant option' else '' end as line
+    -- JSON null for the defaults, else every grant, the owner's included.
+    case
+        when acl.acl is null then 'null'
+        else coalesce(
+            (
+                select jsonb_agg(
+                    jsonb_build_object(
+                        'grantee', case when x.grantee = 0 then null else pg_get_userbyid(x.grantee) end,
+                        'privilege', x.privilege_type,
+                        'grantable', x.is_grantable,
+                        -- Null when the owner granted it, so owners need not match.
+                        'grantor', case when x.grantor = acl.owner then null else pg_get_userbyid(x.grantor) end
+                    )
+                )
                 from aclexplode(acl.acl) x
-            ) g
-        ),
-        'default'
-    ) as definition
+            ),
+            '[]'::jsonb
+        )::text
+    end as definition
 from acl
