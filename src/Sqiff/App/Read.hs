@@ -13,6 +13,8 @@ module Sqiff.App.Read (
     withDatabase,
     describeConnections,
     Purpose (..),
+    SchemaSnapshot (..),
+    ComparisonInputs (..),
     readBoth,
     reachableEdges,
     routineWords,
@@ -38,7 +40,7 @@ import Sqiff.Connection (withConnection, withConnections, withSharedSnapshot)
 import Sqiff.ConnectionString (ConnectionString)
 import Sqiff.Definition (printed)
 import Sqiff.Dependencies (Dependencies, indexEdges, reachableFrom)
-import Sqiff.Diff (BodyText (..), Change (..), Changes, bodiesToAnalyse, bodyText, diff)
+import Sqiff.Diff (BodyCandidate (..), BodyText (..), Change (..), Changes, bodiesToAnalyse, bodyText, diff)
 import Sqiff.Model
 import Sqiff.Timing (measure, timed)
 
@@ -162,65 +164,167 @@ reachedSoFar :: Reach -> Dependencies
 reachedSoFar reach = indexEdges (reach.catalogEdges <> reach.bodyEdges)
 
 
+-- | A database's addresses, indexed both ways 'reachableEdges' looks them up. Built once.
+data AddressIndex = AddressIndex
+    { addresses :: Addresses
+    , idsOf :: Map ObjectId [CatalogId]
+    -- ^ The catalog ids of each object.
+    , columnsOf :: Map ObjectId [ObjectId]
+    -- ^ The columns of each relation.
+    }
+
+
+addressIndex :: Addresses -> AddressIndex
+addressIndex addresses =
+    AddressIndex
+        { addresses
+        , idsOf = Map.fromListWith (<>) [(object, [ids]) | (ids, object) <- Map.toList addresses]
+        , columnsOf = Map.fromListWith (<>) [(rel, [object]) | (ids, object) <- Map.toList addresses, ids.classId == pgClass, ids.subId > 0, Just rel <- [relationWith ids]]
+        }
+  where
+    relationWith ids = Map.lookup (CatalogId pgClass ids.objectOid 0) addresses
+
+
+-- | The catalog ids of these objects, to read their @pg_depend@ edges by.
+idsFor :: AddressIndex -> Set ObjectId -> [CatalogId]
+idsFor index = concatMap (\a -> Map.findWithDefault [] a index.idsOf) . Set.toList
+
+
+-- | These objects and the columns of those that are relations.
+withColumns :: AddressIndex -> Set ObjectId -> Set ObjectId
+withColumns index xs = xs <> Set.fromList (concatMap (\a -> Map.findWithDefault [] a index.columnsOf) (Set.toList xs))
+
+
+-- | What every round of 'discoverReachable' reads from; it does not change between rounds.
+data ReachInput = ReachInput
+    { conn :: Connection.Connection
+    , extra :: [Connection.Connection]
+    , index :: AddressIndex
+    , tempTableScript :: IO (Maybe Text)
+    , starts :: Set ObjectId
+    , functions :: PlFunctions
+    , candidates :: [BodyCandidate PlFunction]
+    , implicit :: [ObjectId]
+    -- ^ The functions behind user-defined casts and operators.
+    }
+
+
 -- | The @pg_depend@ edges reachable from @starts@, and the body edges of the PL/pgSQL
 -- functions 'bodiesToAnalyse' picks, repeated until nothing new is reached or picked.
 reachableEdges :: Text -> Scope -> Set ObjectId -> Connected -> IO (Map ObjectId BodyText) -> IO ([Edge], [Text])
-reachableEdges label scope starts Connected{conn, extra, schema, addresses, tempTableScript = made} splitWords = timed [i|reachableEdges #{label}|] do
-    let idsOf = Map.fromListWith (<>) [(object, [ids]) | (ids, object) <- Map.toList addresses]
-        idsFor = concatMap (\a -> Map.findWithDefault [] a idsOf) . Set.toList
-        relationWith ids = Map.lookup (CatalogId pgClass ids.objectOid 0) addresses
-        columnsOf = Map.fromListWith (<>) [(rel, [object]) | (ids, object) <- Map.toList addresses, ids.classId == pgClass, ids.subId > 0, Just rel <- [relationWith ids]]
-        withColumns xs = xs <> Set.fromList (concatMap (\a -> Map.findWithDefault [] a columnsOf) (Set.toList xs))
+reachableEdges label scope starts Connected{conn, extra, schema, addresses, tempTableScript} splitWords = timed [i|reachableEdges #{label}|] do
+    let index = addressIndex addresses
     (edges, functions) <-
         concurrently
-            (timed "reach.dependFrom0" $ dependenciesFrom conn addresses (idsFor starts))
+            (timed "reach.dependFrom0" $ dependenciesFrom conn addresses (idsFor index starts))
             ( timed "reach.functionsAndWords"
                 $ plpgsqlFunctions (fromMaybe conn (listToMaybe extra)) scope.excluded
                 >>= traverse \fs -> do
                     split_ <- splitWords
-                    let wordsAt object = fromMaybe (bodyText (maybe "" printed (Map.lookup (definitionKey object) schema))) (Map.lookup object split_)
-                        split part = do
-                            let described =
-                                    [ (f, addr, wordsAt addr, trigger)
-                                    | f <- part
-                                    , let trigger = f.relid >>= \r -> Map.lookup (CatalogId pgClass r 0) addresses
-                                    , Just addr <- [Map.lookup (CatalogId pgProc f.oid 0) addresses]
-                                    ]
-                            _ <- evaluate (foldl' (\n (_, _, b, _) -> n + HS.size b.wordSet) (0 :: Int) described)
-                            pure described
-                        parts = [[f | (n, f) <- zip [0 :: Int ..] fs.checkable, n `mod` 8 == k] | k <- [0 .. 7]]
-                    described <- concat <$> pooledMapConcurrently split parts
-                    pure (fs, described)
+                    candidates <- bodyCandidates schema addresses split_ fs.checkable
+                    pure (fs, candidates)
             )
     case functions of
         Nothing -> pure (edges, bodyNotes label Nothing)
-        Just (fs, described) -> do
-            let position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
-                implicit = [a | o <- fs.implicit, Just a <- [Map.lookup (CatalogId pgProc o 0) addresses]]
-                -- One round: read the pg_depend edges of what is newly reached, then
-                -- analyse the bodies that may reach further, until neither adds anything.
-                go reach = do
-                    let frontier = (starts <> reachableFrom (reachedSoFar reach) starts) `Set.difference` reach.explored
-                    more <- timed "reach.dependFrom" $ dependenciesFrom conn addresses (idsFor frontier)
-                    let read_ = reach{explored = reach.explored <> withColumns (frontier <> Set.fromList (map (.dependent) more)), catalogEdges = reach.catalogEdges <> more}
-                        deps = reachedSoFar read_
-                        picked
-                            | any (`Set.member` (starts <> reachableFrom deps starts)) implicit = [f | (f, _, _, _) <- described]
-                            | otherwise = bodiesToAnalyse deps starts described
-                    case [f | f <- picked, f.oid `Set.notMember` read_.analysed] of
-                        []
-                            | Set.null frontier -> pure read_
-                            | otherwise -> go read_
-                        todo -> do
-                            (uses, failed) <- timed [i|reach.analyseBodies n=#{length todo}|] $ analyseBodies (conn :| extra) fs{tempTables = made >>= maybe fs.tempTables pure} todo
-                            go
-                                read_
-                                    { analysed = read_.analysed <> Set.fromList (map (.oid) todo)
-                                    , bodyEdges = read_.bodyEdges <> edgesBetween addresses uses
-                                    , failed = read_.failed <> failed
-                                    }
-            reached <- go Reach{explored = withColumns (starts <> Set.fromList (map (.dependent) edges)), catalogEdges = edges, bodyEdges = [], analysed = Set.empty, failed = []}
-            pure (reached.catalogEdges <> reached.bodyEdges, bodyNotes label (Just (fs.unchecked <> L.sortOn (\(name, _) -> Map.lookup name position) reached.failed)))
+        Just (fs, candidates) -> do
+            let input =
+                    ReachInput
+                        { conn
+                        , extra
+                        , index
+                        , tempTableScript
+                        , starts
+                        , functions = fs
+                        , candidates
+                        , implicit = [a | o <- fs.implicit, Just a <- [Map.lookup (CatalogId pgProc o 0) addresses]]
+                        }
+            reached <- discoverReachable input (firstReach index starts edges)
+            pure (reached.catalogEdges <> reached.bodyEdges, bodyNotes label (Just (fs.unchecked <> inCheckableOrder fs reached.failed)))
+
+
+-- | The checkable functions as 'bodiesToAnalyse' sees them. Their words are split over
+-- eight threads and forced there.
+bodyCandidates :: Schema -> Addresses -> Map ObjectId BodyText -> [PlFunction] -> IO [BodyCandidate PlFunction]
+bodyCandidates schema addresses split_ checkable =
+    concat <$> pooledMapConcurrently forced (eightParts checkable)
+  where
+    forced part = do
+        let candidates = mapMaybe (bodyCandidate addresses (wordsAt schema split_)) part
+        _ <- evaluate (foldl' (\n c -> n + HS.size c.body.wordSet) (0 :: Int) candidates)
+        pure candidates
+
+
+-- | A function with its object, its words, and the table it is a trigger on; 'Nothing'
+-- when it has no address.
+bodyCandidate :: Addresses -> (ObjectId -> BodyText) -> PlFunction -> Maybe (BodyCandidate PlFunction)
+bodyCandidate addresses wordsOfObject f = do
+    object <- Map.lookup (CatalogId pgProc f.oid 0) addresses
+    pure
+        BodyCandidate
+            { value = f
+            , object
+            , body = wordsOfObject object
+            , triggerRelation = f.relid >>= \r -> Map.lookup (CatalogId pgClass r 0) addresses
+            }
+
+
+-- | The words of a routine: split already, or split from its definition here.
+wordsAt :: Schema -> Map ObjectId BodyText -> ObjectId -> BodyText
+wordsAt schema split_ object = fromMaybe (bodyText (maybe "" printed (Map.lookup (definitionKey object) schema))) (Map.lookup object split_)
+
+
+-- | Where the search starts: the first @pg_depend@ edges read, nothing analysed yet.
+firstReach :: AddressIndex -> Set ObjectId -> [Edge] -> Reach
+firstReach index starts edges =
+    Reach
+        { explored = withColumns index (starts <> Set.fromList (map (.dependent) edges))
+        , catalogEdges = edges
+        , bodyEdges = []
+        , analysed = Set.empty
+        , failed = []
+        }
+
+
+-- | One round: read the @pg_depend@ edges of what is newly reached, then analyse the
+-- bodies that may reach further; repeated until neither adds anything.
+discoverReachable :: ReachInput -> Reach -> IO Reach
+discoverReachable input reach = do
+    let frontier = (input.starts <> reachableFrom (reachedSoFar reach) input.starts) `Set.difference` reach.explored
+    more <- timed "reach.dependFrom" $ dependenciesFrom input.conn input.index.addresses (idsFor input.index frontier)
+    let read_ = reach{explored = reach.explored <> withColumns input.index (frontier <> Set.fromList (map (.dependent) more)), catalogEdges = reach.catalogEdges <> more}
+    case [f | f <- picked input (reachedSoFar read_), f.oid `Set.notMember` read_.analysed] of
+        []
+            | Set.null frontier -> pure read_
+            | otherwise -> discoverReachable input read_
+        todo -> analyse input todo read_ >>= discoverReachable input
+
+
+-- | The functions whose bodies may reach further. All of them once a cast or operator
+-- function is reached, since bodies use those without naming them.
+picked :: ReachInput -> Dependencies -> [PlFunction]
+picked input deps
+    | any (`Set.member` (input.starts <> reachableFrom deps input.starts)) input.implicit = [f.value | f <- input.candidates]
+    | otherwise = bodiesToAnalyse deps input.starts input.candidates
+
+
+-- | Analyses the bodies of @todo@ and adds the edges found.
+analyse :: ReachInput -> [PlFunction] -> Reach -> IO Reach
+analyse input todo reach = do
+    let fs = input.functions
+    (uses, failed) <- timed [i|reach.analyseBodies n=#{length todo}|] $ analyseBodies (input.conn :| input.extra) fs{tempTables = input.tempTableScript >>= maybe fs.tempTables pure} todo
+    pure
+        reach
+            { analysed = reach.analysed <> Set.fromList (map (.oid) todo)
+            , bodyEdges = reach.bodyEdges <> edgesBetween input.index.addresses uses
+            , failed = reach.failed <> failed
+            }
+
+
+-- | The functions plpgsql_check could not analyse, in the order it lists the checkable ones.
+inCheckableOrder :: PlFunctions -> Skipped -> Skipped
+inCheckableOrder fs = L.sortOn (\(name, _) -> Map.lookup name position)
+  where
+    position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
 
 
 -- | The words of every function's and procedure's definition, split on every core.
@@ -231,13 +335,32 @@ routineWords schema = do
             let split_ = [(addr, bodyText def) | (addr, def) <- part]
             _ <- evaluate (foldl' (\n (_, b) -> n + HS.size b.wordSet + T.length b.lowered) (0 :: Int) split_)
             pure split_
-        parts = [[r | (n, r) <- zip [0 :: Int ..] routines, n `mod` 8 == k] | k <- [0 .. 7]]
-    Map.fromList . concat <$> pooledMapConcurrently split parts
+    Map.fromList . concat <$> pooledMapConcurrently split (eightParts routines)
+
+
+-- | The list dealt into eight parts, in turn: work for eight threads.
+eightParts :: [a] -> [[a]]
+eightParts xs = [[x | (n, x) <- zip [0 :: Int ..] xs, n `mod` 8 == k] | k <- [0 .. 7]]
+
+
+-- | A database's schema and the dependency edges read from it.
+data SchemaSnapshot = SchemaSnapshot
+    { schema :: Schema
+    , dependencies :: Dependencies
+    }
+
+
+-- | What 'readBoth' reads: @--from@, @--to@, and the body checks of @--to@.
+data ComparisonInputs = ComparisonInputs
+    { source :: SchemaSnapshot
+    , target :: SchemaSnapshot
+    , bodyChecks :: Map ObjectKey BodyCheck
+    }
 
 
 -- | Reads both databases at the same time, then the edges the command needs, given what
 -- differs, alongside the body checks; the edges of @--to@ only for 'ForPlan'.
-readBoth :: Source -> ConnectionString -> Purpose -> RIO AppEnv ((Schema, Dependencies), (Schema, Dependencies), Map ObjectKey BodyCheck)
+readBoth :: Source -> ConnectionString -> Purpose -> RIO AppEnv ComparisonInputs
 readBoth from toDb purpose = do
     env <- ask
     let scope = env.scope
@@ -263,7 +386,12 @@ readBoth from toDb purpose = do
                         )
                         (bodyChecks scope toDb toSchema plainChanges)
             for_ (fromNotes <> toNotes) note
-            pure ((fromSchema, indexEdges fromEdges), (toSchema, indexEdges toEdges), checks)
+            pure
+                ComparisonInputs
+                    { source = SchemaSnapshot{schema = fromSchema, dependencies = indexEdges fromEdges}
+                    , target = SchemaSnapshot{schema = toSchema, dependencies = indexEdges toEdges}
+                    , bodyChecks = checks
+                    }
 
 
 -- | Body checks for the definitions that are added or changed: no other check is consulted.

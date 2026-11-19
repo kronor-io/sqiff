@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE NoFieldSelectors #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 module Sqiff.Diff (
@@ -12,6 +13,7 @@ module Sqiff.Diff (
     affected,
     BodyText (..),
     bodyText,
+    BodyCandidate (..),
     bodiesToAnalyse,
 ) where
 
@@ -119,11 +121,22 @@ wordsOf = HS.fromList . filter (not . T.null) . T.split (not . identifierChar)
     identifierChar c = isAlphaNum c || c == '_' || c == '$'
 
 
+-- | A function whose body 'bodiesToAnalyse' may pick.
+data BodyCandidate a = BodyCandidate
+    { value :: a
+    , object :: ObjectId
+    , body :: BodyText
+    -- ^ The words of its definition.
+    , triggerRelation :: Maybe ObjectId
+    -- ^ The table it is a trigger function on, if it is one.
+    }
+
+
 -- | Of @functions@, those whose body edges 'affected' can follow from @starts@: their
 -- definition names a reached object, or they are a trigger function on the closure.
-bodiesToAnalyse :: Dependencies -> Set ObjectId -> [(a, ObjectId, BodyText, Maybe ObjectId)] -> [a]
+bodiesToAnalyse :: Dependencies -> Set ObjectId -> [BodyCandidate a] -> [a]
 bodiesToAnalyse deps starts functions =
-    [f | (f, _, def, trigger) <- functions, named def || maybe False (`Set.member` closure) trigger]
+    [f.value | f <- functions, named f.body || maybe False (`Set.member` closure) f.triggerRelation]
   where
     reached = reachableFrom deps starts
     closure = starts <> reached
