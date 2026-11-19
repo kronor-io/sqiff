@@ -5,6 +5,8 @@ select
     a.attrelid as relid,
     jsonb_build_object(
         'position', a.attnum,
+        -- Only there because a parent table has it.
+        'inherited', not a.attislocal,
         'type', format_type(a.atttypid, a.atttypmod),
         -- The schema is left out for pg_catalog, where the built-in collations are.
         'collation', case when a.attcollation <> t.typcollation then jsonb_build_object(

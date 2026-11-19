@@ -1,0 +1,6 @@
+-- table public.child
+alter table public.child no inherit public.base;
+
+-- table public.child
+alter table public.child inherit public.audit;
+

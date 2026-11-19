@@ -28,6 +28,14 @@ select
                     where h.inhrelid = c.oid
                 )
             end,
+            -- Parents by inherits, not by partitioning, in order.
+            'inherits', (
+                select coalesce(jsonb_agg(jsonb_build_object('schema', pn.nspname, 'name', p.relname) order by h.inhseqno), '[]')
+                from pg_inherits h
+                join pg_class p on p.oid = h.inhparent
+                join pg_namespace pn on pn.oid = p.relnamespace
+                where h.inhrelid = c.oid and not c.relispartition
+            ),
             'row_security', c.relrowsecurity,
             'force_row_security', c.relforcerowsecurity,
             -- The table's storage options, then its TOAST table's with a toast. prefix.

@@ -288,12 +288,14 @@ definition ctx key object change = case object of
                     <> " ("
                     <> columnList
                     <> ")"
+                    <> (if null def.inherits then "" else " inherits (" <> T.intercalate ", " (map qualified def.inherits) <> ")")
                     <> maybe "" (" partition by " <>) def.partitionBy
                     <> maybe "" (" " <>) (withOptions def.options)
                 )
                 : settings
       where
-        columnList = case Map.findWithDefault [] t ctx.newTableColumns of
+        -- Columns a parent gives it are not declared again.
+        columnList = case [col | col@(_, d) <- Map.findWithDefault [] t ctx.newTableColumns, not d.inheritedOnly] of
             [] -> ""
             cols -> [i|\n#{T.intercalate ",\n" (map columnLine cols)}\n|]
         columnLine (c, col) = [i|    #{quoted c} #{columnSql col}|]
@@ -308,6 +310,8 @@ definition ctx key object change = case object of
                 <> toggle (.rowSecurity) ("enable row level security", "disable row level security") []
                 <> toggle (.forceRowSecurity) ("force row level security", "no force row level security") []
                 <> storageOptions
+                <> [create (Shared, []) [i|alter table #{qualified t} no inherit #{qualified p}|] | p <- old.inherits, p `notElem` new.inherits]
+                <> [create (Shared, []) [i|alter table #{qualified t} inherit #{qualified p}|] | p <- new.inherits, p `notElem` old.inherits]
       where
         toggle setting (enable, disable) hazards
             | setting old == setting new = []
@@ -327,6 +331,8 @@ definition ctx key object change = case object of
 
     column t c = case traverse asColumn change of
         Nothing -> manual "the catalog described the column without its column facts"
+        -- The parent's change brings it, changes it or takes it away.
+        Just ch | all (.inheritedOnly) ch -> []
         Just (Added parsed)
             | t `Set.member` ctx.newTables -> []
             | otherwise ->
@@ -436,7 +442,8 @@ end |]
                     tableLiteral = literal (qualified t)
                  in doBlock [i| begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal (nameText c)})])); end |]
 
-    tableConstraint t c = typed asConstraint \case
+    tableConstraint t c = typed asConstraint \ch -> if all (.inheritedOnly) ch then [] else tableConstraintOf t c ch
+    tableConstraintOf t c = \case
         Added def -> addConstraint def <> restoreComments [TableConstraint t c]
         Dropped old -> [dropConstraint old]
         Changed old new

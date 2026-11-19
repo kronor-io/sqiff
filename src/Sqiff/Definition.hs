@@ -229,6 +229,8 @@ data ColumnDef = ColumnDef
     -- ^ Adding the column rewrites the table: its default is volatile, or its type a
     -- domain with constraints.
     , position :: Position
+    , inheritedOnly :: Bool
+    -- ^ The table has it only because a parent does, so it comes and goes with the parent's.
     }
     deriving stock (Eq, Show, Generic)
     deriving anyclass (NFData)
@@ -405,7 +407,8 @@ instance FromJSON ColumnDef where
             (Just _, Just _) -> fail "a column cannot be both an identity and generated"
         rewritesOnAdd <- o .:? "rewrites_on_add" .!= False
         position <- Position <$> o .:? "position" .!= 0
-        pure ColumnDef{colType, collation, nullability, value, rewritesOnAdd, position}
+        inheritedOnly <- o .:? "inherited" .!= False
+        pure ColumnDef{colType, collation, nullability, value, rewritesOnAdd, position, inheritedOnly}
       where
         identityKind :: Text -> Parser IdentityKind
         identityKind = \case
@@ -429,9 +432,18 @@ data TableDef = TableDef
     , forceRowSecurity :: Bool
     , options :: [Text]
     -- ^ Storage options such as @fillfactor=70@; the TOAST table's with a @toast.@ prefix.
+    , inherits :: [QName]
+    -- ^ Parents by @inherits@, in order.
     }
     deriving stock (Eq, Show, Generic)
     deriving anyclass (NFData)
+
+
+newtype InheritedFrom = InheritedFrom QName
+
+
+instance FromJSON InheritedFrom where
+    parseJSON = withObject "parent" \p -> InheritedFrom <$> (qname <$> p .: "schema" <*> p .: "name")
 
 
 data PartitionOf = PartitionOf
@@ -456,6 +468,7 @@ tableText t =
         $ ["unlogged" | t.unlogged]
         <> ["partition by " <> key | Just key <- [t.partitionBy]]
         <> ["partition of " <> qualified p.parent <> " " <> p.bound | Just p <- [t.partitionOf]]
+        <> ["inherits " <> qualified p | p <- t.inherits]
         <> ["row level security" | t.rowSecurity]
         <> ["force row level security" | t.forceRowSecurity]
         <> maybeToList (withOptions t.options)
@@ -525,6 +538,8 @@ data ConstraintDef = ConstraintDef
     , references :: Maybe ForeignKeyTarget
     , clause :: Text
     -- ^ As @pg_get_constraintdef@ prints it, @NOT VALID@ included.
+    , inheritedOnly :: Bool
+    -- ^ The table has it only because a parent does.
     }
     deriving stock (Eq, Show, Generic)
     deriving anyclass (NFData)
@@ -558,6 +573,7 @@ instance FromJSON TableDef where
             <*> o
             .:? "options"
             .!= []
+            <*> (map (\(InheritedFrom q) -> q) <$> o .:? "inherits" .!= [])
 
 
 instance FromJSON ViewDef where
@@ -597,7 +613,8 @@ instance FromJSON ConstraintDef where
         columns <- map identifier <$> o .:? "columns" .!= []
         references <- o .:? "references" >>= traverse (withObject "references" \r -> ForeignKeyTarget <$> (qname <$> r .: "schema" <*> r .: "table") <*> (map identifier <$> r .: "columns"))
         clause <- o .: "clause"
-        pure ConstraintDef{kind, validity, columns, references, clause}
+        inheritedOnly <- o .:? "inherited" .!= False
+        pure ConstraintDef{kind, validity, columns, references, clause, inheritedOnly}
 
 
 -- | A sequence that is not an identity column's.

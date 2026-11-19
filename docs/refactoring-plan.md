@@ -413,6 +413,17 @@ Guiding rules:
     to the user ("still differs"). A run against a database showed the old build
     failing and the new one rewriting the file.
 
+- [x] **Table inheritance (Codex 28, in part).**
+  - A table records its parents by `inherits`. Columns and constraints record whether
+    they are there only because a parent has them.
+  - A new child is created with `inherits (…)`, without declaring what it inherits.
+    Changed parents become `alter table … inherit` / `no inherit`. Inherited-only
+    columns and constraints come and go with the parent's, so they get no steps of
+    their own.
+  - Before, a child was created as a plain table with copies of its parent's columns,
+    and the round trip could not notice. Fixtures `table-inherits` and
+    `table-inherit-changed` cover it.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

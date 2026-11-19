@@ -7,6 +7,7 @@ select
         'clause', pg_get_constraintdef(con.oid),
         'kind', con.contype,
         'validated', con.convalidated,
+        'inherited', not con.conislocal,
         'columns', (
             select jsonb_agg(a.attname order by k.n)
             from unnest(con.conkey) with ordinality k (attnum, n)

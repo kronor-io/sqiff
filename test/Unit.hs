@@ -369,7 +369,7 @@ columns =
         , testCase "drift ignores validity but not the words \"not valid\" in a comment" do
             let key o = ObjectKey Comment o
                 table = Table (qname "public" "t")
-                column validity = ColumnDefinition (ColumnDef (typeName "int") Nothing (NotNull validity Nothing) (PlainColumn Nothing) False (Position 1))
+                column validity = ColumnDefinition (ColumnDef (typeName "int") Nothing (NotNull validity Nothing) (PlainColumn Nothing) False (Position 1) False)
                 columnKey = ObjectKey Definition (Column (qname "public" "t") (identifier "c"))
             Map.keys (fileDrift Set.empty (Map.fromList [(key table, Printed "is not valid")]) (Map.fromList [(key table, Printed "is")])) @?= [key table]
             fileDrift Set.empty (Map.fromList [(columnKey, column NotValidated)]) (Map.fromList [(columnKey, column Validated)]) @?= Map.empty
@@ -493,11 +493,11 @@ sqitchChecks =
             length (batchProblems p [unitNamed ReworkChange "c"]) @?= 1
             batchProblems p [unitNamed ReworkChange "a", unitNamed AddChange "b"] @?= []
         , testCase "a column's position does not make it differ" do
-            let at n = ColumnDefinition (ColumnDef (typeName "int") Nothing Nullable (PlainColumn Nothing) False (Position n))
+            let at n = ColumnDefinition (ColumnDef (typeName "int") Nothing Nullable (PlainColumn Nothing) False (Position n) False)
                 key = ObjectKey Definition (Column (qname "public" "t") (identifier "a"))
             diff (\_ a b -> a == b) (Map.fromList [(key, at 1)]) (Map.fromList [(key, at 3)]) @?= Map.empty
         , testCase "verify checks a column's full type, not only its base type" do
-            let col ty = ColumnDefinition (ColumnDef (typeName ty) Nothing Nullable (PlainColumn Nothing) False (Position 1))
+            let col ty = ColumnDefinition (ColumnDef (typeName ty) Nothing Nullable (PlainColumn Nothing) False (Position 1) False)
                 object = Column (qname "public" "t") (identifier "a")
                 retype = Step CreatePhase 6 object "alter table public.t alter column a type character varying(20)" Shared [] (ObjectKey Definition object) (Changed (col "character varying(10)") (col "character varying(20)")) UndoObject
                 script = verifyScript "-- verify" [retype]

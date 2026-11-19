@@ -1,0 +1,4 @@
+changed table public.child
+  - inherits public.base
+  + inherits public.audit
+0 added, 0 dropped, 1 changed
