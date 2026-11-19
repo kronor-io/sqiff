@@ -1,6 +1,7 @@
 {-# LANGUAGE DisambiguateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Tests of the pure parts: quoting, name templates, script splitting, plan parsing,
@@ -10,6 +11,7 @@ module Unit (tests) where
 
 import Data.Aeson (FromJSON)
 import Data.Aeson qualified as Aeson
+import Data.String.Interpolate (i)
 import Data.Time (UTCTime (..), fromGregorian)
 import Hedgehog (Gen, forAll, property, (===))
 import Hedgehog.Gen qualified as Gen
@@ -215,6 +217,7 @@ templates =
   where
     placeholders p = [T.takeWhile (/= '}') rest | rest <- drop 1 (T.split (== '{') p)]
     segment :: Gen Text
+    -- [allow:SqiffInterpolate] a set of characters to draw from, not text
     segment = Gen.text (Range.linear 1 12) (Gen.element (['a' .. 'z'] <> ['0' .. '9'] <> "_-."))
 
 
@@ -525,9 +528,9 @@ tableFlags =
     describeMode :: Either Text TableOptions -> Either Text Text
     describeMode = fmap \o -> case o.mode of
         MigrateToFile m ->
-            let swap = if m.sameTypeSwap == AskIfRename then "ask if rename" else "drop and add"
+            let swap = if m.sameTypeSwap == AskIfRename then "ask if rename" else "drop and add" :: Text
              in case m.comparison of
-                    WithBaseFile rs -> "base file, " <> tshow (length rs) <> " renames, " <> swap
+                    WithBaseFile rs -> [i|base file, #{tshow (length rs)} renames, #{swap}|]
                     WithLiveTable _ -> "live table"
         RewriteFile live -> "rewrite from " <> maybe "--db" redacted live
 
@@ -639,7 +642,7 @@ sqitchChecks =
                 ctx = context Map.empty Map.empty Map.empty noDependencies Map.empty
                 overload arg =
                     let object = Routine Function (qname "public" "f") [typeName arg]
-                     in (createStep object ("create function public.f(" <> arg <> ")")){rank = 9, change = Added (Printed arg)}
+                     in (createStep object [i|create function public.f(#{arg})|]){rank = 9, change = Added (Printed arg)}
                 written = units names (const True) ctx Map.empty (plan "") (UTCTime (fromGregorian 2026 11 18) 0) [overload "int", overload "text"]
             map (\u -> (u.changeName, length u.deploy)) written @?= [("public/function/f", 2)]
         , testCase "the layout: the target's setting beats the engine's, which beats the core's" do

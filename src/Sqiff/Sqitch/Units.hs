@@ -558,7 +558,7 @@ verifyScript header steps =
         MaterializedView q -> [relation s q]
         Sequence q -> [relation s q]
         Routine _ q args ->
-            let signature = qualified q <> "(" <> T.intercalate ", " (map typeText args) <> ")"
+            let signature = [S.i|#{qualified q}(#{T.intercalate ", " (map typeText args)})|]
              in [lookupBy s "to_regprocedure" signature]
         Type t ->
             lookupBy s "to_regtype" (typeText t)
@@ -590,4 +590,6 @@ verifyScript header steps =
     reg t = let name = literal (qualified t) in [S.i|#{name}::regclass|]
     assertBlock
         | null asserts = []
-        | otherwise = ["    " <> doBlock (T.intercalate "\n" ([""] <> ["    begin"] <> map ("        " <>) asserts <> ["    end", "    "])) <> ";"]
+        | otherwise =
+            let block = doBlock (T.intercalate "\n" ([""] <> ["    begin"] <> map ("        " <>) asserts <> ["    end", "    "]))
+             in [[S.i|    #{block};|]]
