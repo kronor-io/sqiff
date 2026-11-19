@@ -578,6 +578,11 @@ sqitchChecks =
             for_ ["[core]", "[engine \"pg\"]", "[target \"prod\"]", "\ttop_dir = \"alt\"", "\turi = \"db:pg://h/x\""] \line ->
                 (line, line `T.isInfixOf` conf) @?= (line, True)
             ("top_dir = \"db\"" `T.isInfixOf` conf) @?= False
+        , testCase "a rework copies the scripts next to them, not under top_dir twice" do
+            l <- either (assertFailure . T.unpack) pure (resolveLayout "/p" Nothing Nothing [("core.engine", "pg"), ("core.top_dir", "database")] [])
+            let conf = sqitchConf l
+            for_ ["\treworked_deploy_dir = \"database/deploy\"", "\treworked_revert_dir = \"database/revert\"", "\treworked_verify_dir = \"database/verify\""] \line ->
+                (line, line `T.isInfixOf` conf) @?= (line, True)
         ]
   where
     plan entries = parsePlan ("%syntax-version=1.0.0\n%project=p\n\n" <> entries)

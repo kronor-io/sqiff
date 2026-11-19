@@ -137,6 +137,8 @@ secondTag = withSqitchProject \root -> do
     write [unit ReworkChange "one" "create table public.one (a int, b int)"]
     plan <- readPlan planFile
     plan.tags @?= Set.fromList ["2026-11-18_sqiff", "2026-11-18_sqiff_2"]
+    snapshots <- for ["deploy", "revert", "verify"] \d -> (d,) <$> doesFileExist (root </> "db" </> d </> "one@2026-11-18_sqiff.sql")
+    snapshots @?= [("deploy", True), ("revert", True), ("verify", True)]
 
 
 refusesCollisions :: Assertion

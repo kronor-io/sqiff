@@ -37,9 +37,10 @@ data Layout = Layout
     , deployDir :: FilePath
     , revertDir :: FilePath
     , verifyDir :: FilePath
-    , reworkedDirs :: [FilePath]
-    -- ^ Where @sqitch rework@ copies the previous scripts, when that is not the script
-    -- directories themselves.
+    , reworkedDeployDir :: FilePath
+    , reworkedRevertDir :: FilePath
+    , reworkedVerifyDir :: FilePath
+    -- ^ Where @sqitch rework@ copies the previous scripts.
     , extension :: String
     , local :: [(Text, Text)]
     -- ^ The project's own settings, as @sqitch config --local --list@ prints them.
@@ -68,7 +69,7 @@ scriptPath l script change = l.root </> dir </> T.unpack change <.> l.extension
 
 -- | Every directory sqitch writes scripts to, absolute.
 scriptDirs :: Layout -> [FilePath]
-scriptDirs l = map (normalise . (l.root </>)) ([l.deployDir, l.revertDir, l.verifyDir] <> l.reworkedDirs)
+scriptDirs l = nubOrd (map (normalise . (l.root </>)) [l.deployDir, l.revertDir, l.verifyDir, l.reworkedDeployDir, l.reworkedRevertDir, l.reworkedVerifyDir])
 
 
 -- | The layout of the project in @root@, with @--top-dir@ and @--plan-file@ when they
@@ -115,10 +116,6 @@ resolveLayout root top planGiven merged local = do
         deployDir = dirFor "deploy_dir" "deploy"
         revertDir = dirFor "revert_dir" "revert"
         verifyDir = dirFor "verify_dir" "verify"
-        reworkedDirs =
-            filter
-                (`notElem` [deployDir, revertDir, verifyDir])
-                [reworkedDirFor "reworked_deploy_dir" "deploy", reworkedDirFor "reworked_revert_dir" "revert", reworkedDirFor "reworked_verify_dir" "verify"]
     when (any (T.any (== '\n') . snd) local) $ Left "sqitch.conf has a multi-line value, which sqiff cannot pass on to sqitch"
     pure
         Layout
@@ -128,7 +125,9 @@ resolveLayout root top planGiven merged local = do
             , deployDir
             , revertDir
             , verifyDir
-            , reworkedDirs
+            , reworkedDeployDir = reworkedDirFor "reworked_deploy_dir" "deploy"
+            , reworkedRevertDir = reworkedDirFor "reworked_revert_dir" "revert"
+            , reworkedVerifyDir = reworkedDirFor "reworked_verify_dir" "verify"
             , extension = maybe "sql" T.unpack (named "extension")
             , local
             , engine
@@ -142,13 +141,18 @@ resolveLayout root top planGiven merged local = do
 sqitchConf :: Layout -> Text
 sqitchConf l = T.unlines (concatMap section (Map.toList sections))
   where
-    layoutKeys = ["top_dir", "plan_file", "deploy_dir", "revert_dir", "verify_dir", "extension"]
+    layoutKeys = ["top_dir", "plan_file", "deploy_dir", "revert_dir", "verify_dir", "reworked_dir", "reworked_deploy_dir", "reworked_revert_dir", "reworked_verify_dir", "extension"]
+    -- sqitch puts a reworked directory left unset under top_dir, so a pinned relative
+    -- deploy_dir would land in top_dir twice.
     pinned =
         [ ("top_dir", T.pack l.topDir)
         , ("plan_file", T.pack l.planFile)
         , ("deploy_dir", T.pack l.deployDir)
         , ("revert_dir", T.pack l.revertDir)
         , ("verify_dir", T.pack l.verifyDir)
+        , ("reworked_deploy_dir", T.pack l.reworkedDeployDir)
+        , ("reworked_revert_dir", T.pack l.reworkedRevertDir)
+        , ("reworked_verify_dir", T.pack l.reworkedVerifyDir)
         , ("extension", T.pack l.extension)
         ]
     levels = [("core", Nothing), ("engine", Just l.engine)] <> [("target", Just t) | Just t <- [l.target]]
