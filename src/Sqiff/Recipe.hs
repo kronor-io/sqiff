@@ -805,7 +805,8 @@ privileges key object change = case (target, traverse asAcl change) of
     (Just onObject, Just (Added new)) -> reconcile onObject DefaultAcl new
     (Just onObject, Just (Changed old new)) -> reconcile onObject old new
   where
-    step hazards sql = Step CreatePhase privilegesRank object sql Shared hazards key change UndoObject
+    step hazards sql =
+        Step{phase = CreatePhase, rank = privilegesRank, object, sql, txn = Shared, hazards, key, change, undo = UndoObject}
     target = case object of
         Table t -> Just ("table " <> qualified t)
         View t -> Just ("table " <> qualified t)
@@ -876,7 +877,8 @@ comment ctx key change = case (commentTarget key.object, printed <$> change) of
     (Just subject, Added new) -> [step (subject <> " is " <> literal new)]
     (Just subject, Changed _ new) -> [step (subject <> " is " <> literal new)]
   where
-    step sql = Step CreatePhase commentRank key.object ("comment on " <> sql) Shared [] key change UndoObject
+    step sql =
+        Step{phase = CreatePhase, rank = commentRank, object = key.object, sql = "comment on " <> sql, txn = Shared, hazards = [], key, change, undo = UndoObject}
 
 
 -- | What @comment on@ names the object as.

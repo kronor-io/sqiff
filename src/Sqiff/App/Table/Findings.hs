@@ -26,7 +26,7 @@ import RIO.List qualified as L
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
-import Sqiff.App.Dependents (Dependents (..), catalogDependentsOf, routinesNaming)
+import Sqiff.App.Dependents (Dependents (..), exactDependentsOf, routinesNaming)
 import Sqiff.App.Options (Comparison (..), MigrateOptions (..), SameTypeSwap (..), TableOptions (..), renamesOf)
 import Sqiff.App.Table.Env
 import Sqiff.Config (Config (..))
@@ -134,7 +134,9 @@ data Effects = Effects
     , recreations :: Map (QName, Identifier) Recreation
     -- ^ What goes and comes back around each retyped column.
     , recreatedAround :: Map ObjectId (Set ObjectId)
-    -- ^ For each retyped column, the objects that go and come back around it.
+    -- ^ For each retyped column, the objects that go and come back around it. Every
+    -- retyped column has an entry, empty when nothing goes around it: being a key here
+    -- is what marks a column as retyped.
     }
 
 
@@ -203,7 +205,8 @@ blockers effects ev = onDropped <> onRetyped <> Map.keysSet ev.bodies.breaking <
         Set.fromList
             [ d
             | (object, ds) <- Map.toList ev.deps.exact
-            , object `Map.member` effects.recreatedAround
+            , -- The column is retyped.
+            object `Map.member` effects.recreatedAround
             , d <- Set.toList ds
             , not (recreatedWith effects object d)
             , not (rebuiltWithColumn d)
@@ -236,7 +239,7 @@ foreignKeyPartners table deps column =
     Set.toList
         . Set.fromList
         $ [ qualified other
-          | k@(TableConstraint onTable _) <- Set.toList (catalogDependentsOf column deps)
+          | k@(TableConstraint onTable _) <- Set.toList (exactDependentsOf column deps)
           , Just (ConstraintDefinition def) <- [Map.lookup (definitionKey k) deps.dbSchema]
           , Just target <- [def.references]
           , let other = if onTable == table then target.table else onTable
@@ -343,7 +346,7 @@ usageOf effects ev object =
         , namedIn = Set.toList (uncheckedNaming ev object)
         }
   where
-    dependents = catalogDependentsOf object ev.deps
+    dependents = exactDependentsOf object ev.deps
     isDropped = object `Set.member` effects.dropped
     (droppedWith, rest) = L.partition (\d -> isDropped && goesWithColumn effects.table d) (Set.toList dependents)
     (recreatedAround, usedBy) = L.partition (recreatedWith effects object) (filter (`Map.notMember` ev.bodies.breaking) rest)

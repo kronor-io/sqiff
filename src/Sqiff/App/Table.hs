@@ -24,7 +24,7 @@ import RIO.FilePath (makeRelative, normalise, (</>))
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
-import Sqiff.App.Dependents (Dependents (..), catalogDependentsOf, dependentsIn, dependentsScope)
+import Sqiff.App.Dependents (Dependents (..), dependentsIn, dependentsScope, exactDependentsOf)
 import Sqiff.App.Env (say)
 import Sqiff.App.Options (Comparison (..), MigrateOptions (..), Output (..), TableMode (..), TableOptions (..), renamesOf)
 import Sqiff.App.Read (Connected (..), routineWords, withDatabase)
@@ -211,7 +211,7 @@ foreignKeyBreaksFor conn deps retyped =
         <$> for
             [ (addr, k, types)
             | addr <- map retypedObject retyped
-            , k@(TableConstraint onTable _) <- Set.toList (catalogDependentsOf addr deps)
+            , k@(TableConstraint onTable _) <- Set.toList (exactDependentsOf addr deps)
             , Just (ConstraintDefinition def) <- [Map.lookup (definitionKey k) deps.dbSchema]
             , Just types <- [foreignKeyTypes typeIn onTable def]
             ]
