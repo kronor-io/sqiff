@@ -1,7 +1,9 @@
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE NoFieldSelectors #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | What plpgsql_check finds in function bodies: the objects they use, and the errors an
@@ -15,7 +17,9 @@ module Sqiff.Catalog.PlpgsqlCheck (
     plpgsqlFunctions,
     analyseBodies,
     bodyErrors,
-    notChecked,
+    BodyError (..),
+    Outcome (..),
+    bodyErrorText,
     tempTableStatements,
 ) where
 
@@ -193,9 +197,45 @@ analyseBodies conns fs functions = do
     useRow = (,,) <$> int8Column <*> int8Column <*> int8Column
 
 
--- | plpgsql_check's errors, as (function, line, message), for these signatures in the
--- transaction @conn@ is in; 'Nothing' when plpgsql_check is not installed.
-bodyErrors :: Connection.Connection -> Text -> Text -> IO (Maybe Text) -> [Text] -> [Text] -> IO (Maybe (Set (Text, Int32, Text)))
+-- | What checking one function's body found.
+data BodyError = BodyError
+    { signature :: Text
+    , line :: Int32
+    -- ^ 0 when the error is not on a line of the body.
+    , outcome :: Outcome
+    , message :: Text
+    }
+
+
+-- | Whether the body was checked and found wrong, or could not be checked.
+data Outcome = Fails | NotChecked
+    deriving stock (Eq, Show)
+
+
+-- | Errors compare as their function, line and text, so one function's errors keep the
+-- order they had as text.
+instance Eq BodyError where
+    a == b = errorOrder a == errorOrder b
+
+
+instance Ord BodyError where
+    compare = comparing errorOrder
+
+
+errorOrder :: BodyError -> (Text, Int32, Text)
+errorOrder e = (e.signature, e.line, bodyErrorText e)
+
+
+-- | The error as the report shows it.
+bodyErrorText :: BodyError -> Text
+bodyErrorText e = case e.outcome of
+    Fails -> e.message
+    NotChecked -> "not checked: " <> e.message
+
+
+-- | plpgsql_check's errors for these signatures in the transaction @conn@ is in;
+-- 'Nothing' when plpgsql_check is not installed.
+bodyErrors :: Connection.Connection -> Text -> Text -> IO (Maybe Text) -> [Text] -> [Text] -> IO (Maybe (Set BodyError))
 bodyErrors conn aside table made signatures sqlSignatures =
     run conn () plpgsqlCheckSchema
         >>= traverse \extSchema -> do
@@ -203,11 +243,11 @@ bodyErrors conn aside table made signatures sqlSignatures =
             made' <- timed "bodyErrors.tempTables" $ guarded (Connection.use conn (Session.script tempTables))
             recompiled <- if null signatures then pure (Right ()) else timed "bodyErrors.recompile" $ guarded (Connection.use conn (Session.script recompile))
             plErrors <- case (made', recompiled) of
-                (Left e, _) -> pure [[(s, 0, notChecked <> "plpgsql_check's temp tables could not be made: " <> errorText e) | s <- signatures]]
-                (_, Left e) -> pure [[(s, 0, notChecked <> "the functions could not be recompiled: " <> errorText e) | s <- signatures]]
+                (Left e, _) -> pure [[notChecked s ("plpgsql_check's temp tables could not be made: " <> errorText e) | s <- signatures]]
+                (_, Left e) -> pure [[notChecked s ("the functions could not be recompiled: " <> errorText e) | s <- signatures]]
                 _ -> for (chunks signatures) (timed "bodyErrors.batch" . inBatches extSchema)
             sqlErrors <- for sqlSignatures \signature ->
-                either (\e -> [(signature, 0, errorText e)]) (const [])
+                either (\e -> [BodyError{signature, line = 0, outcome = Fails, message = errorText e}]) (const [])
                     <$> timed ("bodyErrors.sql " <> signature) (guarded (Connection.use conn (Session.statement signature validate)))
             pure (Set.fromList (concat (plErrors <> sqlErrors)))
   where
@@ -233,7 +273,7 @@ end |]
         guarded (Connection.use conn (Session.statement (batch, table) (Statement.unpreparable (query extSchema) params decoder))) >>= \case
             Right errors -> pure errors
             Left e@(Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError _))
-                | [s] <- batch -> pure [(s, 0, notChecked <> errorText e)]
+                | [s] <- batch -> pure [notChecked s (errorText e)]
             Left e
                 | [_] <- batch -> failWith [i|the body check failed: #{errorText e}|]
                 | otherwise -> do
@@ -243,7 +283,8 @@ end |]
         ([], _) -> []
         (b, rest) -> b : chunks rest
     params = contramap fst (E.param (E.nonNullable (E.foldableArray (E.nonNullable E.text)))) <> contramap snd (E.param (E.nonNullable E.text))
-    decoder = D.rowList ((,,) <$> textColumn <*> D.column (D.nonNullable D.int4) <*> textColumn)
+    notChecked signature message = BodyError{signature, line = 0, outcome = NotChecked, message}
+    decoder = D.rowList ((\signature line message -> BodyError{signature, line, outcome = Fails, message}) <$> textColumn <*> D.column (D.nonNullable D.int4) <*> textColumn)
     query extSchema =
         [i|
             select s.signature, e.lineno, e.message
@@ -271,11 +312,6 @@ end |]
             ) e
             order by s.n
         |]
-
-
--- | How 'bodyErrors' starts the message for a function it could not check.
-notChecked :: Text
-notChecked = "not checked: "
 
 
 -- | The schema plpgsql_check is installed in, if it is.
