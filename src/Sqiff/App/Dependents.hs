@@ -19,6 +19,7 @@ import RIO.Text qualified as T
 import Sqiff.App.Env (BodyChecks (..), Scope (..), note)
 import Sqiff.App.Read (Connected (..), reachableEdges)
 import Sqiff.Catalog (Partitions (..), relationColumns)
+import Sqiff.Dependencies (Dependencies, indexEdges, noDependencies)
 import Sqiff.Diff (BodyText (..), Change (..), Changes, affected)
 import Sqiff.Identifier
 import Sqiff.Model
@@ -29,7 +30,7 @@ data Dependents = Dependents
     { exact :: Map ObjectId (Set ObjectId)
     , named :: Map ObjectId (Set ObjectId)
     , dbSchema :: Schema
-    , dbEdges :: [Edge]
+    , dbDeps :: Dependencies
     , dbTempTables :: IO (Maybe Text)
     -- ^ The statements that make plpgsql_check's temp tables there.
     }
@@ -46,14 +47,15 @@ dependentsScope excluded = Scope{excluded, partitions = SkipPartitions, bodyChec
 -- something is dropped or changed.
 dependentsIn :: [Text] -> IO (Connected, Map ObjectId BodyText) -> Changes -> IO Dependents
 dependentsIn excluded described changes
-    | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty [] (pure Nothing))
+    | Set.null starts = pure (Dependents Map.empty Map.empty Map.empty noDependencies (pure Nothing))
     | otherwise = do
         (connected, split_) <- timed "deps.describeDatabase" described
         (edges, notes) <- timed "deps.reachableEdges" $ reachableEdges "--db" (dependentsScope excluded) starts connected (pure split_)
         for_ notes note
         let schema = connected.schema
             known = Set.fromList [k.object | k <- Map.keys schema, k.aspect == Definition]
-            exact = affected known edges changes
+            deps = indexEdges edges
+            exact = affected known deps changes
             viewsOf object = [v | a <- Set.toList (Map.findWithDefault Set.empty object exact), isView a, Just v <- [isRelation a]]
         measure "deps.affected" (Map.foldl' (\n s -> n + Set.size s) (0 :: Int) exact)
         viewColumns <- timed "deps.relationColumns" $ relationColumns connected.conn (Set.toList (Set.fromList (concatMap viewsOf (Set.toList starts))))
@@ -80,7 +82,7 @@ dependentsIn excluded described changes
                         , not (null wordSets)
                         ]
         measure "deps.textMatch" (Map.foldl' (\n s -> n + Set.size s) (0 :: Int) textual)
-        pure (Dependents exact textual schema edges connected.tempTableScript)
+        pure (Dependents exact textual schema deps connected.tempTableScript)
   where
     droppedHere object = case Map.lookup (definitionKey object) changes of
         Just (Dropped _) -> True

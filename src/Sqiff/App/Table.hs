@@ -36,6 +36,7 @@ import Sqiff.Config (Config (..), Names (..), fill, loadConfig, match)
 import Sqiff.Connection (failWith)
 import Sqiff.ConnectionString (ConnectionString)
 import Sqiff.Definition hiding (DomainType)
+import Sqiff.Dependencies (noDependencies)
 import Sqiff.Diff (BodyText (..), Change (..))
 import Sqiff.Git (findRepo, showFile)
 import Sqiff.Identifier
@@ -271,7 +272,7 @@ writeMigration conn baseline edit f = do
     sqitchPlan <- timed "write.readPlan" $ liftIO (readPlan (planPath env.layout))
     basePlan <- timed "write.basePlan" $ liftIO (parsePlan <$> showFile env.repo opts.base (planPath env.layout))
     now <- liftIO getCurrentTime
-    let inverseCtx = f.withViews (context Map.empty edit.desired edit.current [] (Map.map invert edit.changes))
+    let inverseCtx = f.withViews (context Map.empty edit.desired edit.current noDependencies (Map.map invert edit.changes))
         isIndex s = case s.object of Index _ -> True; _ -> False
         written = units env.config.names isIndex inverseCtx edit.changes sqitchPlan now f.steps
         tagging = Tagging{given = opts.tableTag, now}

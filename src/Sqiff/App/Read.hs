@@ -37,8 +37,8 @@ import Sqiff.Config (Config (..))
 import Sqiff.Connection (withConnection, withConnections, withSharedSnapshot)
 import Sqiff.ConnectionString (ConnectionString)
 import Sqiff.Definition (printed)
-import Sqiff.Diff (BodyText (..), Change (..), Changes, bodiesToAnalyse, bodyText, dependentsBy, diff)
-import Sqiff.Graph (reachedFrom)
+import Sqiff.Dependencies (Dependencies, indexEdges, reachableFrom)
+import Sqiff.Diff (BodyText (..), Change (..), Changes, bodiesToAnalyse, bodyText, diff)
 import Sqiff.Model
 import Sqiff.Timing (measure, timed)
 
@@ -145,6 +145,23 @@ bodyNotes label = \case
                 : [[i|  #{name}: #{reason}|] | (name, reason) <- skipped]
 
 
+-- | How far 'reachableEdges' has got.
+data Reach = Reach
+    { explored :: Set ObjectId
+    -- ^ The objects whose @pg_depend@ edges have been read.
+    , catalogEdges :: [Edge]
+    , bodyEdges :: [Edge]
+    -- ^ The edges plpgsql_check found in the bodies analysed.
+    , analysed :: Set Int64
+    -- ^ The functions whose bodies have been analysed, by oid.
+    , failed :: Skipped
+    }
+
+
+reachedSoFar :: Reach -> Dependencies
+reachedSoFar reach = indexEdges (reach.catalogEdges <> reach.bodyEdges)
+
+
 -- | The @pg_depend@ edges reachable from @starts@, and the body edges of the PL/pgSQL
 -- functions 'bodiesToAnalyse' picks, repeated until nothing new is reached or picked.
 reachableEdges :: Text -> Scope -> Set ObjectId -> Connected -> IO (Map ObjectId BodyText) -> IO ([Edge], [Text])
@@ -180,25 +197,30 @@ reachableEdges label scope starts Connected{conn, extra, schema, addresses, temp
         Just (fs, described) -> do
             let position = Map.fromList (zip [f.name | f <- fs.checkable] [0 :: Int ..])
                 implicit = [a | o <- fs.implicit, Just a <- [Map.lookup (CatalogId pgProc o 0) addresses]]
-                go explored pgEdges done bodyEdges failed = do
-                    let dependents = dependentsBy (pgEdges <> bodyEdges)
-                        frontier = (starts <> reachedFrom dependents starts) `Set.difference` explored
+                -- One round: read the pg_depend edges of what is newly reached, then
+                -- analyse the bodies that may reach further, until neither adds anything.
+                go reach = do
+                    let frontier = (starts <> reachableFrom (reachedSoFar reach) starts) `Set.difference` reach.explored
                     more <- timed "reach.dependFrom" $ dependenciesFrom conn addresses (idsFor frontier)
-                    let pgEdges' = pgEdges <> more
-                        explored' = explored <> withColumns (frontier <> Set.fromList (map (.dependent) more))
-                        dependents' = dependentsBy (pgEdges' <> bodyEdges)
+                    let read_ = reach{explored = reach.explored <> withColumns (frontier <> Set.fromList (map (.dependent) more)), catalogEdges = reach.catalogEdges <> more}
+                        deps = reachedSoFar read_
                         picked
-                            | any (`Set.member` (starts <> reachedFrom dependents' starts)) implicit = [f | (f, _, _, _) <- described]
-                            | otherwise = bodiesToAnalyse dependents' starts described
-                    case [f | f <- picked, f.oid `Set.notMember` done] of
+                            | any (`Set.member` (starts <> reachableFrom deps starts)) implicit = [f | (f, _, _, _) <- described]
+                            | otherwise = bodiesToAnalyse deps starts described
+                    case [f | f <- picked, f.oid `Set.notMember` read_.analysed] of
                         []
-                            | Set.null frontier -> pure (pgEdges' <> bodyEdges, failed)
-                            | otherwise -> go explored' pgEdges' done bodyEdges failed
+                            | Set.null frontier -> pure read_
+                            | otherwise -> go read_
                         todo -> do
-                            (uses, failed') <- timed [i|reach.analyseBodies n=#{length todo}|] $ analyseBodies (conn :| extra) fs{tempTables = made >>= maybe fs.tempTables pure} todo
-                            go explored' pgEdges' (done <> Set.fromList (map (.oid) todo)) (bodyEdges <> edgesBetween addresses uses) (failed <> failed')
-            (allEdges, failed) <- go (withColumns (starts <> Set.fromList (map (.dependent) edges))) edges Set.empty [] []
-            pure (allEdges, bodyNotes label (Just (fs.unchecked <> L.sortOn (\(name, _) -> Map.lookup name position) failed)))
+                            (uses, failed) <- timed [i|reach.analyseBodies n=#{length todo}|] $ analyseBodies (conn :| extra) fs{tempTables = made >>= maybe fs.tempTables pure} todo
+                            go
+                                read_
+                                    { analysed = read_.analysed <> Set.fromList (map (.oid) todo)
+                                    , bodyEdges = read_.bodyEdges <> edgesBetween addresses uses
+                                    , failed = read_.failed <> failed
+                                    }
+            reached <- go Reach{explored = withColumns (starts <> Set.fromList (map (.dependent) edges)), catalogEdges = edges, bodyEdges = [], analysed = Set.empty, failed = []}
+            pure (reached.catalogEdges <> reached.bodyEdges, bodyNotes label (Just (fs.unchecked <> L.sortOn (\(name, _) -> Map.lookup name position) reached.failed)))
 
 
 -- | The words of every function's and procedure's definition, split on every core.
@@ -215,7 +237,7 @@ routineWords schema = do
 
 -- | Reads both databases at the same time, then the edges the command needs, given what
 -- differs, alongside the body checks; the edges of @--to@ only for 'ForPlan'.
-readBoth :: Source -> ConnectionString -> Purpose -> RIO AppEnv ((Schema, [Edge]), (Schema, [Edge]), Map ObjectKey BodyCheck)
+readBoth :: Source -> ConnectionString -> Purpose -> RIO AppEnv ((Schema, Dependencies), (Schema, Dependencies), Map ObjectKey BodyCheck)
 readBoth from toDb purpose = do
     env <- ask
     let scope = env.scope
@@ -241,7 +263,7 @@ readBoth from toDb purpose = do
                         )
                         (bodyChecks scope toDb toSchema plainChanges)
             for_ (fromNotes <> toNotes) note
-            pure ((fromSchema, fromEdges), (toSchema, toEdges), checks)
+            pure ((fromSchema, indexEdges fromEdges), (toSchema, indexEdges toEdges), checks)
 
 
 -- | Body checks for the definitions that are added or changed: no other check is consulted.

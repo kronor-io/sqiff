@@ -33,6 +33,7 @@ import Sqiff.Config (Config (..))
 import Sqiff.Connection (failWith, withConnections, withSharedSnapshot)
 import Sqiff.ConnectionString (ConnectionString)
 import Sqiff.Definition (Definition, printed)
+import Sqiff.Dependencies (Dependencies)
 import Sqiff.Diff (Change (..), Changes, affected, diff)
 import Sqiff.Folder (writeFolder)
 import Sqiff.Model
@@ -63,10 +64,10 @@ runDescribe opts = do
 -- | Lists what differs, with what depends on it; exits 1 when something does.
 runDiff :: Source -> ConnectionString -> RIO AppEnv ()
 runDiff from toDb = do
-    ((fromSchema, edges), (toSchema, _), checks) <- timed "readBoth" $ readBoth from toDb ForDiff
+    ((fromSchema, deps), (toSchema, _), checks) <- timed "readBoth" $ readBoth from toDb ForDiff
     let changes = diff (sameDefinition checks) fromSchema toSchema
         known = Set.fromList [k.object | k <- Map.keys fromSchema, k.aspect == Definition]
-        affectedBy = affected known edges changes
+        affectedBy = affected known deps changes
         dependentsOf key = case key.aspect of
             Definition -> Map.findWithDefault Set.empty key.object affectedBy
             _ -> Set.empty
@@ -98,9 +99,9 @@ runSqitch from toDb opts = do
         -- A retype's views are the same on both sides, so its revert recreates them
         -- around the column as the plan does.
         inverseCtx =
-            withViewsReplaced planned.fromSchema planned.toEdges inverse
-                . withViewsAround planned.fromSchema planned.fromEdges planned.changes
-                $ context Map.empty planned.toSchema planned.fromSchema planned.toEdges inverse
+            withViewsReplaced planned.fromSchema planned.toDeps inverse
+                . withViewsAround planned.fromSchema planned.fromDeps planned.changes
+                $ context Map.empty planned.toSchema planned.fromSchema planned.toDeps inverse
         written = units config.names (const True) inverseCtx planned.changes sqitchPlan now planned.steps
         tagging = Tagging{given = opts.tag, now}
     measure "sqitch.planUnits" (sum [length u.deploy + length u.revert | u <- written])
@@ -121,9 +122,9 @@ runSqitch from toDb opts = do
 -- | Both databases, what differs and the steps that migrate it.
 data Planned = Planned
     { fromSchema :: Schema
-    , fromEdges :: [Edge]
+    , fromDeps :: Dependencies
     , toSchema :: Schema
-    , toEdges :: [Edge]
+    , toDeps :: Dependencies
     , changes :: Changes
     , steps :: [Step]
     }
@@ -131,10 +132,11 @@ data Planned = Planned
 
 planBoth :: Source -> ConnectionString -> RIO AppEnv Planned
 planBoth from toDb = do
-    ((fromSchema, fromEdges), (toSchema, toEdges), checks) <- timed "readBoth" $ readBoth from toDb ForPlan
+    ((fromSchema, fromDeps), (toSchema, toDeps), checks) <- timed "readBoth" $ readBoth from toDb ForPlan
     let changes = diff (sameDefinition checks) fromSchema toSchema
-    steps <- either (failWith . cycleMessage) pure (planWith (withViewsReplaced toSchema fromEdges changes . withViewsAround fromSchema fromEdges changes) (checks :: Map ObjectKey BodyCheck) fromSchema toSchema fromEdges toEdges changes)
-    pure Planned{fromSchema, fromEdges, toSchema, toEdges, changes, steps}
+        adjust = withViewsReplaced toSchema fromDeps changes . withViewsAround fromSchema fromDeps changes
+    steps <- either (failWith . cycleMessage) pure (planWith adjust (checks :: Map ObjectKey BodyCheck) fromSchema toSchema fromDeps toDeps changes)
+    pure Planned{fromSchema, fromDeps, toSchema, toDeps, changes, steps}
 
 
 report :: MonadIO m => ObjectKey -> Change Definition -> Set ObjectId -> m ()

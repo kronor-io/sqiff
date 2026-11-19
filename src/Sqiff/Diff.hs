@@ -11,7 +11,6 @@ module Sqiff.Diff (
     affected,
     BodyText (..),
     bodyText,
-    dependentsBy,
     bodiesToAnalyse,
 ) where
 
@@ -24,6 +23,7 @@ import RIO.NonEmpty qualified as L
 import RIO.Set qualified as Set
 import RIO.Text qualified as T
 import Sqiff.Definition (Definition)
+import Sqiff.Dependencies (Dependencies, directDependents, reachableFrom, restrictedTo)
 import Sqiff.Graph (reachedFrom)
 import Sqiff.Identifier (QName (..), TypeName, nameText, typeText)
 import Sqiff.Model
@@ -68,8 +68,8 @@ diff same =
 
 -- | For each dropped or changed definition, the objects in @known@ that depend on it,
 -- directly or through others, and whose definitions are not in the diff themselves.
-affected :: Set ObjectId -> [Edge] -> Map ObjectKey (Change a) -> Map ObjectId (Set ObjectId)
-affected known edges changes =
+affected :: Set ObjectId -> Dependencies -> Map ObjectKey (Change a) -> Map ObjectId (Set ObjectId)
+affected known deps changes =
     Map.filter (not . Set.null)
         $ Map.fromList
             [ (key.object, closure key.object `Set.difference` inDiff)
@@ -82,24 +82,8 @@ affected known edges changes =
     -- comment or grants change still stands in the way.
     inDiff = Set.fromList [k.object | k <- Map.keys changes, k.aspect == Definition]
 
-    dependents =
-        Map.fromListWith
-            (<>)
-            [ (edge.referenced, Set.singleton edge.dependent)
-            | edge <- edges
-            , edge.referenced `Set.member` known
-            , edge.dependent `Set.member` known
-            ]
-
-    direct addr = Map.findWithDefault Set.empty addr dependents
-
-    closure start = go Set.empty (direct start)
-      where
-        go seen frontier
-            | Set.null frontier = seen
-            | otherwise =
-                let seen' = seen <> frontier
-                 in go seen' (foldMap direct frontier `Set.difference` seen')
+    amongKnown = restrictedTo known deps
+    closure start = reachedFrom (Set.toList . directDependents amongKnown) (Set.singleton start)
 
     removesOrChanges = \case
         Added _ -> False
@@ -126,24 +110,13 @@ wordsOf = HS.fromList . filter (not . T.null) . T.split (not . identifierChar)
     identifierChar c = isAlphaNum c || c == '_' || c == '$'
 
 
--- | Who depends on an object by the edges given; a relation also counts what depends on
--- its columns.
-dependentsBy :: [Edge] -> ObjectId -> [ObjectId]
-dependentsBy edges = \object -> direct object <> concatMap direct (columnsOf object)
-  where
-    deps = Map.fromListWith (<>) [(e.referenced, [e.dependent]) | e <- edges]
-    direct object = Map.findWithDefault [] object deps
-    columns = Map.fromListWith (<>) [(t, Set.singleton e.referenced) | e <- edges, Column t _ <- [e.referenced]]
-    columnsOf object = maybe [] (\q -> maybe [] Set.toList (Map.lookup q columns)) (isRelation object)
-
-
 -- | Of @functions@, those whose body edges 'affected' can follow from @starts@: their
 -- definition names a reached object, or they are a trigger function on the closure.
-bodiesToAnalyse :: (ObjectId -> [ObjectId]) -> Set ObjectId -> [(a, ObjectId, BodyText, Maybe ObjectId)] -> [a]
-bodiesToAnalyse dependents starts functions =
+bodiesToAnalyse :: Dependencies -> Set ObjectId -> [(a, ObjectId, BodyText, Maybe ObjectId)] -> [a]
+bodiesToAnalyse deps starts functions =
     [f | (f, _, def, trigger) <- functions, named def || maybe False (`Set.member` closure) trigger]
   where
-    reached = reachedFrom dependents starts
+    reached = reachableFrom deps starts
     closure = starts <> reached
     counted = Set.toList reached <> filter namedInBodies (Set.toList starts)
     names = HS.toList (foldMap (wordsOf . T.toLower . bodyName) counted)

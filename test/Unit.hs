@@ -26,6 +26,7 @@ import Sqiff.App.Table.Rewrite (changesTableIn)
 import Sqiff.Config (fill, match)
 import Sqiff.ConnectionString (connectionString, fromPairs, libpqText, redacted)
 import Sqiff.Definition hiding (columns)
+import Sqiff.Dependencies (indexEdges, noDependencies)
 import Sqiff.Diff (Change (..), affected, diff)
 import Sqiff.Folder (Existing (..), exportManifest, writeFolder)
 import Sqiff.Graph (schedule)
@@ -296,13 +297,13 @@ ordering =
             $ topoOrder (Set.fromList "abc") [('a', 'b'), ('b', 'a')]
             @?= "cab"
         , testCase "schedule takes the smallest priority among the ready"
-            $ schedule [(2 :: Int, 'a'), (1, 'b'), (3, 'c')] []
+            $ scheduleChars [(2, 'a'), (1, 'b'), (3, 'c')] []
             @?= Right "bac"
         , testCase "schedule lets a constraint beat priority"
-            $ schedule [(1 :: Int, 'f'), (2, 'v')] [(0, 1)]
+            $ scheduleChars [(1, 'f'), (2, 'v')] [('f', 'v')]
             @?= Right "vf"
         , testCase "schedule reports what a cycle blocks"
-            $ schedule [(1 :: Int, 'a'), (2, 'b'), (3, 'c'), (4, 'd')] [(0, 1), (1, 0), (3, 0)]
+            $ scheduleChars [(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')] [('a', 'b'), ('b', 'a'), ('d', 'a')]
             @?= Left ("c", "abd")
         , testProperty "every pair is respected in an acyclic graph" $ property do
             n <- forAll (Gen.int (Range.linear 1 30))
@@ -327,7 +328,7 @@ diffing =
             let column = Column (qname "public" "t") (identifier "a")
                 v = View (qname "public" "v")
                 changes = Map.fromList [(ObjectKey Definition column, Changed "int" "bigint"), (ObjectKey Comment v, Changed "old" "new" :: Change Text)]
-            affected (Set.fromList [column, v]) [Edge v column] changes @?= Map.fromList [(column, Set.singleton v)]
+            affected (Set.fromList [column, v]) (indexEdges [Edge v column]) changes @?= Map.fromList [(column, Set.singleton v)]
         , testCase "the sameness test can hide a change"
             $ diff (\_ _ _ -> True) (Map.fromList [(k "a", "1") :: (ObjectKey, Text)]) (Map.fromList [(k "a", "2")])
             @?= Map.empty
@@ -551,7 +552,7 @@ sqitchChecks =
             Sql.splitTopLevel ',' "\"a, b\", f(c, d), 'e,f'" @?= ["\"a, b\"", "f(c, d)", "'e,f'"]
         , testCase "overloads of a new function make one change" do
             let names = either error id (Aeson.eitherDecode "{}")
-                ctx = context Map.empty Map.empty Map.empty [] Map.empty
+                ctx = context Map.empty Map.empty Map.empty noDependencies Map.empty
                 overload arg =
                     let object = Routine Function (qname "public" "f") [typeName arg]
                      in Step CreatePhase 9 object ("create function public.f(" <> arg <> ")") Shared [] (ObjectKey Definition object) (Added (Printed arg)) UndoObject
@@ -613,3 +614,8 @@ folderExport =
         ]
   where
     table n = ObjectKey Definition (Table (qname "public" n))
+
+
+-- | 'schedule' over characters keyed by themselves, with the priorities given.
+scheduleChars :: [(Int, Char)] -> [(Char, Char)] -> Either (String, String) String
+scheduleChars items pairs = bimap (bimap (map snd) (map snd)) (map snd) (schedule snd fst items pairs)

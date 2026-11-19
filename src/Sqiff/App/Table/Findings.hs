@@ -30,6 +30,7 @@ import Sqiff.App.Options (Comparison (..), MigrateOptions (..), SameTypeSwap (..
 import Sqiff.App.Table.Env
 import Sqiff.Config (Config (..))
 import Sqiff.Definition hiding (DomainType)
+import Sqiff.Dependencies (noDependencies)
 import Sqiff.Diff (Change (..))
 import Sqiff.Identifier
 import Sqiff.Model
@@ -99,7 +100,7 @@ retypedColumns edit =
 
 findingsFor :: TableEnv -> MigrateOptions -> Evidence -> Either DependencyCycle Findings
 findingsFor env migrate ev = do
-    planned <- planWith withViews Map.empty edit.current edit.desired [] [] edit.changes
+    planned <- planWith withViews Map.empty edit.current edit.desired noDependencies noDependencies edit.changes
     let steps = renameSteps <> map withTypeFacts planned
     pure Findings{steps, renameSteps, newRenames = ev.pendingRenames, usage, blocking, renameLike, same, withViews}
   where
@@ -133,7 +134,7 @@ findingsFor env migrate ev = do
     dependents = deps.exact
     mentions = Map.map (Set.filter (\a -> a `Map.notMember` breaking && a `Set.notMember` passed)) deps.named
     retypedAddresses = Set.fromList (map retypedObject retyped)
-    around = viewsAroundTypeChanges deps.exact deps.dbSchema deps.dbEdges [(r.table, r.column, retypedObject r) | r <- retyped]
+    around = viewsAroundTypeChanges deps.exact deps.dbSchema deps.dbDeps [(r.table, r.column, retypedObject r) | r <- retyped]
     withViews c = c{viewsAround = Map.map snd around}
     aroundOf addr = fold [members | r <- retyped, retypedObject r == addr, Just (members, _) <- [Map.lookup (r.table, r.column) around]]
     foreignKeysFor addr = Map.findWithDefault [] addr ev.foreignKeyBreaks

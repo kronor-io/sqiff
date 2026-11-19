@@ -10,8 +10,6 @@ module Sqiff.Graph (
 import RIO
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
-import RIO.Vector qualified as V
-import RIO.Vector.Partial qualified as V
 
 
 -- | The nodes reachable from @starts@ by one step or more of @next@; a start is in it only
@@ -27,45 +25,42 @@ reachedFrom next starts = go Set.empty (step starts)
              in go seen' (step frontier `Set.difference` seen')
 
 
--- | Kahn's algorithm over @(x, y)@ pairs meaning x comes after y. Ties go to the smaller
--- node; nodes caught in a cycle come last.
+-- | The nodes with each after the ones @pairs@ name for it, as @(after, before)@. Ties go
+-- to the smaller node; nodes caught in a cycle come last.
 topoOrder :: Ord a => Set a -> [(a, a)] -> [a]
-topoOrder nodes pairs = case schedule [(n, n) | n <- Set.toList nodes] indexPairs of
+topoOrder nodes pairs = case schedule id id (Set.toList nodes) pairs of
     Right ordered -> ordered
-    Left (done, blocked) -> done <> blocked
-  where
-    index = Map.fromList (zip (Set.toList nodes) [0 :: Int ..])
-    indexPairs = [(ix, iy) | (x, y) <- pairs, Just ix <- [Map.lookup x index], Just iy <- [Map.lookup y index]]
+    Left (placed, blocked) -> placed <> blocked
 
 
--- | The items in an order where each comes after the ones @pairs@ name for it, as
--- @(after, before)@ positions in the list; among the items that are ready, the one with
--- the smallest priority goes first. When a cycle blocks some items, 'Left' has the ones
--- placed and the blocked ones, in priority order.
-schedule :: forall p a. Ord p => [(p, a)] -> [(Int, Int)] -> Either ([a], [a]) [a]
-schedule items pairs = go initial indegree0 []
+-- | Kahn's algorithm: the items, each after the ones @pairs@ name for it, as
+-- @(after, before)@ keys; pairs naming a key no item has are ignored. Among the items
+-- that are ready, the one with the smallest priority goes first, then the smallest key.
+-- When a cycle blocks some items, 'Left' has the ones placed and the blocked ones, in
+-- priority order. Keys are distinct.
+schedule :: forall k p a. (Ord k, Ord p) => (a -> k) -> (a -> p) -> [a] -> [(k, k)] -> Either ([a], [a]) [a]
+schedule keyOf priorityOf items pairs = go (queue ready0) waiting0 []
   where
-    -- Positions come from the list, so indexing it is safe.
-    keyed = V.fromList items :: Vector (p, a)
-    count = V.length keyed
-    valid x = x >= 0 && x < count
-    relevant = Set.fromList [(x, y) | (x, y) <- pairs, x /= y, valid x, valid y]
+    byKey = Map.fromList [(keyOf x, x) | x <- items]
+    relevant = Set.fromList [(x, y) | (x, y) <- pairs, x /= y, x `Map.member` byKey, y `Map.member` byKey]
     successors = Map.fromListWith (<>) [(y, [x]) | (x, y) <- Set.toList relevant]
-    indegree0 = Map.unionWith (+) (Map.fromList [(n, 0) | n <- [0 .. count - 1]]) (Map.fromListWith (+) [(x, 1 :: Int) | (x, _) <- Set.toList relevant])
-    key n = (fst (keyed V.! n), n)
-    item n = snd (keyed V.! n)
-    initial = Set.fromList [key n | (n, 0) <- Map.toList indegree0]
+    -- How many items each item still waits for; items waiting for none are not in it.
+    waiting0 = Map.fromListWith (+) [(x, 1 :: Int) | (x, _) <- Set.toList relevant]
+    ready0 = [k | k <- Map.keys byKey, k `Map.notMember` waiting0]
 
-    go ready indegree acc = case Set.minView ready of
+    -- The items with these keys, by priority.
+    queue :: [k] -> Map (p, k) a
+    queue ks = Map.fromList [((priorityOf x, k), x) | k <- ks, Just x <- [Map.lookup k byKey]]
+
+    go ready waiting placed = case Map.minViewWithKey ready of
         Nothing
-            | length acc == count -> Right (reverse acc)
-            | otherwise ->
-                let blocked = Set.fromList [key n | (n, d) <- Map.toList indegree, d > 0]
-                 in Left (reverse acc, [item n | (_, n) <- Set.toList blocked])
-        Just ((_, n), rest) ->
-            let (indegree', ready') = foldl' release (Map.insert n (-1) indegree, rest) (Map.findWithDefault [] n successors)
-             in go ready' indegree' (item n : acc)
+            | Map.null waiting -> Right (reverse placed)
+            | otherwise -> Left (reverse placed, Map.elems (queue (Map.keys waiting)))
+        Just (((_, k), x), rest) ->
+            let (released, waiting') = foldl' release ([], waiting) (Map.findWithDefault [] k successors)
+             in go (rest <> queue released) waiting' (x : placed)
 
-    release (m, r) s =
-        let d = Map.findWithDefault 0 s m - 1
-         in (Map.insert s d m, if d == 0 then Set.insert (key s) r else r)
+    release (released, waiting) k = case Map.lookup k waiting of
+        Just 1 -> (k : released, Map.delete k waiting)
+        Just n -> (released, Map.insert k (n - 1) waiting)
+        Nothing -> (released, waiting)

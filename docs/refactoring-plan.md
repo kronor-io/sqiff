@@ -442,6 +442,16 @@ Guiding rules:
   local database and staging. Grants are compared relative to the owner for the same
   reason.
 
+- [x] **Dependency graph as a type.** Edges no longer travel as `[Edge]` with each user
+  building its own lookup. `Sqiff.Dependencies` indexes them once, both ways, and answers
+  `dependentsOf`, `referencesOf`, `dependsOn` and `reachableFrom`; `readBoth` returns it,
+  and `Planned`, `plan`, `context`, `affected` and the view recreation take it.
+  `affected` uses `reachedFrom` instead of its own copy of the search. `schedule` keys
+  items by any `Ord` key instead of list positions, so `inPhase` passes step numbers
+  directly. `reachableEdges` keeps its progress in a `Reach` record instead of five
+  primed variables. Behaviour is unchanged; alga was considered and left out, as
+  sqiff's column-aware dependents and its partial schedule on cycles are its own.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

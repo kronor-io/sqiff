@@ -20,8 +20,9 @@ import RIO
 import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import Sqiff.Definition
-import Sqiff.Diff (Change (..), Changes, affected, dependentsBy)
-import Sqiff.Graph (reachedFrom, topoOrder)
+import Sqiff.Dependencies (Dependencies, dependsOn, edges, noDependencies, reachableFrom, referencesOf)
+import Sqiff.Diff (Change (..), Changes, affected)
+import Sqiff.Graph (topoOrder)
 import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Plan (context)
@@ -29,21 +30,21 @@ import Sqiff.Recipe (Context (..), Step (..), recipe, revokeGranted)
 
 
 -- | Adds to the context what to drop and create again around each retyped column, by
--- what depends on it in @schema@ through @edges@.
-withViewsAround :: Schema -> [Edge] -> Changes -> Context -> Context
-withViewsAround schema edges changes ctx =
-    ctx{viewsAround = Map.map snd (viewsAroundTypeChanges exact schema edges (retypedIn changes))}
+-- what depends on it in @schema@ by @deps@.
+withViewsAround :: Schema -> Dependencies -> Changes -> Context -> Context
+withViewsAround schema deps changes ctx =
+    ctx{viewsAround = Map.map snd (viewsAroundTypeChanges exact schema deps (retypedIn changes))}
   where
     known = Set.fromList [k.object | k <- Map.keys schema, k.aspect == Definition]
-    exact = affected known edges changes
+    exact = affected known deps changes
 
 
 -- | Adds to the context what to drop and create again around each view whose columns
--- change, by what depends on it in the database being changed (@edges@), as the desired
+-- change, by what depends on it in the database being changed (@deps@), as the desired
 -- one (@toSchema@) has it.
-withViewsReplaced :: Schema -> [Edge] -> Changes -> Context -> Context
-withViewsReplaced toSchema edges changes ctx =
-    ctx{viewDependents = viewsToRecreate toSchema edges changes}
+withViewsReplaced :: Schema -> Dependencies -> Changes -> Context -> Context
+withViewsReplaced toSchema deps changes ctx =
+    ctx{viewDependents = viewsToRecreate toSchema deps changes}
 
 
 -- | The columns whose type or collation changes, with their identities.
@@ -59,15 +60,15 @@ retypedIn changes =
 
 -- | For each retyped column, the statements that drop the views, policies, triggers and
 -- routines that hold it, and the ones that create them again.
-viewsAroundTypeChanges :: Map ObjectId (Set ObjectId) -> Schema -> [Edge] -> [(QName, Identifier, ObjectId)] -> Map (QName, Identifier) (Set ObjectId, ([Text], [Text]))
-viewsAroundTypeChanges exact schema edges retyped =
+viewsAroundTypeChanges :: Map ObjectId (Set ObjectId) -> Schema -> Dependencies -> [(QName, Identifier, ObjectId)] -> Map (QName, Identifier) (Set ObjectId, ([Text], [Text]))
+viewsAroundTypeChanges exact schema deps retyped =
     Map.fromList
         [ ((t, c), (members, (map dropStatement (reverse order), concatMap (createAgain schema) order)))
         | (t, c, column) <- retyped
         , let closure = Map.findWithDefault Set.empty column exact
-              onColumn = Set.filter (\a -> isPolicyOrTrigger a && any (\e -> e.dependent == a && e.referenced == column) edges) closure
-              members = held schema edges column closure (Set.filter isView closure <> onColumn)
-              order = inDependencyOrder edges members
+              onColumn = Set.filter (\a -> isPolicyOrTrigger a && dependsOn deps a column) closure
+              members = held schema deps column closure (Set.filter isView closure <> onColumn)
+              order = inDependencyOrder deps members
         , not (Set.null members)
         ]
   where
@@ -81,8 +82,8 @@ viewsAroundTypeChanges exact schema edges retyped =
 -- @create or replace view@ refuses, the statements that drop what depends on it in the
 -- database being changed, and the ones that create those again as @toSchema@ has them;
 -- one the plan drops is not created again.
-viewsToRecreate :: Schema -> [Edge] -> Changes -> Map QName ([Text], [Text])
-viewsToRecreate toSchema edges changes =
+viewsToRecreate :: Schema -> Dependencies -> Changes -> Map QName ([Text], [Text])
+viewsToRecreate toSchema deps changes =
     Map.fromList
         [ (v, (map (dropWith " if exists") (reverse order), concatMap (createAgain toSchema) (filter wanted order)))
         | (k, Changed (ViewDefinition old) (ViewDefinition new)) <- Map.toList changes
@@ -90,31 +91,31 @@ viewsToRecreate toSchema edges changes =
         , View v <- [k.object]
         , not (extendsColumns old new)
         , -- Every dependent, changed ones included: they go before the view does.
-        let closure = reachedFrom (dependentsBy edges) (Set.singleton k.object)
-            order = inDependencyOrder edges (held toSchema edges k.object closure (Set.filter isView closure))
+        let closure = reachableFrom deps (Set.singleton k.object)
+            order = inDependencyOrder deps (held toSchema deps k.object closure (Set.filter isView closure))
         ]
   where
     wanted a = definitionKey a `Map.member` toSchema
 
 
 -- | The members in the order they can be created, by the relations they depend on.
-inDependencyOrder :: [Edge] -> Set ObjectId -> [ObjectId]
-inDependencyOrder edges members =
-    topoOrder members [(d, r) | e <- edges, let d = relationOf e.dependent, let r = relationOf e.referenced, d `Set.member` members, r `Set.member` members]
+inDependencyOrder :: Dependencies -> Set ObjectId -> [ObjectId]
+inDependencyOrder deps members =
+    topoOrder members [(d, r) | e <- edges deps, let d = relationOf e.dependent, let r = relationOf e.referenced, d `Set.member` members, r `Set.member` members]
 
 
 -- | @members@ and the routines whose definitions hold @start@ or one of them, until no
 -- more do.
-held :: Schema -> [Edge] -> ObjectId -> Set ObjectId -> Set ObjectId -> Set ObjectId
-held schema edges start closure members =
+held :: Schema -> Dependencies -> ObjectId -> Set ObjectId -> Set ObjectId -> Set ObjectId
+held schema deps start closure members =
     let views = Set.filter isView members
         holds r = case printed <$> Map.lookup (definitionKey r) schema of
             Just def
-                | standardBody def -> any (\e -> e.dependent == r && (e.referenced == start || relationOf e.referenced `Set.member` members)) edges
+                | standardBody def -> any (\x -> x == start || relationOf x `Set.member` members) (referencesOf deps r)
                 | otherwise -> any (\v -> qualifiedName v `T.isInfixOf` signature def) views
             Nothing -> False
         more = Set.filter (\r -> isRoutine r && r `Set.notMember` members && holds r) closure
-     in if Set.null more then members else held schema edges start closure (members <> more)
+     in if Set.null more then members else held schema deps start closure (members <> more)
   where
     signature = T.unlines . takeWhile (\l -> not ("AS " `T.isPrefixOf` T.stripStart l || "BEGIN ATOMIC" `T.isInfixOf` l)) . T.lines
 
@@ -146,7 +147,7 @@ createAgain schema a =
             , k.object == a || (relationOf k.object == a && k.object /= a)
             ]
   where
-    ctx0 = context Map.empty Map.empty Map.empty [] Map.empty
+    ctx0 = context Map.empty Map.empty Map.empty noDependencies Map.empty
     stepsFor key c = map (.sql) (recipe ctx0 key c)
 
 

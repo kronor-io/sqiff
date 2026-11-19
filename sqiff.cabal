@@ -41,6 +41,7 @@ library
     Sqiff.Connection
     Sqiff.ConnectionString
     Sqiff.Definition
+    Sqiff.Dependencies
     Sqiff.Diff
     Sqiff.Folder
     Sqiff.Git
