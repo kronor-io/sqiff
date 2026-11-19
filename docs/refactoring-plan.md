@@ -452,6 +452,15 @@ Guiding rules:
   primed variables. Behaviour is unchanged; alga was considered and left out, as
   sqiff's column-aware dependents and its partial schedule on cycles are its own.
 
+- [x] **The reachable-edges query no longer scans pg_depend at every step.** Measuring
+  the refactor above found no change (about 1.15 s on a 3,000-table schema, either way)
+  but found the real cost: in `depend_from.sql` the planner scanned every user
+  `pg_depend` row for each object reached, so the time grew with catalog size times
+  view depth. Three chains of 100 nested views over 3,000 tables ran over 10 minutes;
+  it now takes about 4.7 s. The lookup is a lateral subquery kept by `offset 0`, so
+  it goes through the reference index. A test plans three 100-deep chains over 300
+  tables within 3 s: 0.6 s now, 10.3 s before.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

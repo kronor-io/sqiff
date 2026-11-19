@@ -40,7 +40,7 @@ import System.Process.Typed (proc, readProcess, setWorkingDir)
 import Test.Tasty (TestTree, testGroup, withResource)
 import Test.Tasty.ExpectedFailure (expectFailBecause)
 import Test.Tasty.Golden (goldenVsStringDiff)
-import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
+import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
 
 
 fixturesDir :: FilePath
@@ -58,7 +58,7 @@ tests sqitch = do
             path <- fromMaybe "" <$> lookupEnv "PATH"
             setEnv "PATH" (bin <> ":" <> path)
             pure $ withResource (startCluster bin) stopCluster \cluster ->
-                testGroup "integration" (sharedSnapshot cluster : map (uncurry (fixture sqitch cluster)) fixtures)
+                testGroup "integration" (sharedSnapshot cluster : deepViewChains cluster : map (uncurry (fixture sqitch cluster)) fixtures)
 
 
 -- | Connections that share a snapshot do not see what another commits after it.
@@ -75,6 +75,56 @@ sharedSnapshot getCluster = testCase "connections in a shared snapshot see one s
         seen @?= (0, [0])
         after <- tableCount a
         after @?= 1
+
+
+-- | Finding what depends on a retyped column takes time in proportion to what it
+-- reaches, not to the size of the catalog at every step: three chains of 100 nested
+-- views over 300 tables used to take several seconds.
+deepViewChains :: IO Cluster -> TestTree
+deepViewChains getCluster = testCase "deep view chains are planned in reasonable time" do
+    cluster <- getCluster
+    for_ [("deep_from", "int"), ("deep_to", "bigint")] \(db, retyped) -> do
+        createDatabase cluster db
+        runScript cluster db (schema retyped) >>= either (assertFailure . T.unpack) pure
+    started <- getMonotonicTime
+    (code, out, err) <- runSqiff cluster ["plan"] "deep_from" "deep_to"
+    elapsed <- subtract started <$> getMonotonicTime
+    assertBool (T.unpack err) (code == ExitSuccess)
+    length (filter ("drop view" `T.isPrefixOf`) (T.lines out)) @?= chains * depth
+    assertBool [i|sqiff plan took #{elapsed} s|] (elapsed < 3)
+  where
+    chains, depth, tables :: Int
+    chains = 3
+    depth = 100
+    tables = 300
+    schema :: Text -> Text
+    schema retyped =
+        T.unlines
+            $ [ [i|create table t#{n} (id int primary key, a #{if n < chains then retyped else "int"}, b text#{reference n});|]
+              | n <- [0 .. tables - 1]
+              ]
+            <> [ [i|create view c#{c}_v#{j} as #{viewBody c j};|]
+               | c <- [0 .. chains - 1]
+               , j <- [0 .. depth - 1]
+               ]
+    reference :: Int -> Text
+    reference n = if n == 0 then "" else [i|, p int references t#{n - 1}(id)|]
+    viewBody :: Int -> Int -> Text
+    viewBody c j
+        | j == 0 = [i|select id, a, b from t#{c}|]
+        | otherwise = [i|select v.id, v.a, v.b from c#{c}_v#{j - 1} v join t#{chains + (c * depth + j) `mod` (tables - chains)} t on t.id = v.id|]
+
+
+-- | Runs sqiff's @command@ from @from@ to @to@, outside the repository so no sqiff.yaml
+-- is read.
+runSqiff :: Cluster -> [String] -> Text -> Text -> IO (ExitCode, Text, Text)
+runSqiff cluster command from to = do
+    exe <- fromMaybe "sqiff" <$> lookupEnv "SQIFF_EXE"
+    let args = command <> ["--from", T.unpack (conninfo cluster from), "--to", T.unpack (conninfo cluster to)]
+    (code, out, err) <- readProcess (setWorkingDir "/" (proc exe args))
+    pure (code, decode out, decode err)
+  where
+    decode = decodeUtf8Lenient . BL.toStrict
 
 
 -- | The reason in one of a fixture's marker files, if it has it.
@@ -125,12 +175,7 @@ fixture sqitch getCluster name (bug, revertGap) = withResource prepare (const (p
 
     sqiffFrom cluster from = sqiffBetween cluster from toDb
 
-    sqiffBetween cluster from to command = do
-        exe <- fromMaybe "sqiff" <$> lookupEnv "SQIFF_EXE"
-        let args = command <> ["--from", T.unpack (conninfo cluster from), "--to", T.unpack (conninfo cluster to)]
-        -- Run outside the repository, so no sqiff.yaml is read.
-        (code, out, err) <- readProcess (setWorkingDir "/" (proc exe args))
-        pure (code, decode out, decode err)
+    sqiffBetween cluster from to command = runSqiff cluster command from to
 
     decode = decodeUtf8Lenient . BL.toStrict
 
