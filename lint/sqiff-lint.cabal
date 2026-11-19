@@ -15,6 +15,7 @@ library
   hs-source-dirs:  src
   exposed-modules:
     Sqiff.Lint
+    Sqiff.Lint.Rule.Interpolate
     Sqiff.Lint.Rule.NamedFields
     Sqiff.Lint.Rule.NamedQueries
     Sqiff.Lint.Rule.NamedTuples
@@ -27,6 +28,7 @@ library
     , containers
     , ghc-lib-parser
     , hopinion
+    , string-interpolate
     , syb
     , text
 

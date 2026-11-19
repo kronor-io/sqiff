@@ -112,6 +112,54 @@ A refactor that depends on an invariant — every retyped column is a key of
 the code that produces the value. Comments explain contracts, order and surprises;
 they do not restate the code, and not every helper needs one.
 
+### R8. Write text as the text it makes
+
+A chain of `<>` between quoted pieces, a list of lines joined with `unlines`, or a
+literal continued across lines with string gaps all make the reader assemble the
+text in their head, and a missing space or newline is easy to miss. Interpolation
+shows the text with its values in place.
+
+```haskell
+-- before
+"create table " <> qualified t <> " partition of " <> qualified p.parent <> " " <> p.bound
+-- after
+[i|create table #{qualified t} partition of #{qualified p.parent} #{p.bound}|]
+```
+
+A block of lines is one `[__i|...|]`, which drops the block's indentation and its
+first and last newline; a newline wanted there is written `\n`:
+
+```haskell
+-- before
+T.unlines
+    [ ""
+    , "begin"
+    , "    if exists ("
+    ...
+    , "end"
+    ]
+-- after
+[__i|
+    \nbegin
+        if exists (
+    ...
+    end\n
+|]
+```
+
+A block with no values in it can also be a multiline string literal (`"""...`"""`,
+the `MultilineStrings` extension), which GHC dedents the same way.
+
+One line of prose wrapped in the source, such as a rule's text, is `[iii|...|]`,
+which turns every run of whitespace into one space.
+
+`#{}` takes any expression, record fields included (string-interpolate 1.0 parses
+it with GHC's own parser); bind a long one to a name so the text stays readable. A
+`#` that does not start an interpolation is written `\#`. A string literal whose
+type the chain used to fix may need a signature. Joining lists, values with no
+literal between them, or lines chosen one by one in a list comprehension is not
+building text: keep `<>` and `unlines` there.
+
 ## Haskell
 
 ### H1. Build records with many fields by field name
@@ -177,6 +225,7 @@ performance thresholds in CI. Each of these would be met by worse code.
 | R2 | `SqiffNamedTuples`: no tuple of three or more, or tuple in a tuple, in a top-level signature |
 | R3 for steps | `SqiffStepRole`: no reading a step's `.sql` with a text test |
 | R6 | `SqiffNamedQueries`: `exactDependentsOf` and `routinesNaming`, not the maps behind them |
+| R8 | `SqiffInterpolate`: no run of `<>` or `++` joining three or more pieces with a string literal among them, no written-out list of three or more fixed lines joined with `unlines` or `intercalate "\n"`, and no string literal continued across lines |
 | H1 | `SqiffNamedFields`: no constructor applied to more than four positional arguments |
 | H2 (signatures), exhaustive matches | GHC: `-Werror` for missing signatures, missing fields, incomplete patterns and partial record selectors and updates (`sqiff.cabal`) |
 | Layout | fourmolu (`fourmolu.yaml`) |

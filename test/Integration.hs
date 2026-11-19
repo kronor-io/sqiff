@@ -58,7 +58,7 @@ tests sqitchFound = do
         Right bin -> do
             -- sqitch runs psql from PATH.
             path <- fromMaybe "" <$> lookupEnv "PATH"
-            setEnv "PATH" (bin <> ":" <> path)
+            setEnv "PATH" [i|#{bin}:#{path}|]
             pure $ withResource (startCluster bin) stopCluster \getCluster ->
                 let shared = Shared{getCluster, sqitchFound}
                  in testGroup "integration" (sharedSnapshot getCluster : deepViewChains getCluster : map (fixture shared) fixtures)

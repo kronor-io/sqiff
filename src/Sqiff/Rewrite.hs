@@ -442,7 +442,8 @@ withLiteral :: Text -> Text -> Text
 withLiteral new code = case [k | (k, "is") <- topWords code] of
     k : _ ->
         let (sep, old) = T.span isSpace (T.drop (k + 2) code)
-            tag = if "$" `T.isPrefixOf` old then Just ("$" <> T.takeWhile (/= '$') (T.drop 1 old) <> "$") else Nothing
+            label = T.takeWhile (/= '$') (T.drop 1 old)
+            tag = if "$" `T.isPrefixOf` old then Just [i|$#{label}$|] else Nothing
          in T.take (k + 2) code <> sep <> literal tag new
     [] -> code
 
@@ -451,7 +452,7 @@ literal :: Maybe Text -> Text -> Text
 literal tag t = case tag of
     Just q | fits q -> q <> t <> q
     _
-        | "\n" `T.isInfixOf` t && fits "$comment$" -> "$comment$" <> t <> "$comment$"
+        | "\n" `T.isInfixOf` t && fits "$comment$" -> [i|$comment$#{t}$comment$|]
         | otherwise -> Sql.literal t
   where
     fits q = not (q `T.isInfixOf` (t <> "$"))
@@ -460,9 +461,9 @@ literal tag t = case tag of
 commentTarget :: ObjectId -> Maybe Text
 commentTarget = \case
     Table t -> Just ("table " <> qualified t)
-    Column t c -> Just ("column " <> qualified t <> "." <> quoted c)
+    Column t c -> Just [i|column #{qualified t}.#{quoted c}|]
     Index ix -> Just ("index " <> qualified ix)
-    TableConstraint t n -> Just ("constraint " <> quoted n <> " on " <> qualified t)
+    TableConstraint t n -> Just [i|constraint #{quoted n} on #{qualified t}|]
     _ -> Nothing
 
 
@@ -477,7 +478,7 @@ indexCode indent def =
     let tidied = tidyIndex def
         guarded = fromMaybe tidied (asum [(new <>) <$> T.stripPrefix old tidied | (old, new) <- [("create unique index ", "create unique index if not exists "), ("create index ", "create index if not exists ")]])
         (front, back) = T.breakOn " on " guarded
-     in if T.null back then guarded else front <> "\n" <> indent <> "    " <> T.drop 1 back
+     in if T.null back then guarded else [i|#{front}\n#{indent}    #{T.drop 1 back}|]
 
 
 -- | A @create table@ statement's text up to its column list, the list's entries, and the
@@ -578,7 +579,7 @@ elementKind table body = case ws of
         Nothing -> Nothing
         Just [""] -> Nothing
         Just cs -> Just (map unquote cs)
-    named suffix cs = identifier (T.intercalate "_" (nameText table.name : cs) <> "_" <> suffix)
+    named suffix cs = identifier (T.intercalate "_" (nameText table.name : cs <> [suffix]))
 
 
 -- | Applies the column and constraint differences to a @create table@ statement, with the
@@ -595,7 +596,7 @@ editCreateTable table order columns constraints options code = do
             _ -> newLead
         (beforeParen, fromParen) = T.breakOn ")" tt.closing
         closing = case options of
-            Just w | not (any ((== "with") . snd) (topWords (T.drop 1 fromParen))) -> Just (beforeParen <> ") " <> w <> T.drop 1 fromParen)
+            Just w | not (any ((== "with") . snd) (topWords (T.drop 1 fromParen))) -> Just [i|#{beforeParen}) #{w}#{T.drop 1 fromParen}|]
             _ -> Nothing
         inline = Set.fromList [n | (_, ColumnElement _ ns) <- kinds, n <- ns]
         edit (e, kind) = case kind of
@@ -638,7 +639,8 @@ editCreateTable table order columns constraints options code = do
 columnLine :: Identifier -> ColumnDef -> Text
 columnLine c def =
     let unqualified = typeName (fromMaybe (typeText def.colType) (T.stripPrefix "public." (typeText def.colType)))
-     in quoted c <> " " <> columnSql def{colType = unqualified}
+        sql = columnSql def{colType = unqualified}
+     in [i|#{quoted c} #{sql}|]
 
 
 -- | The inline constraints written after a column's type and options.
@@ -651,5 +653,6 @@ inlineSuffix body = case [k | (k, w) <- drop 1 (topWords body), w `elem` ["const
 constraintLine :: Text -> Identifier -> Text -> Text
 constraintLine indent n def =
     let tidied = fromMaybe def (T.stripPrefix "add constraint " (tidyConstraint [i|add constraint #{quoted n} #{def}|]))
-        broken = foldl' (\acc kw -> replaceInCode (" " <> kw <> " ") ("\n" <> indent <> "    " <> kw <> " ") acc) tidied ["foreign key", "references", "on delete", "on update"]
+        keywords = ["foreign key", "references", "on delete", "on update"] :: [Text]
+        broken = foldl' (\acc kw -> replaceInCode [i| #{kw} |] [i|\n#{indent}    #{kw} |] acc) tidied keywords
      in "constraint " <> if "foreign key" `T.isInfixOf` tidied then broken else tidied

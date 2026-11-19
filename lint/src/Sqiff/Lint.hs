@@ -5,6 +5,7 @@ module Sqiff.Lint (main, rules) where
 
 import Hopinion (hopinionWith)
 import Hopinion.Rule (Rule)
+import Sqiff.Lint.Rule.Interpolate qualified as Interpolate
 import Sqiff.Lint.Rule.NamedFields qualified as NamedFields
 import Sqiff.Lint.Rule.NamedQueries qualified as NamedQueries
 import Sqiff.Lint.Rule.NamedTuples qualified as NamedTuples
@@ -23,4 +24,5 @@ rules =
     , StepRole.rule
     , NamedQueries.rule
     , NamedFields.rule
+    , Interpolate.rule
     ]

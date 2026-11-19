@@ -40,7 +40,7 @@ setUpSqitch :: IO Bool
 setUpSqitch = do
     lookupEnv "SQIFF_TEST_SQITCH_BIN" >>= traverse_ \bin -> do
         path <- fromMaybe "" <$> lookupEnv "PATH"
-        setEnv "PATH" (bin <> ":" <> path)
+        setEnv "PATH" [i|#{bin}:#{path}|]
     setEnv "SQITCH_USER_CONFIG" "/nonexistent/sqiff-test/sqitch.conf"
     setEnv "SQITCH_FULLNAME" "sqiff test"
     setEnv "SQITCH_EMAIL" "sqiff@example.invalid"

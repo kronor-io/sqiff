@@ -1,8 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 
 -- | R6: the questions sqiff keeps asking of its dependents have names.
 module Sqiff.Lint.Rule.NamedQueries (rule) where
 
+import Data.String.Interpolate (iii, __i)
 import Data.Text (Text)
 import GHC.Hs
 import Hopinion.Facts.Module (ModuleContext)
@@ -16,10 +18,16 @@ rule :: Rule
 rule =
     Rule
         { ruleId = RuleId "SqiffNamedQueries"
-        , ruleText = "Ask Dependents through exactDependentsOf and routinesNaming, not by looking up its maps."
+        , ruleText =
+            [iii|
+                Ask Dependents through exactDependentsOf and routinesNaming, not by looking
+                up its maps.
+            |]
         , ruleWhy =
-            "Map.findWithDefault Set.empty object deps.exact spells out how the answer is stored each time it is asked.\n\
-            \The named query says what is asked, and is the one place to change if the storage does."
+            [__i|
+                Map.findWithDefault Set.empty object deps.exact spells out how the answer is stored each time it is asked.
+                The named query says what is asked, and is the one place to change if the storage does.
+            |]
         , ruleFix =
             "Write exactDependentsOf object deps for the exact map, and routinesNaming object deps for the named one."
         , ruleImpl = RuleImplModule (ModuleCheckOverNodes check)

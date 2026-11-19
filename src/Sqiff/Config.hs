@@ -178,7 +178,7 @@ fill pattern values = T.concat (map piece (templatePieces pattern))
   where
     piece = \case
         Left text -> text
-        Right key -> fromMaybe ("{" <> key <> "}") (lookup key values)
+        Right key -> fromMaybe [i|{#{key}}|] (lookup key values)
 
 
 -- | The values @pattern@'s placeholders take in @text@; a placeholder matches one or more
