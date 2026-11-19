@@ -63,7 +63,7 @@ retypedIn changes =
 viewsAroundTypeChanges :: Map ObjectId (Set ObjectId) -> Schema -> Dependencies -> [(QName, Identifier, ObjectId)] -> Map (QName, Identifier) (Set ObjectId, ([Text], [Text]))
 viewsAroundTypeChanges exact schema deps retyped =
     Map.fromList
-        [ ((t, c), (members, (map dropStatement (reverse order), concatMap (createAgain schema) order)))
+        [ ((t, c), (members, (map dropStatement (reverse order), concatMap (createAgain attached) order)))
         | (t, c, column) <- retyped
         , let closure = Map.findWithDefault Set.empty column exact
               onColumn = Set.filter (\a -> isPolicyOrTrigger a && dependsOn deps a column) closure
@@ -72,6 +72,7 @@ viewsAroundTypeChanges exact schema deps retyped =
         , not (Set.null members)
         ]
   where
+    attached = attachedIn schema
     isPolicyOrTrigger = \case
         Policy{} -> True
         Trigger{} -> True
@@ -85,7 +86,7 @@ viewsAroundTypeChanges exact schema deps retyped =
 viewsToRecreate :: Schema -> Dependencies -> Changes -> Map QName ([Text], [Text])
 viewsToRecreate toSchema deps changes =
     Map.fromList
-        [ (v, (map (dropWith " if exists") (reverse order), concatMap (createAgain toSchema) (filter wanted order)))
+        [ (v, (map (dropWith " if exists") (reverse order), concatMap (createAgain attached) (filter wanted order)))
         | (k, Changed (ViewDefinition old) (ViewDefinition new)) <- Map.toList changes
         , k.aspect == Definition
         , View v <- [k.object]
@@ -95,6 +96,7 @@ viewsToRecreate toSchema deps changes =
             order = inDependencyOrder deps (held toSchema deps k.object closure (Set.filter isView closure))
         ]
   where
+    attached = attachedIn toSchema
     wanted a = definitionKey a `Map.member` toSchema
 
 
@@ -120,32 +122,51 @@ held schema deps start closure members =
     signature = T.unlines . takeWhile (\l -> not ("AS " `T.isPrefixOf` T.stripStart l || "BEGIN ATOMIC" `T.isInfixOf` l)) . T.lines
 
 
--- | The statements that create @a@ as @schema@ has it, with its grants, indexes, triggers
--- and comments.
-createAgain :: Schema -> ObjectId -> [Text]
-createAgain schema a =
+-- | A schema with what belongs to each relation found once, for 'createAgain'.
+data Attached = Attached
+    { attachedSchema :: Schema
+    , indexesAndTriggers :: Map QName [Text]
+    -- ^ The definitions of each relation's indexes and triggers, in key order.
+    , comments :: Map ObjectId [(ObjectKey, Definition)]
+    -- ^ The comments on each relation and its parts, in key order.
+    }
+
+
+attachedIn :: Schema -> Attached
+attachedIn schema =
+    Attached
+        { attachedSchema = schema
+        , indexesAndTriggers =
+            Map.fromListWith
+                (flip (<>))
+                [ (t, [printed def])
+                | (k, def) <- Map.toList schema
+                , k.aspect == Definition
+                , Just t <- [indexedOrTriggered k.object def]
+                ]
+        , comments = Map.fromListWith (flip (<>)) [(relationOf k.object, [(k, def)]) | (k, def) <- Map.toList schema, k.aspect == Comment]
+        }
+  where
+    indexedOrTriggered object def = case object of
+        Index _ | IndexDefinition ix <- def -> Just ix.table
+        Trigger t _ -> Just t
+        _ -> Nothing
+
+
+-- | The statements that create @a@ as the schema has it, with its grants, indexes,
+-- triggers and comments.
+createAgain :: Attached -> ObjectId -> [Text]
+createAgain attached a =
     concat
         [ [revokeGranted (qualifiedName a) | aspect == Privileges, isView a] <> stepsFor key (Added def)
         | aspect <- [Definition, Privileges]
         , let key = ObjectKey aspect a
-        , Just def <- [Map.lookup key schema]
+        , Just def <- [Map.lookup key attached.attachedSchema]
         , -- A view created again starts with the default privileges.
         aspect == Definition || not (isDefault def)
         ]
-        <> [ printed def
-           | (k, def) <- Map.toList schema
-           , k.aspect == Definition
-           , case k.object of
-                Index _ | IndexDefinition ix <- def -> isRelation a == Just ix.table
-                Trigger t _ -> isRelation a == Just t
-                _ -> False
-           ]
-        <> concat
-            [ stepsFor k (Added def)
-            | (k, def) <- Map.toList schema
-            , k.aspect == Comment
-            , k.object == a || (relationOf k.object == a && k.object /= a)
-            ]
+        <> maybe [] (\t -> Map.findWithDefault [] t attached.indexesAndTriggers) (isRelation a)
+        <> concat [stepsFor k (Added def) | (k, def) <- Map.findWithDefault [] a attached.comments]
   where
     ctx0 = context Map.empty Map.empty Map.empty noDependencies Map.empty
     stepsFor key c = map (.sql) (recipe ctx0 key c)

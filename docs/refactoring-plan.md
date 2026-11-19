@@ -460,6 +460,11 @@ Guiding rules:
   it now takes about 4.7 s. The lookup is a lateral subquery kept by `offset 0`, so
   it goes through the reference index. A test plans three 100-deep chains over 300
   tables within 3 s: 0.6 s now, 10.3 s before.
+- [x] **Recreating views no longer scans the schema per view.** With the query fixed,
+  planning was 3.6 s of the 4.7 s on that schema, nearly all in `withViewsAround`:
+  `createAgain` walked every definition to find each recreated view's indexes,
+  triggers and comments. `attachedIn` groups those once per schema. Planning now
+  takes about 120 ms and the whole run about 1.05 s, with the same plan.
 
 ## Phases (each one builds, passes tests, and ships on its own)
 
