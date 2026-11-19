@@ -30,7 +30,7 @@ import RIO.Map qualified as Map
 import RIO.Set qualified as Set
 import Sqiff.Config (Names (..), fill)
 import Sqiff.Definition
-import Sqiff.Diff (Change (..), Changes)
+import Sqiff.Diff (Change (..), Changes, after, before)
 import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Plan (invert)
@@ -425,8 +425,8 @@ verifyScript header steps =
     checkObject s = case s.object of
         Column t col
             | gone s -> [notExists [S.i|select from pg_attribute where attrelid = #{reg t} and attname = #{literal c} and not attisdropped|] [S.i|column #{c} is still on #{qualified t}|]]
-            | Just new <- asColumn =<< changed s.change ->
-                let old = asColumn =<< previous s.change
+            | Just new <- asColumn =<< after s.change ->
+                let old = asColumn =<< before s.change
                     differs f = fmap f old /= Just (f new)
                     ty = typeText new.colType
                     attribute :: Text -> Text
@@ -466,19 +466,12 @@ verifyScript header steps =
             lookupBy s "to_regtype" (typeText t)
                 : [ [S.i|assert exists (select from pg_enum where enumtypid = to_regtype(#{literal (typeText t)}) and enumlabel = #{literal label}), #{literal ("label " <> label <> " is missing from " <> typeText t)};|]
                   | not (gone s)
-                  , Just (TypeDefinition (EnumType labels)) <- [changed s.change]
+                  , Just (TypeDefinition (EnumType labels)) <- [after s.change]
                   , label <- labels
                   ]
         Schema n -> let name = nameText n in [presence s [S.i|select from pg_namespace where nspname = #{literal name}|] [S.i|schema #{name}|]]
         Extension e -> let name = nameText e in [presence s [S.i|select from pg_extension where extname = #{literal name}|] [S.i|extension #{name}|]]
         _ -> []
-    changed = \case
-        Added d -> Just d
-        Changed _ d -> Just d
-        Dropped _ -> Nothing
-    previous = \case
-        Changed d _ -> Just d
-        _ -> Nothing
     -- Whether a regclass-like lookup finds the object, as it should.
     lookupBy :: Step -> Text -> Text -> Text
     lookupBy s function name =

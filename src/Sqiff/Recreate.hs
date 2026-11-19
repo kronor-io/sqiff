@@ -54,7 +54,7 @@ retypedIn changes =
     | (k, Changed (ColumnDefinition old) (ColumnDefinition new)) <- Map.toList changes
     , k.aspect == Definition
     , Column t c <- [k.object]
-    , old.colType /= new.colType || old.collation /= new.collation
+    , columnTypeChanged old new
     ]
 
 

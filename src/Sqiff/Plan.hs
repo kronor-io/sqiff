@@ -151,7 +151,7 @@ context checks fromSchema toSchema fromDeps changes =
             Set.fromList
                 [ (t, c)
                 | (Column t c, Changed (ColumnDefinition o) (ColumnDefinition n)) <- definitions
-                , o.colType /= n.colType || o.collation /= n.collation
+                , columnTypeChanged o n
                 ]
         , viewsAround = Map.empty
         , droppedObjects = Set.fromList [k.object | (k, Dropped _) <- Map.toList changes, k.aspect == Definition]

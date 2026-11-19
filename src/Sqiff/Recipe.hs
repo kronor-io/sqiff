@@ -57,6 +57,8 @@ data Hazard
     | RechecksForeignKey Text
     | EveryPartition
     | IndexBuild
+    | -- | An existing value may not convert to the column's new type.
+      ConversionMayFail
     | MayFail Text
     | Manual Text
     deriving stock (Eq, Ord, Show)
@@ -73,6 +75,7 @@ hazardText = \case
     RechecksForeignKey t -> [i|hazard: checks the foreign key between the table and #{t} again, reading every row|]
     EveryPartition -> "hazard: the lock and any rewrite cover every partition"
     IndexBuild -> "hazard: builds an index"
+    ConversionMayFail -> "hazard: fails when an existing value does not convert to the new type"
     MayFail why -> "hazard: " <> why
     Manual why -> "manual: " <> why
 
@@ -347,7 +350,7 @@ definition ctx key object change = case object of
         alter = [i|alter table #{qualified t} |]
         col = [i|#{alter}alter column #{quoted c} |]
         alterColumn old new =
-            let typeChanged = old.colType /= new.colType || old.collation /= new.collation
+            let typeChanged = columnTypeChanged old new
                 defaultChanged = defaultExpr old /= defaultExpr new
                 serialToIdentity = isNothing (identityKindOf old) && isJust (identityKindOf new) && isJust (serialSequence old)
                 identityToSerial = isJust (identityKindOf old) && isNothing (identityKindOf new) && isJust (serialSequence new)
@@ -355,7 +358,7 @@ definition ctx key object change = case object of
              in [create (Shared, []) (col <> "drop default") | typeChanged, isJust (defaultExpr old)]
                     <> [ create
                             ( Shared
-                            , [MayRewriteTable, LongLock, MayFail "fails when an existing value does not convert to the new type"]
+                            , [MayRewriteTable, LongLock, ConversionMayFail]
                                 <> [MayFail "recreating a view fails when its query relies on the old type; then edit the view" | Map.member (t, c) ctx.viewsAround]
                             )
                             (aroundViews (col <> "type " <> typeText new.colType <> maybe "" ((" collate " <>) . collationSql) new.collation <> " using " <> quoted c <> "::" <> typeText new.colType))

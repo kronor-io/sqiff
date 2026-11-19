@@ -93,7 +93,7 @@ retypedColumns edit =
     , k.aspect == Definition
     , ColumnDefinition o <- [old]
     , ColumnDefinition n <- [new]
-    , o.colType /= n.colType || o.collation /= n.collation
+    , columnTypeChanged o n
     , Column t c <- [k.object]
     ]
 
@@ -121,13 +121,12 @@ findingsFor env migrate ev = do
               , let other = if onTable == table then qualified target.table else qualified onTable
               , other /= qualified table
               ]
-    convertNote = MayFail "fails when an existing value does not convert to the new type"
     withTypeFacts s = case Map.lookup s.object ev.typeFacts of
         Just (TypeChange rewrite target)
             | MayRewriteTable `elem` s.hazards ->
                 let rewrites = rewrite == RewritesFiles
                     domain = target == DomainType
-                 in let kept = concatMap (\h -> if h == MayRewriteTable then [RewritesTable | rewrites] else [h | h /= convertNote || rewrites || domain]) s.hazards
+                 in let kept = concatMap (\h -> if h == MayRewriteTable then [RewritesTable | rewrites] else [h | h /= ConversionMayFail || rewrites || domain]) s.hazards
                      in s{hazards = kept <> concat [LocksOther o : [RechecksForeignKey o | rewrites] | o <- otherTables s.object]}
         _ -> s
     breaksFor addr = [a | a <- Set.toList (Map.findWithDefault Set.empty addr deps.named <> Map.findWithDefault Set.empty addr deps.exact), a `Map.member` breaking]

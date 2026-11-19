@@ -27,6 +27,7 @@ module Sqiff.Definition (
 
     -- * Columns
     ColumnDef (..),
+    columnTypeChanged,
     Collation (..),
     collationSql,
     Position (..),
@@ -234,6 +235,11 @@ data ColumnDef = ColumnDef
     }
     deriving stock (Eq, Show, Generic)
     deriving anyclass (NFData)
+
+
+-- | Whether a column's type changes from @old@ to @new@: its type or its collation.
+columnTypeChanged :: ColumnDef -> ColumnDef -> Bool
+columnTypeChanged old new = old.colType /= new.colType || old.collation /= new.collation
 
 
 -- | Where a column sits in its table (@attnum@), so a new table gets its columns in

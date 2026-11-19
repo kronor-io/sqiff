@@ -6,6 +6,7 @@ module Sqiff.Diff (
     Change (..),
     Changes,
     invert,
+    before,
     after,
     diff,
     affected,
@@ -47,6 +48,14 @@ invert = \case
     Added new -> Dropped new
     Dropped old -> Added old
     Changed old new -> Changed new old
+
+
+-- | The definition a change starts from, if there was one.
+before :: Change a -> Maybe a
+before = \case
+    Dropped old -> Just old
+    Changed old _ -> Just old
+    Added _ -> Nothing
 
 
 -- | The definition a change leaves, if it leaves one.
