@@ -36,7 +36,7 @@ import Sqiff.Diff (Change (..))
 import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Plan (DependencyCycle, planWith)
-import Sqiff.Recipe (Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), Undo (..))
+import Sqiff.Recipe (Context (viewsAround), Hazard (..), Phase (..), Role (..), Step (..), Txn (..), Undo (..))
 import Sqiff.Recreate (Recreation (..), viewsAroundTypeChanges)
 import Sqiff.TableEdit (TableEdit (..), TableRewrite (..), TargetType (..), TypeChange (..))
 
@@ -253,6 +253,7 @@ renameStep :: TableEnv -> TableEdit -> (Identifier, Identifier) -> Step
 renameStep env edit (old, new) =
     Step
         { phase = DropPhase
+        , role = RenamesColumn
         , rank = -1
         , object = renamed
         , sql = renameSql env.table (old, new)
@@ -264,6 +265,7 @@ renameStep env edit (old, new) =
             UndoBy
                 [ Step
                     { phase = DropPhase
+                    , role = RenamesColumn
                     , rank = -1
                     , object = Column env.table old
                     , sql = renameSql env.table (new, old)

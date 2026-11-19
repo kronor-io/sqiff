@@ -33,7 +33,7 @@ import Sqiff.Graph (schedule)
 import Sqiff.Identifier (identifier, qname, quoteIdent, typeName)
 import Sqiff.Model (Address (..), Aspect (..), Edge (..), ObjectId (..), ObjectKey (..), RoutineKind (..), fromAddress, toAddress)
 import Sqiff.Plan (context, invert, topoOrder)
-import Sqiff.Recipe (Hazard (..), Phase (..), Step (..), Txn (..), Undo (..))
+import Sqiff.Recipe (Hazard (..), Phase (..), Role (..), Step (..), Txn (..), Undo (..))
 import Sqiff.Rewrite (fileDrift)
 import Sqiff.Script (splitStatements, withoutTransactionControl)
 import Sqiff.Sqitch.Check (Tagging (..), batchProblems, changeNameProblem, chooseTag, tagNameProblem)
@@ -500,21 +500,21 @@ sqitchChecks =
         , testCase "verify checks a column's full type, not only its base type" do
             let col ty = ColumnDefinition (ColumnDef (typeName ty) Nothing Nullable (PlainColumn Nothing) False (Position 1) False)
                 object = Column (qname "public" "t") (identifier "a")
-                retype = Step CreatePhase 6 object "alter table public.t alter column a type character varying(20)" Shared [] (ObjectKey Definition object) (Changed (col "character varying(10)") (col "character varying(20)")) UndoObject
+                retype = Step CreatePhase Creates 6 object "alter table public.t alter column a type character varying(20)" Shared [] (ObjectKey Definition object) (Changed (col "character varying(10)") (col "character varying(20)")) UndoObject
                 script = verifyScript "-- verify" [retype]
             ("format_type(atttypid, atttypmod)" `T.isInfixOf` script, "= 'character varying(20)'" `T.isInfixOf` script) @?= (True, True)
         , testCase "verify checks routines, types, schemas and extensions" do
-            let made object = Step CreatePhase 1 object "create" Shared [] (ObjectKey Definition object) (Added (Printed "x")) UndoObject
+            let made object = Step CreatePhase Creates 1 object "create" Shared [] (ObjectKey Definition object) (Added (Printed "x")) UndoObject
                 script = verifyScript "-- verify" (map made [Routine Function (qname "app" "f") [typeName "integer"], Type (typeName "app.mood"), Schema (identifier "app"), Extension (identifier "pgcrypto"), Table (qname "app" "t")])
             for_ ["to_regprocedure('app.f(integer)') is not null", "to_regtype('app.mood') is not null", "nspname = 'app'", "extname = 'pgcrypto'", "to_regclass('app.t') is not null"] \check ->
                 (check, check `T.isInfixOf` script) @?= (check, True)
         , testCase "verify does not expect an object dropped to be created again to be gone" do
             let object = MaterializedView (qname "app" "mv")
-                drop' = Step DropPhase 1 object "drop materialized view app.mv" Shared [] (ObjectKey Definition object) (Changed (Printed "a") (Printed "b")) UndoObject
+                drop' = Step DropPhase Drops 1 object "drop materialized view app.mv" Shared [] (ObjectKey Definition object) (Changed (Printed "a") (Printed "b")) UndoObject
             ("still exists" `T.isInfixOf` verifyScript "-- verify" [drop']) @?= False
         , testCase "a step sqiff cannot write stops the deploy" do
             let object = Type (typeName "app.mood")
-                manual = Step CreatePhase 8 object "-- only adding enum values is automated" Shared [Manual "only adding enum values is automated"] (ObjectKey Definition object) (Changed (Printed "a") (Printed "b")) UndoObject
+                manual = Step CreatePhase Creates 8 object "-- only adding enum values is automated" Shared [Manual "only adding enum values is automated"] (ObjectKey Definition object) (Changed (Printed "a") (Printed "b")) UndoObject
             ("raise exception" `T.isInfixOf` renderScript "-- deploy" Migration [manual]) @?= True
         , testCase "a table's migrations are found by its name as migration names write it" do
             let names = either error id (Aeson.eitherDecode "{}")
@@ -555,7 +555,7 @@ sqitchChecks =
                 ctx = context Map.empty Map.empty Map.empty noDependencies Map.empty
                 overload arg =
                     let object = Routine Function (qname "public" "f") [typeName arg]
-                     in Step CreatePhase 9 object ("create function public.f(" <> arg <> ")") Shared [] (ObjectKey Definition object) (Added (Printed arg)) UndoObject
+                     in Step CreatePhase Creates 9 object ("create function public.f(" <> arg <> ")") Shared [] (ObjectKey Definition object) (Added (Printed arg)) UndoObject
                 written = units names (const True) ctx Map.empty (plan "") (UTCTime (fromGregorian 2026 11 18) 0) [overload "int", overload "text"]
             map (\u -> (u.changeName, length u.deploy)) written @?= [("public/function/f", 2)]
         , testCase "the layout: the target's setting beats the engine's, which beats the core's" do

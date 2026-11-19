@@ -120,7 +120,7 @@ verb :: Step -> Text
 verb s
     | s.key.aspect == Privileges = "grant"
     | s.key.aspect == Comment = "comment"
-    | " rename column " `T.isInfixOf` s.sql = "rename"
+    | s.role == RenamesColumn = "rename"
     | s.phase == DropPhase = "drop"
     | isAdded s.change = "add"
     | otherwise = "alter"
@@ -140,7 +140,7 @@ data RevertIndex = RevertIndex
     , objectUnits :: Map ObjectKey (Set Int)
     -- ^ The migrations holding steps of each object change that its inverse undoes.
     , mainUnits :: Map ObjectKey Int
-    -- ^ The first migration with the step that creates or drops the object itself.
+    -- ^ The first migration with a step that creates, replaces or drops the object itself.
     , dropThenCreate :: Map ObjectKey Bool
     -- ^ Whether an object's change drops the old object in the drop phase and creates
     -- the new one in the create phase, so each part has its own inverse.
@@ -152,7 +152,7 @@ revertIndex us =
     RevertIndex
         { withSteps = Set.fromList [s.key | (_, s) <- numbered]
         , objectUnits = Map.fromListWith (<>) [(s.key, Set.singleton n) | (n, s) <- undoneByObject]
-        , mainUnits = Map.fromListWith min [(s.key, n) | (n, s) <- undoneByObject, s.rank == createRank s.object || s.rank == dropRank s.object]
+        , mainUnits = Map.fromListWith min [(s.key, n) | (n, s) <- undoneByObject, defines s]
         , dropThenCreate = Map.map (== Set.fromList [DropPhase, CreatePhase]) $ Map.fromListWith (<>) [(s.key, Set.singleton s.phase) | (_, s) <- undoneByObject]
         }
   where
@@ -231,11 +231,11 @@ objectPart index ctx n k change mine
     | dropsThenCreates
     , Changed old _ <- change
     , all ((== DropPhase) . (.phase)) mine =
-        if any (\x -> x.rank == dropRank x.object) mine then recipe ctx k (Added old) else []
+        if any defines mine then recipe ctx k (Added old) else []
     | dropsThenCreates
     , Changed _ new <- change
     , all ((== CreatePhase) . (.phase)) mine =
-        if any (\x -> x.rank == createRank x.object) mine then recipe ctx k (Dropped new) else []
+        if any defines mine then recipe ctx k (Dropped new) else []
     -- Otherwise the migration with its main step reverts it all, or the last with a part
     -- of it when none has one.
     | Just n == (Map.lookup k index.mainUnits <|> (Map.lookup k index.objectUnits >>= Set.lookupMax)) = recipe ctx k (invert change)
@@ -295,7 +295,7 @@ conventionalName :: Names -> Step -> Maybe Text
 conventionalName names s
     | s.key.aspect /= Definition = Nothing
     | otherwise = case (s.object, s.change) of
-        (Table t, Added _) | s.rank == 4 -> Just (path names.table t)
+        (Table t, Added _) | s.role == Creates -> Just (path names.table t)
         (Routine Aggregate _ _, _) -> Nothing
         (Routine _ q _, Added _) -> Just (path names.function q)
         (Routine _ q _, Changed _ _) -> Just (path names.function q)
@@ -303,7 +303,7 @@ conventionalName names s
         (View v, Changed _ _) -> Just (path names.view v)
         (MaterializedView v, Added _) | s.phase == CreatePhase -> Just (path names.view v)
         (Trigger t n, Added _) -> Just (triggerPath t n)
-        (Trigger t n, Changed _ _) | "CREATE OR REPLACE TRIGGER" `T.isPrefixOf` s.sql -> Just (triggerPath t n)
+        (Trigger t n, Changed _ _) | s.role == Replaces -> Just (triggerPath t n)
         (Index ix, Added (IndexDefinition def)) | Just t <- plainTable def -> Just (fill names.index [("schema", nameText ix.schema), ("table", nameText t), ("name", nameText ix.name)])
         (Type t, Added _) | [schema, name] <- T.splitOn "." (typeText t) -> Just (fill names.type_ [("schema", schema), ("name", name)])
         _ -> Nothing
@@ -491,11 +491,7 @@ verifyScript header steps =
     gone :: Step -> Bool
     gone s = case s.change of
         Dropped _ -> True
-        _
-            | " rename " `T.isInfixOf` s.sql -> False
-            | s.phase == DropPhase -> True
-            | Index _ <- s.object -> "drop index " `T.isPrefixOf` s.sql
-            | otherwise -> False
+        _ -> s.role == Drops
     selects :: [Text]
     selects =
         [ [S.i|select #{columns} from #{table} where false;|]
@@ -535,7 +531,7 @@ verifyScript header steps =
                            ]
           where
             c = nameText col
-        TableConstraint t con | "create unique index " `T.isInfixOf` T.toLower s.sql -> [relation s (QName t.schema con)]
+        TableConstraint t con | s.role == BuildsIndex -> [relation s (QName t.schema con)]
         TableConstraint t con -> let c = nameText con in [presence s [S.i|select from pg_constraint where conrelid = #{reg t} and conname = #{literal c}|] [S.i|constraint #{c} on #{qualified t}|]]
         Policy t name -> let n = nameText name in [presence s [S.i|select from pg_policy where polrelid = #{reg t} and polname = #{literal n}|] [S.i|policy #{n} on #{qualified t}|]]
         Trigger t name -> let n = nameText name in [presence s [S.i|select from pg_trigger where tgrelid = #{reg t} and tgname = #{literal n} and not tgisinternal|] [S.i|trigger #{n} on #{qualified t}|]]

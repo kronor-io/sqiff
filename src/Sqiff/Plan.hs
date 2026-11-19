@@ -91,9 +91,9 @@ planWith adjust checks fromSchema toSchema fromDeps toDeps changes = do
                 , waiting <- waitingSteps phase a' b (stepsOf a')
                 , waited <- if phase == CreatePhase then mainStep b else take 1 (reverse (stepsOf b))
                 ]
-            -- The step that makes or replaces the object, not one that changes its
-            -- settings, grants or comment.
-            mainStep b = take 1 [n | n <- stepsOf b, Just s <- [Map.lookup n stepAt], s.rank == createRank b]
+            -- The first step that creates, replaces or drops the object itself, not
+            -- one that sets its settings, grants or comment.
+            mainStep b = take 1 [n | n <- stepsOf b, Just s <- [Map.lookup n stepAt], defines s]
          in case schedule fst priority numbered (chained <> waits) of
                 Right placed -> Right (map snd placed)
                 Left (_, (_, b) : bs) -> Left (DependencyCycle (b.object :| filter (/= b.object) (nubOrd (map ((.object) . snd) bs))))
@@ -105,7 +105,7 @@ planWith adjust checks fromSchema toSchema fromDeps toDeps changes = do
     -- column, the step that sets the owner. The sequence itself comes first, as the
     -- column's default uses it.
     waitingSteps phase a b ns
-        | phase == CreatePhase, owns a b = [n | n <- ns, Just s <- [Map.lookup n stepAt], s.rank == sequenceOwnerRank]
+        | phase == CreatePhase, owns a b = [n | n <- ns, Just s <- [Map.lookup n stepAt], s.role == OwnsSequence]
         | otherwise = take 1 ns
 
     -- A sequence owned by a column: dropping the column drops the sequence.

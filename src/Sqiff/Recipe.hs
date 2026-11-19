@@ -12,15 +12,14 @@ module Sqiff.Recipe (
     hazardText,
     revokeGranted,
     Step (..),
+    Role (..),
+    defines,
     Undo (..),
     Context (..),
     Surrounding (..),
     KeptOnView (..),
     columnSql,
     recipe,
-    createRank,
-    dropRank,
-    sequenceOwnerRank,
 ) where
 
 import Data.ByteString qualified as B
@@ -92,7 +91,9 @@ revokeGranted relation =
 
 data Step = Step
     { phase :: Phase
+    , role :: Role
     , rank :: Int
+    -- ^ Orders steps within a phase; dependency order breaks ties.
     , object :: ObjectId
     , sql :: Text
     , txn :: Txn
@@ -103,6 +104,32 @@ data Step = Step
     -- ^ How a migration that holds this step reverts it.
     }
     deriving stock (Eq, Show)
+
+
+-- | What a step does to its object. Planning and the sqitch output go by it, rather
+-- than by a step's rank or SQL.
+data Role
+    = -- | Creates the object, or changes it in place.
+      Creates
+    | -- | Creates or replaces the object in one statement.
+      Replaces
+    | -- | Builds an index the object needs, concurrently.
+      BuildsIndex
+    | -- | Drops the object: for good, or in the create phase to create it again.
+      Drops
+    | -- | Renames a column, before anything else runs.
+      RenamesColumn
+    | -- | Sets the column that owns a sequence, once the column exists.
+      OwnsSequence
+    | -- | Sets something on an object that exists: a table's settings, grants, a comment.
+      Configures
+    deriving stock (Eq, Show)
+
+
+-- | Whether the step creates, replaces or drops the object itself, rather than renaming
+-- it or setting what goes with it.
+defines :: Step -> Bool
+defines s = s.role `elem` [Creates, Replaces, BuildsIndex, Drops]
 
 
 -- | How a step is reverted when its object's change is split over several migrations,
@@ -265,16 +292,46 @@ textual :: Target -> Change Text
 textual this = printed <$> this.objectChange
 
 
--- | A step of the create phase that changes the object, at its own rank.
+-- | A step of the create phase that creates the object or changes it, at its own rank.
 create :: Target -> (Txn, [Hazard]) -> Text -> Step
-create this = createAt this (createRank this.objectKey.object)
+create this = stepOf this CreatePhase Creates (createRank this.objectKey.object)
 
 
--- | A step of the create phase at @rank@.
-createAt :: Target -> Int -> (Txn, [Hazard]) -> Text -> Step
-createAt this rank (txn, hazards) sql =
+-- | A step that replaces the object in one statement.
+replace :: Target -> (Txn, [Hazard]) -> Text -> Step
+replace this = stepOf this CreatePhase Replaces (createRank this.objectKey.object)
+
+
+-- | A step that builds an index the object needs, concurrently.
+buildIndex :: Target -> (Txn, [Hazard]) -> Text -> Step
+buildIndex this = stepOf this CreatePhase BuildsIndex (createRank this.objectKey.object)
+
+
+-- | A step of the drop phase that drops the object.
+remove :: Target -> (Txn, [Hazard]) -> Text -> Step
+remove this = stepOf this DropPhase Drops (dropRank this.objectKey.object)
+
+
+-- | A step of the create phase that drops the object, to create it again right after.
+dropToRecreate :: Target -> (Txn, [Hazard]) -> Text -> Step
+dropToRecreate this = stepOf this CreatePhase Drops (createRank this.objectKey.object)
+
+
+-- | A step that sets something on the object once it exists, at @rank@.
+configure :: Target -> Int -> (Txn, [Hazard]) -> Text -> Step
+configure this = stepOf this CreatePhase Configures
+
+
+-- | A step that sets the column owning a sequence.
+ownSequence :: Target -> (Txn, [Hazard]) -> Text -> Step
+ownSequence this = stepOf this CreatePhase OwnsSequence sequenceOwnerRank
+
+
+stepOf :: Target -> Phase -> Role -> Int -> (Txn, [Hazard]) -> Text -> Step
+stepOf this phase role rank (txn, hazards) sql =
     Step
-        { phase = CreatePhase
+        { phase
+        , role
         , rank
         , object = this.objectKey.object
         , sql
@@ -284,11 +341,6 @@ createAt this rank (txn, hazards) sql =
         , change = this.objectChange
         , undo = UndoObject
         }
-
-
--- | A step of the drop phase.
-remove :: Target -> (Txn, [Hazard]) -> Text -> Step
-remove this txnAndHazards sql = (createAt this (dropRank this.objectKey.object) txnAndHazards sql){phase = DropPhase}
 
 
 -- | A step left to a person, saying why.
@@ -319,7 +371,7 @@ builds this index = undoneBy [create this (None, []) ("drop index concurrently i
 -- old object, and nothing else in the plan sets them.
 restoreComments :: Target -> [ObjectId] -> [Step]
 restoreComments this objects =
-    [ undoneBy [] (create this (Shared, []) ("comment on " <> subject <> " is " <> literal text))
+    [ undoneBy [] (configure this (createRank this.objectKey.object) (Shared, []) ("comment on " <> subject <> " is " <> literal text))
     | o <- objects
     , Just text <- [Map.lookup o this.context.keptComments]
     , Just subject <- [commentTarget o]
@@ -400,8 +452,8 @@ createTable this t def
         cols -> [i|\n#{T.intercalate ",\n" (map columnLine cols)}\n|]
     columnLine (c, col) = [i|    #{quoted c} #{columnSql col}|]
     settings =
-        [createAt this tableSettingsRank (Shared, []) [i|alter table #{qualified t} enable row level security|] | def.rowSecurity]
-            <> [createAt this tableSettingsRank (Shared, []) [i|alter table #{qualified t} force row level security|] | def.forceRowSecurity]
+        [configure this tableSettingsRank (Shared, []) [i|alter table #{qualified t} enable row level security|] | def.rowSecurity]
+            <> [configure this tableSettingsRank (Shared, []) [i|alter table #{qualified t} force row level security|] | def.forceRowSecurity]
 
 
 alterTable :: Target -> QName -> TableDef -> TableDef -> [Step]
@@ -417,17 +469,17 @@ alterTable this t old new
   where
     toggle setting (enable, disable) hazards
         | setting old == setting new = []
-        | setting new = [createAt this tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> enable)]
-        | otherwise = [createAt this tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> disable)]
+        | setting new = [configure this tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> enable)]
+        | otherwise = [configure this tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> disable)]
     optionKey = T.takeWhile (/= '=')
     removedKeys = [k | o <- old.options, let k = optionKey o, k `notElem` map optionKey new.options]
     newOptions = T.intercalate ", " new.options
     storageOptions =
-        [ createAt this tableSettingsRank (Shared, []) [i|alter table #{qualified t} set (#{newOptions})|]
+        [ configure this tableSettingsRank (Shared, []) [i|alter table #{qualified t} set (#{newOptions})|]
         | not (null new.options)
         , L.sort new.options /= L.sort old.options
         ]
-            <> [ createAt this tableSettingsRank (Shared, []) [i|alter table #{qualified t} reset (#{T.intercalate ", " removedKeys})|]
+            <> [ configure this tableSettingsRank (Shared, []) [i|alter table #{qualified t} reset (#{T.intercalate ", " removedKeys})|]
                | not (null removedKeys)
                ]
 
@@ -579,7 +631,7 @@ tableConstraintChange this t c = \case
             ]
         | Just (keyword, cols) <- simpleKey def
         , not (t `Set.member` this.context.partitionedTables) =
-            let build = create this (None, [IndexBuild]) (concurrentBuild (QName t.schema c) [i|create unique index concurrently #{quoted c} on #{qualified t} (#{cols})|])
+            let build = buildIndex this (None, [IndexBuild]) (concurrentBuild (QName t.schema c) [i|create unique index concurrently #{quoted c} on #{qualified t} (#{cols})|])
              in [ builds this (QName t.schema c) build
                 , -- Dropping the constraint drops its index, which the build before made.
                   undoneBy [create this (Shared, []) (alterT <> "drop constraint " <> quoted c), build]
@@ -632,11 +684,11 @@ indexRecipe this ix = typed this asIndex \case
             let tmp = identifier (takeBytes 59 (nameText ix.name) <> "_new")
                 oldName = quoted ix.name
              in [ builds this (QName ix.schema tmp)
-                    $ create
+                    $ buildIndex
                         this
                         (None, [IndexBuild])
                         (concurrentBuild (QName ix.schema tmp) (replaceInCode [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoted tmp} ON |] new.statement))
-                , undoneBy (addIndex old <> restoreComments this [Index ix]) $ create this (None, []) ("drop index concurrently if exists " <> qualified ix)
+                , undoneBy (addIndex old <> restoreComments this [Index ix]) $ dropToRecreate this (None, []) ("drop index concurrently if exists " <> qualified ix)
                 , undoneBy [create this (Shared, []) ("alter index " <> qualified ix <> " rename to " <> quoted tmp)]
                     $ create this (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
                 ]
@@ -649,7 +701,7 @@ indexRecipe this ix = typed this asIndex \case
                 [i|-- create index concurrently and attach partition for #{qualified ix}|]
             ]
         | def.table `Set.member` this.context.newTables = [create this (Shared, []) def.statement]
-        | otherwise = [builds this ix $ create this (None, [IndexBuild]) (concurrentBuild ix (replaceInCode " INDEX " " INDEX CONCURRENTLY " def.statement))]
+        | otherwise = [builds this ix $ buildIndex this (None, [IndexBuild]) (concurrentBuild ix (replaceInCode " INDEX " " INDEX CONCURRENTLY " def.statement))]
 
 
 sequenceRecipe :: Target -> QName -> [Step]
@@ -657,16 +709,16 @@ sequenceRecipe this s = typed this asSequence \case
     -- Made by the column's change to serial; it only needs its options.
     Added def
         | s `Set.member` this.context.convertedSequences ->
-            [createAt this sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions def <> " owned by " <> maybe "none" ownerSql def.ownedBy)]
+            [ownSequence this (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions def <> " owned by " <> maybe "none" ownerSql def.ownedBy)]
     Added def ->
         create this (Shared, []) ("create sequence " <> qualified s <> " " <> sequenceOptions def)
-            : [createAt this sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " owned by " <> ownerSql o) | Just o <- [def.ownedBy]]
+            : [ownSequence this (Shared, []) ("alter sequence " <> qualified s <> " owned by " <> ownerSql o) | Just o <- [def.ownedBy]]
     Dropped def
         | Just o <- def.ownedBy, ownedByDropped o -> []
         -- Dropped by the column's change to identity.
         | s `Set.member` this.context.convertedSequences -> []
         | otherwise -> [remove this (Shared, []) ("drop sequence " <> qualified s)]
-    Changed _ new -> [createAt this sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions new <> " owned by " <> maybe "none" ownerSql new.ownedBy)]
+    Changed _ new -> [ownSequence this (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions new <> " owned by " <> maybe "none" ownerSql new.ownedBy)]
   where
     ownerSql (t, c) = qualified t <> "." <> quoted c
     -- Dropping the column, or its table, drops the sequence with it.
@@ -766,7 +818,7 @@ restoreOnView this v = case Map.lookup v this.context.recreatedViews of
     Just kept ->
         [create this (Shared, [IndexBuild]) def | (_, def) <- kept.keptIndexes]
             <> restoreComments this [Index q | (q, _) <- kept.keptIndexes]
-            <> [create this (Shared, []) (revokeGranted (qualified v)) | isJust kept.keptGrants]
+            <> [configure this (createRank this.objectKey.object) (Shared, []) (revokeGranted (qualified v)) | isJust kept.keptGrants]
             <> maybe [] (\(k, def) -> map (asPartOfThis this) (privileges k k.object (Added def))) kept.keptGrants
 
 
@@ -775,13 +827,13 @@ triggerRecipe this t n = case textual this of
     Added def -> create this (Shared, []) def : restoreComments this [Trigger t n]
     Changed old new
         | namesAlteredColumn this t old -> [dropTrigger DropPhase, create this (Shared, []) new] <> restoreComments this [Trigger t n]
-        | Just rest <- T.stripPrefix "CREATE TRIGGER " new -> [create this (Shared, []) ("CREATE OR REPLACE TRIGGER " <> rest)]
+        | Just rest <- T.stripPrefix "CREATE TRIGGER " new -> [replace this (Shared, []) ("CREATE OR REPLACE TRIGGER " <> rest)]
         | otherwise -> [dropTrigger CreatePhase, create this (Shared, []) new] <> restoreComments this [Trigger t n]
     Dropped _ -> [dropTrigger DropPhase]
   where
     dropTrigger = \case
         DropPhase -> remove this (Shared, []) dropSql
-        CreatePhase -> create this (Shared, []) dropSql
+        CreatePhase -> dropToRecreate this (Shared, []) dropSql
     dropSql = "drop trigger " <> quoted n <> " on " <> qualified t
 
 
@@ -790,7 +842,7 @@ policyRecipe this t n = case textual this of
     Added def -> createPolicy def : restoreComments this [Policy t n]
     Changed old new
         | namesAlteredColumn this t old -> [remove this (Shared, []) dropPolicy, createPolicy new] <> restoreComments this [Policy t n]
-        | otherwise -> [create this (Shared, []) dropPolicy, createPolicy new] <> restoreComments this [Policy t n]
+        | otherwise -> [dropToRecreate this (Shared, []) dropPolicy, createPolicy new] <> restoreComments this [Policy t n]
     Dropped _ -> [remove this (Shared, []) dropPolicy]
   where
     dropPolicy = "drop policy " <> quoted n <> " on " <> qualified t
@@ -806,7 +858,7 @@ privileges key object change = case (target, traverse asAcl change) of
     (Just onObject, Just (Changed old new)) -> reconcile onObject old new
   where
     step hazards sql =
-        Step{phase = CreatePhase, rank = privilegesRank, object, sql, txn = Shared, hazards, key, change, undo = UndoObject}
+        Step{phase = CreatePhase, role = Configures, rank = privilegesRank, object, sql, txn = Shared, hazards, key, change, undo = UndoObject}
     target = case object of
         Table t -> Just ("table " <> qualified t)
         View t -> Just ("table " <> qualified t)
@@ -878,7 +930,7 @@ comment ctx key change = case (commentTarget key.object, printed <$> change) of
     (Just subject, Changed _ new) -> [step (subject <> " is " <> literal new)]
   where
     step sql =
-        Step{phase = CreatePhase, rank = commentRank, object = key.object, sql = "comment on " <> sql, txn = Shared, hazards = [], key, change, undo = UndoObject}
+        Step{phase = CreatePhase, role = Configures, rank = commentRank, object = key.object, sql = "comment on " <> sql, txn = Shared, hazards = [], key, change, undo = UndoObject}
 
 
 -- | What @comment on@ names the object as.
