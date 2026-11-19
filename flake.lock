@@ -77,6 +77,23 @@
         "type": "github"
       }
     },
+    "hopinion": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793807871,
+        "narHash": "sha256-S159YrFvTjcZPouES93KhZPgSoOlptc/oJR282MPHQs=",
+        "owner": "NorfairKing",
+        "repo": "hopinion",
+        "rev": "48eb343a003ab05f7df0c5844ba37897ab35f2e7",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NorfairKing",
+        "repo": "hopinion",
+        "rev": "48eb343a003ab05f7df0c5844ba37897ab35f2e7",
+        "type": "github"
+      }
+    },
     "kronor-haskell-packages": {
       "flake": false,
       "locked": {
@@ -130,6 +147,7 @@
       "inputs": {
         "hackage-nix": "hackage-nix",
         "haskell-nix": "haskell-nix",
+        "hopinion": "hopinion",
         "kronor-haskell-packages": "kronor-haskell-packages",
         "nixpkgs": "nixpkgs"
       }

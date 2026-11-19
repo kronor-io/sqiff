@@ -1,0 +1,21 @@
+-- sqiff's hopinion rules, built apart from sqiff so hopinion's dependencies stay
+-- out of sqiff's own plan. It must use the compiler that builds sqiff: hopinion
+-- reads the .hie and .hi files that compiler writes.
+packages: .
+
+source-repository-package
+  type: git
+  location: https://github.com/NorfairKing/hopinion
+  tag: 48eb343a003ab05f7df0c5844ba37897ab35f2e7
+  subdir: hopinion hopinion-hie
+
+-- What hopinion is written against.
+constraints:
+  Cabal-syntax ==3.12.*,
+  ghc-lib-parser ==9.12.*,
+  ghc-lib-parser-ex ==9.12.*,
+  diagnose ==2.5.*
+
+-- diagnose 2.5's bounds predate GHC 9.10's base and text; nothing else about it
+-- minds, as hopinion's own Nix overlay notes.
+allow-newer: diagnose:base, diagnose:containers, diagnose:text
