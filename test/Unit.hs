@@ -4,8 +4,8 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Tests of the pure parts: quoting, name templates, script splitting, plan parsing,
--- ordering and diffing. A defect from the review (docs/codex-review.md) that is not fixed
--- yet is a test wrapped in @expectFailBecause@, named @known bug:@.
+-- ordering and diffing. A known defect that is not fixed yet is a test wrapped in
+-- @expectFailBecause@, named @known bug:@.
 module Unit (tests) where
 
 import Data.Aeson (FromJSON)
