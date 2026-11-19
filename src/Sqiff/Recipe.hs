@@ -485,6 +485,7 @@ alterTable this t old new
 
 
 columnRecipe :: Target -> QName -> Identifier -> [Step]
+-- [allow:SqiffSmallWhere] pre-existing at adoption
 columnRecipe this t c = case traverse asColumn this.objectChange of
     Nothing -> manual this "the catalog described the column without its column facts"
     -- The parent's change brings it, changes it or takes it away.

@@ -50,6 +50,7 @@ withViewsReplaced toSchema deps changes ctx =
 
 
 -- | The columns whose type or collation changes, with their identities.
+-- [allow:SqiffNamedTuples] pre-existing at adoption
 retypedIn :: Changes -> [(QName, Identifier, ObjectId)]
 retypedIn changes =
     [ (t, c, k.object)
@@ -69,6 +70,7 @@ data Recreation = Recreation
 
 -- | For each retyped column, the views, policies, triggers and routines that hold it,
 -- with the statements that drop them and the ones that create them again.
+-- [allow:SqiffNamedTuples] pre-existing at adoption
 viewsAroundTypeChanges :: Map ObjectId (Set ObjectId) -> Schema -> Dependencies -> [(QName, Identifier, ObjectId)] -> Map (QName, Identifier) Recreation
 viewsAroundTypeChanges exact schema deps retyped =
     Map.fromList

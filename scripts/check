@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# The checks docs/readability.md describes. Run inside `nix develop`.
+#
+#   scripts/check fast     fourmolu
+#   scripts/check lint     build, then sqiff's hopinion rules (lint/) over its .hie files
+#   scripts/check full     fast, lint, then every test
+#   scripts/check advice   HLint's suggestions, without failing
+#
+# The lint uses sqiff-lint from PATH when the dev shell provides it, or else
+# builds it from lint/ with cabal.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+need() {
+    command -v "$1" >/dev/null || {
+        echo "scripts/check: $1 is not on PATH; run inside nix develop" >&2
+        exit 2
+    }
+}
+
+haskell_files() {
+    git ls-files '*.hs'
+}
+
+fast() {
+    need fourmolu
+    echo "== fourmolu"
+    haskell_files | xargs fourmolu --mode check --quiet
+}
+
+build() {
+    need cabal
+    echo "== build"
+    cabal build --enable-tests all
+}
+
+# The sqiff-lint executable: the dev shell's, or one cabal builds from lint/.
+lint_executable() {
+    if command -v sqiff-lint >/dev/null; then
+        command -v sqiff-lint
+    else
+        (cd lint && cabal build -v0 exe:sqiff-lint && cabal list-bin -v0 exe:sqiff-lint)
+    fi
+}
+
+# Each component's .hie files with its .hi interfaces, one tree per component,
+# rooted where a module's path starts, as hopinion looks them up. cabal.project
+# has sqiff write the .hie files.
+collect_hie() {
+    local into="$1"
+    find dist-newstyle/build -type d -name hie -path '*/sqiff-*/*extra-compilation-artifacts*' | sort | while read -r artifacts; do
+        local component
+        component=$(echo "$artifacts" | sed -E 's|.*/sqiff-[0-9.]+/||; s|/extra-compilation-artifacts/hie$||; s|[^A-Za-z0-9]+|-|g')
+        mkdir -p "$into/$component"
+        (cd "$artifacts" && find . -name '*.hie' -exec cp --parents {} "$into/$component" \;)
+        # The library's build directory also holds the other components', under -tmp.
+        (cd "$(dirname "$(dirname "$artifacts")")" && find . -name '*.hi' -not -path '*-tmp/*' -exec cp --parents {} "$into/$component" \;)
+    done
+}
+
+lint() {
+    build
+    echo "== lint"
+    local exe
+    exe=$(lint_executable)
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    collect_hie "$work/hie"
+    local hie=()
+    for tree in "$work"/hie/*; do hie+=(--hie-directory "$tree"); done
+    "$exe" package --root . --rel-prefix sqiff "${hie[@]}" --out "$work/package" . >/dev/null
+    "$exe" project --package "$work/package" --source sqiff=. "${hie[@]}" --expect-packages sqiff --out "$work/project" >/dev/null
+    "$exe" judge "$work/project"
+}
+
+full() {
+    fast
+    lint
+    echo "== test"
+    cabal test all
+}
+
+advice() {
+    need hlint
+    hlint src app test || true
+}
+
+case "${1:-fast}" in
+    fast) fast ;;
+    lint) lint ;;
+    full) full ;;
+    advice) advice ;;
+    *)
+        echo "usage: scripts/check [fast|lint|full|advice]" >&2
+        exit 2
+        ;;
+esac

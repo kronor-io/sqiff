@@ -1,5 +1,10 @@
 packages: .
 
+-- .hie files, which the lint (scripts/check lint) reads; editors' language
+-- servers use them too.
+package sqiff
+  ghc-options: -fwrite-ide-info
+
 optimization: False
 
 -- Kronor's package repository, for the hasql-th fork whose syntax the quoters use.

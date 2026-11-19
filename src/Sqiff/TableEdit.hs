@@ -220,6 +220,7 @@ withEditedTable conn baseline table statements beforeEdit afterEdit = snd <$> ed
 
 
 editTable :: Describing -> Connection.Connection -> Baseline -> QName -> [Text] -> IO b -> (b -> IO a) -> IO (TableEdit, a)
+-- [allow:SqiffSmallWhere] pre-existing at adoption
 editTable describing conn baseline table statements beforeEdit afterEdit = do
     (current, desired, afterResult) <-
         inRolledBackTransaction conn "the table comparison" do

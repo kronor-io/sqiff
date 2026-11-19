@@ -120,6 +120,7 @@ deepViewChains getCluster = testCase "deep view chains are planned in reasonable
 
 -- | Runs sqiff's @command@ from @fromDb@ to @toDb@, outside the repository so no
 -- sqiff.yaml is read.
+-- [allow:SqiffNamedTuples] pre-existing at adoption
 runSqiff :: Cluster -> [String] -> Text -> Text -> IO (ExitCode, Text, Text)
 runSqiff cluster command fromDb toDb = do
     exe <- fromMaybe "sqiff" <$> lookupEnv "SQIFF_EXE"
