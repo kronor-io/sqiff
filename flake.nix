@@ -81,10 +81,43 @@
           };
 
           sqiff-lint = lintProject.hsPkgs.sqiff-lint.components.exes.sqiff-lint;
+
+          # sqiff with what it runs: sqitch, and psql under it, for the sqitch
+          # commands, and git for sqiff table. sqiff baseline drives docker
+          # compose, which has no place inside a container, so it is left out.
+          dockerImage = pkgs.dockerTools.buildLayeredImage {
+            name = "sqiff";
+            tag = "latest";
+            contents = [
+              sqiff
+              pkgs.sqitchPg
+              pkgs.postgresql_18
+              pkgs.git
+              pkgs.cacert
+              pkgs.dockerTools.fakeNss
+            ];
+            extraCommands = ''
+              mkdir -p work tmp
+              chmod 1777 tmp
+            '';
+            config = {
+              Entrypoint = [ "/bin/sqiff" ];
+              WorkingDir = "/work";
+              Env = [ "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
+            };
+          };
         in
         {
-          inherit pkgs project sqiff sqiff-lint;
+          inherit pkgs project sqiff sqiff-lint dockerImage;
         };
+
+      # What CI builds on each system, as a GitHub Actions matrix, the way
+      # kronor's other public packages do it: one job per package and system.
+      githubPlatforms = {
+        "x86_64-linux" = "ubuntu-latest";
+        "aarch64-linux" = "ubuntu-24.04-arm";
+        "aarch64-darwin" = "macos-latest";
+      };
 
       bySystem = forAllSystems perSystem;
     in
@@ -93,7 +126,19 @@
         sqiff = bySystem.${system}.sqiff;
         sqiff-lint = bySystem.${system}.sqiff-lint;
         default = sqiff;
+      } // nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "linux" system) {
+        dockerImage = bySystem.${system}.dockerImage;
       });
+
+      githubActions.matrix.include = nixpkgs.lib.concatMap
+        (system: map
+          (name: {
+            inherit name system;
+            os = githubPlatforms.${system};
+            attr = "packages.${system}.${name}";
+          })
+          (builtins.attrNames (builtins.removeAttrs self.packages.${system} [ "default" ])))
+        systems;
 
       apps = forAllSystems (system: {
         default = {

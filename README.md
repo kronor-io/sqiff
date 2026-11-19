@@ -71,7 +71,7 @@ What sqiff takes care of:
 
 ## Install
 
-Install it from the flake. The repository is private, so nix needs access to it on GitHub, for example a token in `access-tokens` in `nix.conf`.
+Install it from the flake. CI builds it for x86_64-linux, aarch64-linux and aarch64-darwin and pushes the builds to the `kronor-open` cachix cache, which the flake names, so nix downloads sqiff rather than building it once you accept the flake's settings.
 
 ```bash
 nix run github:kronor-io/sqiff -- --help
@@ -81,7 +81,13 @@ nix run github:kronor-io/sqiff -- --help
 nix profile install github:kronor-io/sqiff
 ```
 
-In a clone, `nix build .#sqiff` puts the binary in `result/bin`. `nix develop` gives a shell with GHC, cabal, Postgres, sqitch and git, where `cabal build` and `cabal install` work with the dependency versions in `cabal.project.freeze`.
+Each version tag also publishes an image for amd64 and arm64, with sqitch, psql and git beside sqiff (but not docker, so `sqiff baseline` is not available in it):
+
+```bash
+docker run --rm -v "$PWD:/work" ghcr.io/kronor-io/sqiff --help
+```
+
+In a clone, `nix build .#sqiff` puts the binary in `result/bin`, and `nix build .#dockerImage` the image. `nix develop` gives a shell with GHC, cabal, Postgres, sqitch and git, where `cabal build` and `cabal install` work with the dependency versions in `cabal.project.freeze`.
 
 sqiff needs a reachable Postgres, given with `--db` (`--from` and `--to` for `diff`, `plan` and `sqitch`) or with libpq's `PG*` variables. It also runs `git` and `sqitch`, and `docker` for `--from master`.
 

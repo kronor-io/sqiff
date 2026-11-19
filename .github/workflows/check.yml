@@ -1,18 +1,75 @@
-name: check
+name: CI
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
+  # Any base branch, so a pull request stacked on another one is checked too.
   pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
   contents: read
 
+# GitHub-hosted runners only, as for every public kronor repository: a
+# self-hosted runner would run pull requests from forks on kronor's own machines.
+# Every job reads from the kronor-open cache and pushes what it builds there, so
+# each package is built once and nix run github:kronor-io/sqiff finds a binary.
 jobs:
+  nix-matrix:
+    name: Generate nix github actions matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+        with:
+          name: kronor-open
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      - id: set-matrix
+        name: Generate Nix Matrix
+        run: |
+          set -Eeu
+          matrix="$(nix eval --json '.#githubActions.matrix')"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  # sqiff, sqiff-lint and the Docker image, on each system the flake supports.
+  nix-build:
+    name: ${{ matrix.name }} (${{ matrix.system }})
+    needs: nix-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.nix-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+        with:
+          name: kronor-open
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      - name: Build
+        run: nix build -L .#"${MATRIX_ATTR}"
+        env:
+          MATRIX_ATTR: ${{ matrix.attr }}
+
+  # docs/readability.md: formatting, sqiff's hopinion rules, the build with its
+  # warnings as errors, and every test, in the dev shell.
   check:
-    # GitHub-hosted, as every public kronor repository's CI is: a self-hosted
-    # runner would run pull requests from forks on kronor's own machines.
-    # arm64, so the builds pushed to the cache serve aarch64-linux machines too.
+    name: Check
+    needs: nix-build
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -22,18 +79,80 @@ jobs:
         with:
           extra_nix_config: |
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
-      # Reads from kronor-open and pushes what this job builds to it, as kronor's
-      # other public packages do, so the dev shell, sqiff-lint's dependencies and
-      # sqiff are built once.
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
         with:
           name: kronor-open
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
-      # docs/readability.md: formatting, sqiff's hopinion rules, the build with
-      # its warnings as errors, and every test.
       - name: Check
-        run: nix develop --print-build-logs --command scripts/check full
-      - name: Build
-        run: nix build --print-build-logs .#sqiff
-      - name: Run
-        run: ./result/bin/sqiff --help
+        run: nix develop -L --command scripts/check full
+
+  # On a version tag, the image for each architecture, then one tag for both.
+  release-image:
+    name: Release image (${{ matrix.arch }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [nix-build, check]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, arch: amd64 }
+          - { os: ubuntu-24.04-arm, arch: arm64 }
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+        with:
+          name: kronor-open
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      - name: Build image
+        run: nix build -L .#dockerImage
+      - uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image
+        env:
+          REPOSITORY: ${{ github.repository }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -Eeu
+          image="ghcr.io/${REPOSITORY,,}"
+          version="${GITHUB_REF_NAME#v}"
+          docker load < result
+          docker tag sqiff:latest "$image:$version-$ARCH"
+          docker push "$image:$version-$ARCH"
+
+  release-manifest:
+    name: Release image tags
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag the version and latest for both architectures
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -Eeu
+          image="ghcr.io/${REPOSITORY,,}"
+          version="${GITHUB_REF_NAME#v}"
+          for tag in "$version" latest; do
+            docker manifest create "$image:$tag" "$image:$version-amd64" "$image:$version-arm64"
+            docker manifest push "$image:$tag"
+          done
