@@ -85,12 +85,12 @@ qname s n = QName (identifier s) (identifier n)
 
 -- | @schema.name@, each part quoted as needed.
 qualified :: QName -> Text
-qualified q = quoted q.schema <> "." <> quoted q.name
+qualified (QName s n) = [i|#{quoted s}.#{quoted n}|]
 
 
 -- | @schema.name@ unquoted, as pg_identify_object_as_address and messages give it.
 dotted :: QName -> Text
-dotted q = nameText q.schema <> "." <> nameText q.name
+dotted (QName s n) = [i|#{nameText s}.#{nameText n}|]
 
 
 -- | A type as @format_type@ prints it: already SQL, qualified and quoted as needed.

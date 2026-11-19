@@ -64,7 +64,7 @@ exportManifest schema =
     clashes path = Map.findWithDefault 0 (T.toLower (T.pack path)) folded > 1
     withHash key path =
         let (base, extension) = splitExtension path
-         in base <> "~" <> T.unpack (shortHash (tshow key)) <> extension
+         in [i|#{base}~#{shortHash (tshow key)}#{extension}|]
 
 
 marker :: FilePath
