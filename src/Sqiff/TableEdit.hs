@@ -253,20 +253,7 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             desired <- timed "tableEdit.desired" $ build xact "" statements
             afterResult <- timed "tableEdit.after" $ afterEdit beforeResult
             pure (current, desired, afterResult)
-    let kept = case baseline of
-            BaseFile _ -> desired
-            LiveTable _ _ -> Map.mapWithKey (keepSettings current) desired
-        all' = diff (\_ a b -> a == b) current kept
-        reasons = Map.mapMaybeWithKey leftOut all'
-    pure
-        ( TableEdit
-            { current
-            , desired
-            , changes = all' `Map.difference` reasons
-            , ignored = Map.toList reasons
-            }
-        , afterResult
-        )
+    pure (compareTableSchemas baseline current desired, afterResult)
   where
     script sql = Connection.use conn (Session.script sql) >>= either setupFailed pure
 
@@ -331,27 +318,52 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
         Sequence _ -> False
         o -> owningTable o == Just q
 
-    keepSettings current k def = case (k.object, k.aspect, Map.lookup k current) of
-        -- Settings the file leaves out stay as the table has them.
-        (Table _, Definition, Just (TableDefinition old))
-            | TableDefinition new <- def ->
-                TableDefinition
-                    new
-                        { rowSecurity = new.rowSecurity || old.rowSecurity
-                        , forceRowSecurity = new.forceRowSecurity || old.forceRowSecurity
-                        , options = if null new.options then old.options else new.options
-                        }
-        _ -> def
 
-    leftOut k c
-        | BaseFile _ <- baseline = Nothing
-        | k.aspect == Privileges = Just "grants are kept outside table files"
-        | otherwise = case (k.object, c) of
-            (Index _, Dropped _) -> Just "not in the file; indexes are often kept in their own files"
-            (Trigger _ _, Dropped _) -> Just "not in the file; triggers are kept in their own files"
-            (Policy _ _, Dropped _) -> Just "not in the file; policies may be kept in other files"
-            (_, Dropped _) | LiveTable _ ReportDrops <- baseline -> Just "in the database but not in the file; --allow-drops drops it"
-            _ -> Nothing
+-- | The edit from the table as it is, @current@, to the one the file builds, @desired@.
+-- Against a live table, settings the file leaves out stay as they are, and some
+-- differences are left out, with the reason; @desired@ is kept as the file builds it.
+compareTableSchemas :: Baseline -> Schema -> Schema -> TableEdit
+compareTableSchemas baseline current desired =
+    TableEdit
+        { current
+        , desired
+        , changes = all' `Map.difference` reasons
+        , ignored = Map.toList reasons
+        }
+  where
+    kept = case baseline of
+        BaseFile _ -> desired
+        LiveTable _ _ -> Map.mapWithKey (keepLiveSettings current) desired
+    all' = diff (\_ a b -> a == b) current kept
+    reasons = Map.mapMaybeWithKey (ignoredChangeReason baseline) all'
+
+
+-- | Settings the file leaves out stay as the table has them.
+keepLiveSettings :: Schema -> ObjectKey -> Definition -> Definition
+keepLiveSettings current k def = case (k.object, k.aspect, Map.lookup k current) of
+    (Table _, Definition, Just (TableDefinition old))
+        | TableDefinition new <- def ->
+            TableDefinition
+                new
+                    { rowSecurity = new.rowSecurity || old.rowSecurity
+                    , forceRowSecurity = new.forceRowSecurity || old.forceRowSecurity
+                    , options = if null new.options then old.options else new.options
+                    }
+    _ -> def
+
+
+-- | Why a difference from a live table is left out of the edit, if it is: what table
+-- files do not hold, and drops the options do not allow.
+ignoredChangeReason :: Baseline -> ObjectKey -> Change Definition -> Maybe Text
+ignoredChangeReason baseline k c
+    | BaseFile _ <- baseline = Nothing
+    | k.aspect == Privileges = Just "grants are kept outside table files"
+    | otherwise = case (k.object, c) of
+        (Index _, Dropped _) -> Just "not in the file; indexes are often kept in their own files"
+        (Trigger _ _, Dropped _) -> Just "not in the file; triggers are kept in their own files"
+        (Policy _ _, Dropped _) -> Just "not in the file; policies may be kept in other files"
+        (_, Dropped _) | LiveTable _ ReportDrops <- baseline -> Just "in the database but not in the file; --allow-drops drops it"
+        _ -> Nothing
 
 
 -- | The name in the @constraint name ...@ clause that holds a 1-based character
