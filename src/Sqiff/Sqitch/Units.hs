@@ -1,3 +1,4 @@
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
@@ -60,145 +61,233 @@ data Unit = Unit
 
 
 -- | Groups ordered steps into changes: conventional paths for steps that pass
--- @conventional@, reworks of changes the plan has, and migrations for the rest.
+-- @conventional@, reworks of changes the plan has, and migrations for the rest. Each
+-- gets its revert, and each migration its time-stamped name.
 units :: Names -> (Step -> Bool) -> Context -> Changes -> SqitchPlan -> UTCTime -> [Step] -> [Unit]
-units names conventional inverseCtx forward sqitchPlan now steps = nameMigrations (0 :: Int) (claimReverts (foldr (merge . single) [] steps))
+units names conventional inverseCtx forward sqitchPlan now =
+    nameMigrations names now
+        . claimReverts inverseCtx forward
+        . groupSteps names conventional sqitchPlan
+
+
+-- | One change per step, merged with the next where they can share one: migration
+-- steps of the same table, phase and transaction, and overloads of a routine.
+groupSteps :: Names -> (Step -> Bool) -> SqitchPlan -> [Step] -> [Unit]
+groupSteps names conventional sqitchPlan = foldr (merge . single) []
   where
     existing = Set.fromList sqitchPlan.changes
-
     single s = case if conventional s then conventionalName names s else Nothing of
         Just n
-            | n `Set.member` existing -> Unit ReworkChange n (note "update" s) Conventional [s] []
-            | isAdded s.change -> Unit AddChange n (createNote s) Conventional [s] []
-        _ -> Unit AddChange (groupKey s) (note (verb s) s) Migration [s] []
-
-    createNote s = case (s.object, s.change) of
-        (Index ix, Added (IndexDefinition def)) | Just t <- plainTable def -> let table = dotted (QName ix.schema t); name = nameText ix.name in [S.i|add_index: add index #{table}.#{name}|]
-        _ -> note "create" s
-
+            | n `Set.member` existing -> unitOf ReworkChange n (stepNote "update" s) Conventional s
+            | isAdded s.change -> unitOf AddChange n (createNote s) Conventional s
+        _ -> unitOf AddChange (groupKey s) (stepNote (verb s) s) Migration s
+    unitOf kind changeName note placement s = Unit{kind, changeName, note, placement, deploy = [s], revert = []}
     merge u (next : rest)
-        | u.placement == Migration && next.placement == Migration && u.changeName == next.changeName && all sharable (u.deploy <> next.deploy) && samePhase (u.deploy <> next.deploy) =
-            u{deploy = u.deploy <> next.deploy, note = u.note} : rest
+        | u.placement == Migration && next.placement == Migration && u.changeName == next.changeName && all sharable both && samePhase both =
+            u{deploy = both} : rest
         -- Overloads of a routine share their conventional change.
         | u.placement == Conventional && next.placement == Conventional && u.changeName == next.changeName && u.kind == next.kind =
-            u{deploy = u.deploy <> next.deploy} : rest
+            u{deploy = both} : rest
+      where
+        both = u.deploy <> next.deploy
     merge u rest = u : rest
-
     sharable s = s.txn == Shared
     samePhase ss = length (nubOrd (map (.phase) ss)) <= 1
 
-    -- Each migration reverts its own steps, so reverting it returns to the state after
-    -- the one before. A rework keeps the revert sqitch gives it: the previous version.
-    claimReverts us =
-        [ u{revert = if u.kind == ReworkChange then [] else map refill (revertOf n u <> withTables u)}
-        | (n, u) <- zip [0 :: Int ..] us
-        ]
+
+createNote :: Step -> Text
+createNote s = case (s.object, s.change) of
+    (Index ix, Added (IndexDefinition def))
+        | Just t <- plainTable def ->
+            let table = dotted (QName ix.schema t)
+                name = nameText ix.name
+             in [S.i|add_index: add index #{table}.#{name}|]
+    _ -> stepNote "create" s
+
+
+stepNote :: Text -> Step -> Text
+stepNote v s = let what = render s.object in [S.i|sqiff: #{v} #{what}|]
+
+
+-- | The migration a step goes in: its table's, or its own.
+groupKey :: Step -> Text
+groupKey s = case owningTable s.object of
+    Just t -> dotted t
+    Nothing -> T.intercalate "." (toAddress s.object).objectNames
+
+
+verb :: Step -> Text
+verb s
+    | s.key.aspect == Privileges = "grant"
+    | s.key.aspect == Comment = "comment"
+    | " rename column " `T.isInfixOf` s.sql = "rename"
+    | s.phase == DropPhase = "drop"
+    | isAdded s.change = "add"
+    | otherwise = "alter"
+
+
+isAdded :: Change a -> Bool
+isAdded = \case
+    Added _ -> True
+    _ -> False
+
+
+-- | Where the steps of each object change sit among the migrations, numbered in order,
+-- for deciding which migration reverts which part of it.
+data RevertIndex = RevertIndex
+    { withSteps :: Set ObjectKey
+    -- ^ The object changes that have steps of their own.
+    , objectUnits :: Map ObjectKey (Set Int)
+    -- ^ The migrations holding steps of each object change that its inverse undoes.
+    , mainUnits :: Map ObjectKey Int
+    -- ^ The first migration with the step that creates or drops the object itself.
+    , dropThenCreate :: Map ObjectKey Bool
+    -- ^ Whether an object's change drops the old object in the drop phase and creates
+    -- the new one in the create phase, so each part has its own inverse.
+    }
+
+
+revertIndex :: [Unit] -> RevertIndex
+revertIndex us =
+    RevertIndex
+        { withSteps = Set.fromList [s.key | (_, s) <- numbered]
+        , objectUnits = Map.fromListWith (<>) [(s.key, Set.singleton n) | (n, s) <- undoneByObject]
+        , mainUnits = Map.fromListWith min [(s.key, n) | (n, s) <- undoneByObject, s.rank == createRank s.object || s.rank == dropRank s.object]
+        , dropThenCreate = Map.map (== Set.fromList [DropPhase, CreatePhase]) $ Map.fromListWith (<>) [(s.key, Set.singleton s.phase) | (_, s) <- undoneByObject]
+        }
+  where
+    numbered = [(n, s) | (n, u) <- zip [0 :: Int ..] us, s <- u.deploy]
+    undoneByObject = [(n, s) | (n, s) <- numbered, s.undo == UndoObject]
+
+
+-- | Each migration reverts its own steps, so reverting it returns to the state after
+-- the one before. A rework keeps the revert sqitch gives it: the previous version.
+claimReverts :: Context -> Changes -> [Unit] -> [Unit]
+claimReverts inverseCtx forward us =
+    [ u{revert = if u.kind == ReworkChange then [] else map refill (revertOf index ctx n u <> withTables index ctx forward u)}
+    | (n, u) <- zip [0 :: Int ..] us
+    , let ctx = unitContext inverseCtx u
+    ]
+  where
+    index = revertIndex us
+
+
+-- | A migration's revert creates or drops only its own tables; another migration's
+-- revert sees to the rest.
+unitContext :: Context -> Unit -> Context
+unitContext inverseCtx u =
+    inverseCtx{droppedTables = Set.intersection inverseCtx.droppedTables own, newTables = Set.intersection inverseCtx.newTables own}
+  where
+    own = Set.fromList [t | s <- u.deploy, s.key.aspect == Definition, Table t <- [s.object]]
+
+
+-- | What went with a table the migration drops, which has no steps of its own: its
+-- constraints, indexes, triggers, policies, comments and grants.
+withTables :: RevertIndex -> Context -> Changes -> Unit -> [Step]
+withTables index ctx forward u =
+    L.sortOn (.rank)
+        $ concat
+            [ recipe ctx k (Added d)
+            | not (Set.null dropped)
+            , (k, Dropped d) <- Map.toList forward
+            , k `Set.notMember` index.withSteps
+            , belongs k d
+            ]
+  where
+    dropped = Set.fromList [t | s <- u.deploy, s.key.aspect == Definition, Table t <- [s.object], Dropped _ <- [s.change]]
+    belongs k d = case k.object of
+        Table t -> k.aspect /= Definition && t `Set.member` dropped
+        Index _ | Just ix <- asIndex d -> ix.table `Set.member` dropped
+        o -> maybe False (`Set.member` dropped) (owningTable o) && not (isColumn o)
+    isColumn = \case
+        Column{} -> True
+        _ -> False
+
+
+-- | The revert of migration @n@'s own steps, object change by object change, last first.
+revertOf :: RevertIndex -> Context -> Int -> Unit -> [Step]
+revertOf index ctx n u =
+    concat [undoKey k (filter ((== k) . (.key)) u.deploy) | k <- reverse (nubOrd (map (.key) u.deploy))]
+  where
+    -- The key's steps here, undone last to first; a run of steps the object's inverse
+    -- undoes gets it once.
+    undoKey k here = go False (reverse here)
       where
-        -- A migration's revert creates or drops only its own tables; another migration's
-        -- revert sees to the rest.
-        unitCtx u =
-            let own = Set.fromList [t | s <- u.deploy, s.key.aspect == Definition, Table t <- [s.object]]
-             in inverseCtx{droppedTables = Set.intersection inverseCtx.droppedTables own, newTables = Set.intersection inverseCtx.newTables own}
-        withSteps = Set.fromList [s.key | u <- us, s <- u.deploy]
-        -- What went with a table this migration drops, which has no steps of its own: its
-        -- constraints, indexes, triggers, policies, comments and grants.
-        withTables u =
-            let dropped = Set.fromList [t | s <- u.deploy, s.key.aspect == Definition, Table t <- [s.object], Dropped _ <- [s.change]]
-                belongs k d = case k.object of
-                    Table t -> k.aspect /= Definition && t `Set.member` dropped
-                    Index _ | Just ix <- asIndex d -> ix.table `Set.member` dropped
-                    o -> maybe False (`Set.member` dropped) (owningTable o) && not (isColumn o)
-                isColumn = \case Column{} -> True; _ -> False
-             in L.sortOn (.rank)
-                    $ concat
-                        [ recipe (unitCtx u) k (Added d)
-                        | not (Set.null dropped)
-                        , (k, Dropped d) <- Map.toList forward
-                        , k `Set.notMember` withSteps
-                        , belongs k d
-                        ]
-        -- The migrations holding steps of each object change that its inverse undoes.
-        objectUnits = Map.fromListWith (<>) [(s.key, Set.singleton n) | (n, u) <- zip [0 :: Int ..] us, s <- u.deploy, s.undo == UndoObject]
-        -- The first migration with the step that creates or drops the object itself.
-        mainUnits = Map.fromListWith min [(s.key, n) | (n, u) <- zip [0 :: Int ..] us, s <- u.deploy, s.undo == UndoObject, s.rank == createRank s.object || s.rank == dropRank s.object]
-        -- Whether an object's change drops the old object in the drop phase and creates
-        -- the new one in the create phase, so each part has its own inverse.
-        dropThenCreate = Map.map (== Set.fromList [DropPhase, CreatePhase]) $ Map.fromListWith (<>) [(s.key, Set.singleton s.phase) | u <- us, s <- u.deploy, s.undo == UndoObject]
-        revertOf n u = concat [undoKey n u (filter ((== k) . (.key)) u.deploy) k | k <- reverse (nubOrd (map (.key) u.deploy))]
-        -- The key's steps here, undone last to first; a run of steps the object's
-        -- inverse undoes gets it once.
-        undoKey n u here k = go False (reverse here)
-          where
-            go _ [] = []
-            go done (s : rest) = case s.undo of
-                UndoBy undoing -> undoing <> go done rest
-                UndoObject
-                    | done -> go done rest
-                    | otherwise -> objectPart (unitCtx u) n k s.change [x | x <- here, x.undo == UndoObject] <> go True rest
-        objectPart ctx n k change mine
-            | Map.lookup k objectUnits == Just (Set.singleton n) = recipe ctx k (invert change)
-            -- The migration with the object's own drop, or create, reverts it; one that only
-            -- sets its grants, indexes or comments can be deployed again as it is.
-            | Map.findWithDefault False k dropThenCreate, Changed old _ <- change, all ((== DropPhase) . (.phase)) mine = if any (\x -> x.rank == dropRank x.object) mine then recipe ctx k (Added old) else []
-            | Map.findWithDefault False k dropThenCreate, Changed _ new <- change, all ((== CreatePhase) . (.phase)) mine = if any (\x -> x.rank == createRank x.object) mine then recipe ctx k (Dropped new) else []
-            -- Otherwise the migration with its main step reverts it all, or the last with
-            -- a part of it when none has one.
-            | Just n == (Map.lookup k mainUnits <|> (Map.lookup k objectUnits >>= Set.lookupMax)) = recipe ctx k (invert change)
-            | otherwise = []
+        go _ [] = []
+        go done (s : rest) = case s.undo of
+            UndoBy undoing -> undoing <> go done rest
+            UndoObject
+                | done -> go done rest
+                | otherwise -> objectPart index ctx n k s.change [x | x <- here, x.undo == UndoObject] <> go True rest
 
-    refill s
-        | Column t c <- s.object
-        , Added (ColumnDefinition p) <- s.change
-        , failsOnRows p =
-            let table = qualified t
-                column = quoted c
-                definition = columnSql p{nullability = Nullable}
-             in s
-                    { sql = [S.i|alter table #{table} add column #{column} #{definition}|]
-                    , hazards = [MayFail "the column comes back nullable and empty, since its values were dropped"]
-                    }
-        | otherwise = s
 
-    nameMigrations _ [] = []
-    nameMigrations i (u : rest)
+-- | The part of an object change's inverse that migration @n@ reverts, given its own
+-- steps of it (@mine@).
+objectPart :: RevertIndex -> Context -> Int -> ObjectKey -> Change Definition -> [Step] -> [Step]
+objectPart index ctx n k change mine
+    | Map.lookup k index.objectUnits == Just (Set.singleton n) = recipe ctx k (invert change)
+    -- The migration with the object's own drop, or create, reverts it; one that only sets
+    -- its grants, indexes or comments can be deployed again as it is.
+    | dropsThenCreates
+    , Changed old _ <- change
+    , all ((== DropPhase) . (.phase)) mine =
+        if any (\x -> x.rank == dropRank x.object) mine then recipe ctx k (Added old) else []
+    | dropsThenCreates
+    , Changed _ new <- change
+    , all ((== CreatePhase) . (.phase)) mine =
+        if any (\x -> x.rank == createRank x.object) mine then recipe ctx k (Dropped new) else []
+    -- Otherwise the migration with its main step reverts it all, or the last with a part
+    -- of it when none has one.
+    | Just n == (Map.lookup k index.mainUnits <|> (Map.lookup k index.objectUnits >>= Set.lookupMax)) = recipe ctx k (invert change)
+    | otherwise = []
+  where
+    dropsThenCreates = Map.findWithDefault False k index.dropThenCreate
+
+
+-- | A column that fails on a table with rows comes back nullable: its values were
+-- dropped with it.
+refill :: Step -> Step
+refill s
+    | Column t c <- s.object
+    , Added (ColumnDefinition p) <- s.change
+    , failsOnRows p =
+        let table = qualified t
+            column = quoted c
+            definition = columnSql p{nullability = Nullable}
+         in s
+                { sql = [S.i|alter table #{table} add column #{column} #{definition}|]
+                , hazards = [MayFail "the column comes back nullable and empty, since its values were dropped"]
+                }
+    | otherwise = s
+
+
+-- | Names each migration by its stamp, one second apart from the one before, and its
+-- description.
+nameMigrations :: Names -> UTCTime -> [Unit] -> [Unit]
+nameMigrations names now = go 0
+  where
+    go :: Int -> [Unit] -> [Unit]
+    go _ [] = []
+    go i (u : rest)
         | u.placement == Migration =
             let stamp = T.pack (formatTime defaultTimeLocale (T.unpack names.migrationStamp) (addUTCTime (fromIntegral i) now))
                 description = describe u
                 template = maybe "migration" fst (templateOf u)
-             in u{changeName = fill names.migration [("stamp", stamp), ("slug", slug description)], note = [S.i|#{template}: #{description}|]} : nameMigrations (i + 1) rest
-        | otherwise = u : nameMigrations i rest
+             in u{changeName = fill names.migration [("stamp", stamp), ("slug", slug description)], note = [S.i|#{template}: #{description}|]} : go (i + 1) rest
+        | otherwise = u : go i rest
 
-    describe u = case shapeOf u of
-        AddColumnShape t c _ -> let table = dotted t; column = nameText c in [S.i|add column #{table}.#{column}|]
-        ValidateShape t c -> let table = dotted t; constraint = nameText c in [S.i|validate constraint #{table}.#{constraint}|]
-        _ ->
-            let objects = nubOrd [fromMaybe (render s.object) (L.lastMaybe (toAddress s.object).objectNames) | s <- u.deploy]
-                joined = T.intercalate "-" objects
-                suffix = if objects == maybeToList (L.lastMaybe (T.split (== '.') u.changeName)) then "" else [S.i|.#{joined}|] :: Text
-                v = verbOf u
-                name = u.changeName
-             in [S.i|#{v} #{name}#{suffix}|] :: Text
 
-    verbOf :: Unit -> Text
-    verbOf u = maybe "alter" verb (listToMaybe u.deploy)
-
-    verb :: Step -> Text
-    verb s
-        | s.key.aspect == Privileges = "grant"
-        | s.key.aspect == Comment = "comment"
-        | " rename column " `T.isInfixOf` s.sql = "rename"
-        | s.phase == DropPhase = "drop"
-        | isAdded s.change = "add"
-        | otherwise = "alter"
-
-    note :: Text -> Step -> Text
-    note v s = let what = render s.object in [S.i|sqiff: #{v} #{what}|]
-
-    isAdded = \case Added _ -> True; _ -> False
-
-    groupKey s = case owningTable s.object of
-        Just t -> dotted t
-        Nothing -> T.intercalate "." (toAddress s.object).objectNames
+describe :: Unit -> Text
+describe u = case shapeOf u of
+    AddColumnShape t c _ -> let table = dotted t; column = nameText c in [S.i|add column #{table}.#{column}|]
+    ValidateShape t c -> let table = dotted t; constraint = nameText c in [S.i|validate constraint #{table}.#{constraint}|]
+    _ ->
+        let objects = nubOrd [fromMaybe (render s.object) (L.lastMaybe (toAddress s.object).objectNames) | s <- u.deploy]
+            joined = T.intercalate "-" objects
+            suffix = if objects == maybeToList (L.lastMaybe (T.split (== '.') u.changeName)) then "" else [S.i|.#{joined}|] :: Text
+            v = maybe "alter" verb (listToMaybe u.deploy)
+            name = u.changeName
+         in [S.i|#{v} #{name}#{suffix}|] :: Text
 
 
 -- | Where the project keeps a new object of this kind, for the steps that create or replace one.
