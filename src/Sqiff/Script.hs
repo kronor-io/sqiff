@@ -35,14 +35,14 @@ data FirstStatement = FirstStatement
 -- | What 'firstStatement' looks at in a script: its words, the semicolons and backslashes
 -- in its code, and what lies between them.
 data Token
-    = Word Text
-    -- ^ A word of code, lowercased.
+    = -- | A word of code, lowercased.
+      Word Text
     | Semicolon
     | Backslash
-    | Blank
-    -- ^ Whitespace or a comment: the word before it stays the previous word.
-    | Mark
-    -- ^ Any other code, or a quoted character: it parts @BEGIN@ from @ATOMIC@.
+    | -- | Whitespace or a comment: the word before it stays the previous word.
+      Blank
+    | -- | Any other code, or a quoted character: it parts @BEGIN@ from @ATOMIC@.
+      Mark
 
 
 -- | Each token of the script, with where it starts.
