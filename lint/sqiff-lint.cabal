@@ -33,7 +33,8 @@ library
 executable sqiff-lint
   import:         shared
   hs-source-dirs: app
-  main-is:        Main.hs
+  main-is:        SqiffLint.hs
+  ghc-options:    -main-is SqiffLint.main
   build-depends:
     , base
     , sqiff-lint
