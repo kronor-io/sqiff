@@ -276,6 +276,7 @@ compose cfg p args = do
         ExitFailure n -> failWith [i|docker compose -p #{project} #{unwords args} failed with exit code #{n}|]
 
 
+-- [allow:SqiffNamedTuples] pre-existing at adoption
 readCompose :: BaselineConfig -> Paths -> [String] -> IO (ExitCode, Text, Text)
 readCompose cfg p args = do
     env <- composeEnv cfg

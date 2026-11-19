@@ -129,7 +129,7 @@ plpgsqlFunctions conn excluded =
             implicit <- toList <$> run conn () implicitQuery
             let (unchecked, checkable) = partitionEithers (map triggerTable functions)
             let withSchema = TP.replace "@extschema@" extSchema . decodeUtf8Lenient
-            pure (PlFunctions (withSchema plpgsqlDependQuery) (pure (withSchema plpgsqlTempTablesScript)) checkable unchecked implicit)
+            pure PlFunctions{query = withSchema plpgsqlDependQuery, tempTables = pure (withSchema plpgsqlTempTablesScript), checkable, unchecked, implicit}
   where
     implicitQuery =
         [vectorStatement|
@@ -222,6 +222,7 @@ instance Ord BodyError where
     compare = comparing errorOrder
 
 
+-- [allow:SqiffNamedTuples] a sort key: errors compare as this triple
 errorOrder :: BodyError -> (Text, Int32, Text)
 errorOrder e = (e.signature, e.line, bodyErrorText e)
 
