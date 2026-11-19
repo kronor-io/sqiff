@@ -1,3 +1,4 @@
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
@@ -70,90 +71,221 @@ rewriteFile :: QName -> Set Identifier -> [Identifier] -> Schema -> Schema -> Te
 rewriteFile table ownFiles order live fromFile original = do
     parts <- pieces original
     let changes = fileDrift ownFiles fromFile live
-        typedDefinitions = [(k.object, c) | (k, c) <- Map.toList changes, k.aspect == Definition]
-        definitions = [(o, printed <$> c) | (o, c) <- typedDefinitions]
-        comments = Map.fromList [(k.object, printed <$> c) | (k, c) <- Map.toList changes, k.aspect == Comment]
-        statements = [(n, s, classify table (snd (splitLead s))) | (n, Stmt s) <- zip [0 :: Int ..] parts]
-        indentOf n = statementIndent parts n
-        settings = case lookup (Table table) typedDefinitions of
-            Just (Changed (TableDefinition fileDef) (TableDefinition liveDef)) -> tableSettings table fileDef liveDef
-            _ -> Nothing
-        tableEdit = do
-            (n, s, _) <- L.find (\(_, _, k) -> k == CreatesTable) statements
-            let (lead, code) = splitLead s
-                columns = [(c, ch') | (Column t c, ch) <- typedDefinitions, t == table, Just ch' <- [traverse asColumn ch]]
-                constraints = [(c, ch) | (TableConstraint t c, ch) <- definitions, t == table]
-            (code', placed) <- editCreateTable table order columns constraints (settings >>= snd) code
-            pure (n, lead <> code', placed)
-        settingsPlaced = case settings of
-            Just (alters, options) -> (null alters || isJust tableAt) && (isNothing options || any (\(_, _, p) -> Table table `Set.member` p) tableEdit)
-            Nothing -> False
-        indexEdits =
-            [ (n, edit, Index q)
-            | (n, s, CreatesIndex ix) <- statements
-            , let q = QName table.schema ix
-            , Just ch <- [lookup (Index q) definitions]
-            , let (lead, _) = splitLead s
-                  edit = case ch of
-                    Changed _ def -> Just (lead <> indexCode (indentOf n) def)
-                    _ -> Nothing
-            ]
-        commentEdits =
-            [ (n, edit, addr)
-            | (n, s, Comments addr) <- statements
-            , Just ch <- [Map.lookup addr comments]
-            , let (lead, code) = splitLead s
-                  edit = case ch of
-                    Changed _ new -> Just (lead <> withLiteral new code)
-                    _ -> Nothing
-            ]
-        kept n = n `notElem` [m | (m, Nothing, _) <- indexEdits] && n `notElem` [m | (m, Nothing, _) <- commentEdits]
-        lastOf p = L.lastMaybe [n | (n, _, k) <- statements, p k, kept n]
-        tableAt = lastOf (== CreatesTable)
-        indexAnchor = lastOf (\case CreatesIndex _ -> True; _ -> False) <|> tableAt
-        commentAnchor = lastOf (\case Comments _ -> True; _ -> False) <|> indexAnchor
-        newIndexes = [(q, def) | (Index q, Added def) <- definitions]
-        newComments = [(addr, txt) | (addr, Added txt) <- Map.toList comments, isJust (commentTarget addr)]
-        inserts =
+        plan = planRewrite table order changes parts
+    pure
+        Rewrite
+            { text = applyRewrite parts plan
+            , unplaced = [describeChange k c | (k, c) <- Map.toList changes, k `Set.notMember` plan.handled]
+            }
+
+
+-- | What a rewrite does to one statement of the file.
+data StatementEdit
+    = ReplaceStatement Text
+    | RemoveStatement
+
+
+-- | A rewrite decided before any text is joined: what becomes of the file's statements,
+-- what goes after them, and the differences it settles. Statements are numbered by their
+-- place among the file's 'Part's.
+data RewritePlan = RewritePlan
+    { edits :: Map Int StatementEdit
+    , insertAfter :: Map Int [Text]
+    -- ^ New statements, in order, each to follow the numbered one.
+    , handled :: Set ObjectKey
+    }
+
+
+-- | The differences the rewrite can place, by object.
+data Drift = Drift
+    { definitions :: Map ObjectId (Change Definition)
+    , comments :: Map ObjectId (Change Text)
+    }
+
+
+-- | A statement of the file: its number among the parts, its text and what it does.
+data Statement = Statement
+    { at :: Int
+    , text :: Text
+    , kind :: Kind
+    }
+
+
+-- | The file's @create table@ statement with the differences applied, and the objects it
+-- now places.
+data TableEdit = TableEdit
+    { at :: Int
+    , text :: Text
+    , placed :: Set ObjectId
+    }
+
+
+-- | An edit of an index's or comment's own statement, and the difference it settles.
+data SettledEdit = SettledEdit
+    { at :: Int
+    , edit :: StatementEdit
+    , settles :: ObjectKey
+    }
+
+
+-- | What the file lacks of the table's settings.
+data TableSettings = TableSettings
+    { alters :: [Text]
+    -- ^ Statements that turn them on, to follow @create table@.
+    , options :: Maybe Text
+    -- ^ A @with (...)@ clause for @create table@.
+    }
+
+
+-- | The statements new ones go after: the last @create table@, the last index and the
+-- last comment left in the file, an index falling back on the table and a comment on an
+-- index. Nothing when the file has no such statement.
+data Anchors = Anchors
+    { table :: Maybe Int
+    , index :: Maybe Int
+    , comment :: Maybe Int
+    }
+
+
+-- | Decides the rewrite: the edits of the file's statements, the statements to add, and
+-- which of @changes@ that places.
+planRewrite :: QName -> [Identifier] -> Changes -> [Part] -> RewritePlan
+planRewrite table order changes parts =
+    RewritePlan
+        { edits =
+            Map.fromList
+                ( [(e.at, ReplaceStatement e.text) | Just e <- [tableEdit]]
+                    <> [(e.at, e.edit) | e <- statementEdits]
+                )
+        , insertAfter =
             Map.fromListWith
                 (flip (<>))
-                ( [(a, alters) | Just a <- [tableAt], Just (alters, _) <- [settings], not (null alters)]
-                    <> [(a, [indexCode (indentOf a) def]) | Just a <- [indexAnchor], (_, def) <- newIndexes]
-                    <> [(a, [commentCode (indentOf a) addr txt]) | Just a <- [commentAnchor], (addr, txt) <- newComments]
+                ( [(a, settings.alters) | Just a <- [anchors.table], Just settings <- [missingSettings], not (null settings.alters)]
+                    <> [(a, [indexCode (statementIndent parts a) def]) | Just a <- [anchors.index], (_, def) <- newIndexes]
+                    <> [(a, [commentCode (statementIndent parts a) addr txt]) | Just a <- [anchors.comment], (addr, txt) <- newComments]
                 )
-        handled =
+        , handled =
             Set.unions
-                [ maybe Set.empty (\(_, _, h) -> Set.map definitionKey (Set.filter (not . isTable) h)) tableEdit
-                , Set.fromList [definitionKey o | (_, _, o) <- indexEdits]
-                , Set.fromList [ObjectKey Comment a | (_, _, a) <- commentEdits]
-                , if isJust indexAnchor then Set.fromList [definitionKey (Index q) | (q, _) <- newIndexes] else Set.empty
-                , if isJust commentAnchor then Set.fromList [ObjectKey Comment a | (a, _) <- newComments] else Set.empty
+                [ maybe Set.empty (\e -> Set.map definitionKey (Set.filter (not . isTable) e.placed)) tableEdit
+                , Set.fromList [e.settles | e <- statementEdits]
+                , if isJust anchors.index then Set.fromList [definitionKey (Index q) | (q, _) <- newIndexes] else Set.empty
+                , if isJust anchors.comment then Set.fromList [ObjectKey Comment a | (a, _) <- newComments] else Set.empty
                 , if settingsPlaced then Set.singleton (definitionKey (Table table)) else Set.empty
                 ]
-        replaced = Map.fromList ([(n, t) | Just (n, t, _) <- [tableEdit]] <> [(n, t) | (n, Just t, _) <- indexEdits] <> [(n, t) | (n, Just t, _) <- commentEdits])
-        removed = Set.fromList [n | (n, Nothing, _) <- indexEdits] <> Set.fromList [n | (n, Nothing, _) <- commentEdits]
-        out =
-            concat
-                [ case part of
-                    Gap g -> [Out g]
-                    Stmt s
-                        | n `Set.member` removed -> [Gone]
-                        | otherwise -> Out (Map.findWithDefault s n replaced) : concat [[Out [i|;\n\n#{indentOf n}|], Out c] | c <- Map.findWithDefault [] n inserts]
-                | (n, part) <- zip [0 ..] parts
-                ]
-        unplaced = [describeChange k c | (k, c) <- Map.toList changes, k `Set.notMember` handled]
-    pure Rewrite{text = renderOut out, unplaced}
+        }
   where
-    -- The table counts as handled only when its settings are placed, above.
+    drift = splitDrift changes
+    statements = fileStatements table parts
+    missingSettings = settingsDrift table drift
+    tableEdit = planTableEdit table order drift (missingSettings >>= (.options)) statements
+    statementEdits = indexEdits table parts drift statements <> commentEdits drift statements
+    anchors = anchorsOf statements (Set.fromList [e.at | e@SettledEdit{edit = RemoveStatement} <- statementEdits])
+    newIndexes = [(q, printed def) | (Index q, Added def) <- Map.toList drift.definitions]
+    newComments = [(addr, txt) | (addr, Added txt) <- Map.toList drift.comments, isJust (commentTarget addr)]
+    -- The table counts as handled only when its settings are placed.
+    settingsPlaced = case missingSettings of
+        Just settings -> (null settings.alters || isJust anchors.table) && (isNothing settings.options || any (\e -> Table table `Set.member` e.placed) tableEdit)
+        Nothing -> False
     isTable = \case
         Table _ -> True
         _ -> False
 
 
+-- | The changes to definitions and to comments; grants are not the file's.
+splitDrift :: Changes -> Drift
+splitDrift changes =
+    Drift
+        { definitions = Map.fromList [(k.object, c) | (k, c) <- Map.toList changes, k.aspect == Definition]
+        , comments = Map.fromList [(k.object, printed <$> c) | (k, c) <- Map.toList changes, k.aspect == Comment]
+        }
+
+
+-- | The file's statements, each with what it does to @table@.
+fileStatements :: QName -> [Part] -> [Statement]
+fileStatements table parts = [Statement{at, text = s, kind = classify table (snd (splitLead s))} | (at, Stmt s) <- zip [0 ..] parts]
+
+
+-- | The settings the file lacks, when the table's settings differ from the file's.
+settingsDrift :: QName -> Drift -> Maybe TableSettings
+settingsDrift table drift = case Map.lookup (Table table) drift.definitions of
+    Just (Changed (TableDefinition fileDef) (TableDefinition liveDef)) -> tableSettings table fileDef liveDef
+    _ -> Nothing
+
+
+-- | The first @create table@ statement with the table's column and constraint differences
+-- applied, and @options@ added; nothing when the file has none or its column list cannot
+-- be read.
+planTableEdit :: QName -> [Identifier] -> Drift -> Maybe Text -> [Statement] -> Maybe TableEdit
+planTableEdit table order drift options statements = do
+    s <- L.find (\s -> s.kind == CreatesTable) statements
+    let (lead, code) = splitLead s.text
+        columns = [(c, ch') | (Column t c, ch) <- Map.toList drift.definitions, t == table, Just ch' <- [traverse asColumn ch]]
+        constraints = [(c, printed <$> ch) | (TableConstraint t c, ch) <- Map.toList drift.definitions, t == table]
+    (code', placed) <- editCreateTable table order columns constraints options code
+    pure TableEdit{at = s.at, text = lead <> code', placed}
+
+
+-- | The table's index statements whose index changed, rewritten, or that the database
+-- does not have as written, removed.
+indexEdits :: QName -> [Part] -> Drift -> [Statement] -> [SettledEdit]
+indexEdits table parts drift statements =
+    [ SettledEdit{at = s.at, edit, settles = definitionKey (Index q)}
+    | s@Statement{kind = CreatesIndex ix} <- statements
+    , let q = QName table.schema ix
+    , Just ch <- [Map.lookup (Index q) drift.definitions]
+    , let (lead, _) = splitLead s.text
+          edit = case ch of
+            Changed _ def -> ReplaceStatement (lead <> indexCode (statementIndent parts s.at) (printed def))
+            _ -> RemoveStatement
+    ]
+
+
+-- | The comment statements whose comment changed, with the new text, or that the database
+-- does not have as written, removed.
+commentEdits :: Drift -> [Statement] -> [SettledEdit]
+commentEdits drift statements =
+    [ SettledEdit{at = s.at, edit, settles = ObjectKey Comment addr}
+    | s@Statement{kind = Comments addr} <- statements
+    , Just ch <- [Map.lookup addr drift.comments]
+    , let (lead, code) = splitLead s.text
+          edit = case ch of
+            Changed _ new -> ReplaceStatement (lead <> withLiteral new code)
+            _ -> RemoveStatement
+    ]
+
+
+-- | Where new statements go, among the statements not in @removed@.
+anchorsOf :: [Statement] -> Set Int -> Anchors
+anchorsOf statements removed = Anchors{table, index, comment}
+  where
+    lastOf p = L.lastMaybe [s.at | s <- statements, p s.kind, s.at `Set.notMember` removed]
+    table = lastOf (== CreatesTable)
+    index = lastOf (\case CreatesIndex _ -> True; _ -> False) <|> table
+    comment = lastOf (\case Comments _ -> True; _ -> False) <|> index
+
+
+-- | The file's text with the plan's edits made and its new statements added, each after
+-- a semicolon and a blank line at its anchor's indentation.
+applyRewrite :: [Part] -> RewritePlan -> Text
+applyRewrite parts plan = renderOut (concat (zipWith (partOut parts plan) [0 ..] parts))
+
+
+-- | What one part of the file becomes.
+partOut :: [Part] -> RewritePlan -> Int -> Part -> [Out]
+partOut parts plan n = \case
+    Gap g -> [Out g]
+    Stmt s -> case Map.lookup n plan.edits of
+        Just RemoveStatement -> [Gone]
+        Just (ReplaceStatement t) -> Out t : inserted
+        Nothing -> Out s : inserted
+  where
+    inserted = concat [[Out [i|;\n\n#{statementIndent parts n}|], Out c] | c <- Map.findWithDefault [] n plan.insertAfter]
+
+
 -- | For a table whose settings the file lacks, the statements that turn them on and the
 -- storage options for @create table@; nothing when the file has a setting the table lacks,
 -- or other options than it.
-tableSettings :: QName -> TableDef -> TableDef -> Maybe ([Text], Maybe Text)
+tableSettings :: QName -> TableDef -> TableDef -> Maybe TableSettings
 tableSettings table file live = do
     let name = qualified table
         added setting = setting live && not (setting file)
@@ -164,7 +296,7 @@ tableSettings table file live = do
     -- The file may lack a setting the table has, not have one the table lacks.
     guard ((live.rowSecurity || not file.rowSecurity) && (live.forceRowSecurity || not file.forceRowSecurity))
     guard (null file.options || file.options == live.options)
-    pure (alters, if file.options == live.options then Nothing else withOptions live.options)
+    pure TableSettings{alters, options = if file.options == live.options then Nothing else withOptions live.options}
 
 
 describeChange :: ObjectKey -> Change a -> Text
