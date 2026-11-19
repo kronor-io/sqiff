@@ -1,3 +1,4 @@
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
@@ -165,7 +166,7 @@ recipe :: Context -> ObjectKey -> Change Definition -> [Step]
 recipe ctx key change = case key.aspect of
     Privileges -> privileges key object change
     Comment -> comment ctx key change
-    Definition -> definition ctx key object change
+    Definition -> definition Target{context = ctx, objectKey = key, objectChange = change}
   where
     object = key.object
 
@@ -219,200 +220,283 @@ tableSettingsRank = 14
 privilegesRank = 15
 
 
-definition :: Context -> ObjectKey -> ObjectId -> Change Definition -> [Step]
-definition ctx key object change = case object of
-    Schema s -> case textual of
-        Added _ -> [create (Shared, []) ("create schema " <> quoted s)]
-        Dropped _ -> [remove (Shared, []) ("drop schema " <> quoted s)]
+definition :: Target -> [Step]
+definition this = case this.objectKey.object of
+    Schema s -> case textual this of
+        Added _ -> [create this (Shared, []) ("create schema " <> quoted s)]
+        Dropped _ -> [remove this (Shared, []) ("drop schema " <> quoted s)]
         Changed _ _ -> []
-    Extension e -> extension e
-    Table t -> table t
+    Extension e -> extensionRecipe this e
+    Table t -> tableRecipe this t
     Column t c
-        | t `Set.member` ctx.droppedTables -> []
-        | t `Set.member` ctx.partitionedTables -> map onEveryPartition (column t c)
-        | otherwise -> column t c
+        | t `Set.member` this.context.droppedTables -> []
+        | t `Set.member` this.context.partitionedTables -> map onEveryPartition (columnRecipe this t c)
+        | otherwise -> columnRecipe this t c
     TableConstraint t c
-        | t `Set.member` ctx.droppedTables -> []
-        | otherwise -> tableConstraint t c
-    DomainConstraint d c -> domainConstraint d c
-    Index ix -> indexRecipe ix
-    Sequence s -> sequenceRecipe s
-    Type t -> type' t
-    Routine kind q args -> routine kind q args
-    View v -> viewRecipe v
-    MaterializedView v -> materializedView v
+        | t `Set.member` this.context.droppedTables -> []
+        | otherwise -> tableConstraintRecipe this t c
+    DomainConstraint d c -> domainConstraintRecipe this d c
+    Index ix -> indexRecipe this ix
+    Sequence s -> sequenceRecipe this s
+    Type t -> typeRecipe this t
+    Routine kind q args -> routineRecipe this kind q args
+    View v -> viewRecipe this v
+    MaterializedView v -> materializedViewRecipe this v
     Trigger t n
-        | t `Set.member` ctx.droppedTables -> []
-        | otherwise -> trigger t n
+        | t `Set.member` this.context.droppedTables -> []
+        | otherwise -> triggerRecipe this t n
     Policy t n
-        | t `Set.member` ctx.droppedTables -> []
-        | otherwise -> policy t n
-    OtherColumn{} -> noRecipe
-    Unknown _ -> noRecipe
+        | t `Set.member` this.context.droppedTables -> []
+        | otherwise -> policyRecipe this t n
+    OtherColumn{} -> noRecipe this
+    Unknown _ -> noRecipe this
+
+
+-- | The object a recipe is for, and the change to it.
+data Target = Target
+    { context :: Context
+    , objectKey :: ObjectKey
+    , objectChange :: Change Definition
+    }
+
+
+-- | The definitions as the catalog prints them, for the recipes that read the text.
+textual :: Target -> Change Text
+textual this = printed <$> this.objectChange
+
+
+-- | A step of the create phase that changes the object, at its own rank.
+create :: Target -> (Txn, [Hazard]) -> Text -> Step
+create this = createAt this (createRank this.objectKey.object)
+
+
+-- | A step of the create phase at @rank@.
+createAt :: Target -> Int -> (Txn, [Hazard]) -> Text -> Step
+createAt this rank (txn, hazards) sql =
+    Step
+        { phase = CreatePhase
+        , rank
+        , object = this.objectKey.object
+        , sql
+        , txn
+        , hazards
+        , key = this.objectKey
+        , change = this.objectChange
+        , undo = UndoObject
+        }
+
+
+-- | A step of the drop phase.
+remove :: Target -> (Txn, [Hazard]) -> Text -> Step
+remove this txnAndHazards sql = (createAt this (dropRank this.objectKey.object) txnAndHazards sql){phase = DropPhase}
+
+
+-- | A step left to a person, saying why.
+manual :: Target -> Text -> [Step]
+manual this why = [create this (Shared, [Manual why]) ("-- " <> why)]
+
+
+noRecipe :: Target -> [Step]
+noRecipe this = [create this (Shared, [Manual "no recipe for this kind of object"]) ("-- " <> T.pack (show (textual this)))]
+
+
+undoneBy :: [Step] -> Step -> Step
+undoneBy steps s = s{undo = UndoBy steps}
+
+
+-- | A step another recipe makes, as part of this one: what restores an object created
+-- again goes with that, so its migration leaves the object whole.
+asPartOfThis :: Target -> Step -> Step
+asPartOfThis this s = s{rank = createRank this.objectKey.object, key = this.objectKey, change = this.objectChange, undo = UndoBy []}
+
+
+-- | A concurrent build is reverted by dropping what it built.
+builds :: Target -> QName -> Step -> Step
+builds this index = undoneBy [create this (None, []) ("drop index concurrently if exists " <> qualified index)]
+
+
+-- | The unchanged comments of what this step drops and creates again: they go with the
+-- old object, and nothing else in the plan sets them.
+restoreComments :: Target -> [ObjectId] -> [Step]
+restoreComments this objects =
+    [ undoneBy [] (create this (Shared, []) ("comment on " <> subject <> " is " <> literal text))
+    | o <- objects
+    , Just text <- [Map.lookup o this.context.keptComments]
+    , Just subject <- [commentTarget o]
+    ]
+
+
+-- | The change as the kind of definition this recipe reads; a definition of another
+-- kind is the catalog's mistake, left to a person. The steps keep the change as it was.
+typed :: Target -> (Definition -> Maybe a) -> (Change a -> [Step]) -> [Step]
+typed this as f = maybe (manual this "the catalog described this object unexpectedly") f (traverse as this.objectChange)
+
+
+notValid :: Text
+notValid = " NOT VALID"
+
+
+-- | Whether @new@ is @old@ validated.
+validates :: ConstraintDef -> ConstraintDef -> Bool
+validates old new = old.validity == NotValidated && new.validity == Validated && withoutValidity old == new
+
+
+-- | A step on a partitioned table's column, whose lock and rewrite cover every partition.
+onEveryPartition :: Step -> Step
+onEveryPartition s
+    | any (`elem` [DeletesData, MayRewriteTable, LongLock]) s.hazards = s{hazards = s.hazards <> [EveryPartition]}
+    | otherwise = s
+
+
+-- | Whether @def@ names a column of @t@ that the plan drops or retypes.
+namesAlteredColumn :: Target -> QName -> Text -> Bool
+namesAlteredColumn this t = namesAlteredColumnOf this (== t)
+
+
+namesAlteredColumnOf :: Target -> (QName -> Bool) -> Text -> Bool
+namesAlteredColumnOf this onTable def =
+    let names = Set.fromList (T.split (\ch -> not (isAlphaNum ch || ch == '_')) def)
+     in any (\(t', c) -> onTable t' && nameText c `Set.member` names) (this.context.droppedColumns <> this.context.retypedColumns)
+
+
+extensionRecipe :: Target -> Identifier -> [Step]
+extensionRecipe this e = typed this asExtension \case
+    Added def -> [create this (Shared, []) ("create extension if not exists " <> quoted e <> " with schema " <> quoted def.schema <> " version " <> literal def.version)]
+    Dropped _ -> [remove this (Shared, []) ("drop extension " <> quoted e)]
+    Changed old new
+        | old.schema /= new.schema -> manual this "extension moved to another schema"
+        | otherwise -> [create this (Own, []) ("alter extension " <> quoted e <> " update to " <> literal new.version)]
+
+
+tableRecipe :: Target -> QName -> [Step]
+tableRecipe this t = typed this asTable \case
+    Added def -> createTable this t def
+    Dropped _ -> [remove this (Shared, [DeletesData]) ("drop table " <> qualified t)]
+    Changed old new -> alterTable this t old new
+
+
+createTable :: Target -> QName -> TableDef -> [Step]
+createTable this t def
+    | Just p <- def.partitionOf =
+        create this (Shared, []) ("create table " <> qualified t <> " partition of " <> qualified p.parent <> " " <> p.bound) : settings
+    | otherwise =
+        create
+            this
+            (Shared, [])
+            ( (if def.unlogged then "create unlogged table " else "create table ")
+                <> qualified t
+                <> " ("
+                <> columnList
+                <> ")"
+                <> (if null def.inherits then "" else " inherits (" <> T.intercalate ", " (map qualified def.inherits) <> ")")
+                <> maybe "" (" partition by " <>) def.partitionBy
+                <> maybe "" (" " <>) (withOptions def.options)
+            )
+            : settings
   where
-    -- The definitions as the catalog prints them, for the recipes that read the text.
-    textual = printed <$> change
-    create (txn, hazards) sql = Step CreatePhase (createRank object) object sql txn hazards key change UndoObject
-    createAt rank (txn, hazards) sql = Step CreatePhase rank object sql txn hazards key change UndoObject
-    remove (txn, hazards) sql = Step DropPhase (dropRank object) object sql txn hazards key change UndoObject
-    undoneBy steps s = s{undo = UndoBy steps}
-    -- A step another recipe makes, as part of this one: what restores an object created
-    -- again goes with that, so its migration leaves the object whole.
-    asPartOfThis s = s{rank = createRank object, key, change, undo = UndoBy []}
-    -- A concurrent build is reverted by dropping what it built.
-    builds index = undoneBy [create (None, []) ("drop index concurrently if exists " <> qualified index)]
-    manual why = [create (Shared, [Manual why]) ("-- " <> why)]
-    -- The unchanged comments of what this step drops and creates again: they go with
-    -- the old object, and nothing else in the plan sets them.
-    restoreComments objects =
-        [ undoneBy [] (create (Shared, []) ("comment on " <> subject <> " is " <> literal text))
-        | o <- objects
-        , Just text <- [Map.lookup o ctx.keptComments]
-        , Just subject <- [commentTarget o]
+    -- Columns a parent gives it are not declared again.
+    columnList = case [col | col@(_, d) <- Map.findWithDefault [] t this.context.newTableColumns, not d.inheritedOnly] of
+        [] -> ""
+        cols -> [i|\n#{T.intercalate ",\n" (map columnLine cols)}\n|]
+    columnLine (c, col) = [i|    #{quoted c} #{columnSql col}|]
+    settings =
+        [createAt this tableSettingsRank (Shared, []) [i|alter table #{qualified t} enable row level security|] | def.rowSecurity]
+            <> [createAt this tableSettingsRank (Shared, []) [i|alter table #{qualified t} force row level security|] | def.forceRowSecurity]
+
+
+alterTable :: Target -> QName -> TableDef -> TableDef -> [Step]
+alterTable this t old new
+    | (old.partitionBy, old.partitionOf) /= (new.partitionBy, new.partitionOf) = manual this "partitioning changed"
+    | otherwise =
+        toggle (.unlogged) ("set unlogged", "set logged") [MayRewriteTable, LongLock]
+            <> toggle (.rowSecurity) ("enable row level security", "disable row level security") []
+            <> toggle (.forceRowSecurity) ("force row level security", "no force row level security") []
+            <> storageOptions
+            <> [create this (Shared, []) [i|alter table #{qualified t} no inherit #{qualified p}|] | p <- old.inherits, p `notElem` new.inherits]
+            <> [create this (Shared, []) [i|alter table #{qualified t} inherit #{qualified p}|] | p <- new.inherits, p `notElem` old.inherits]
+  where
+    toggle setting (enable, disable) hazards
+        | setting old == setting new = []
+        | setting new = [createAt this tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> enable)]
+        | otherwise = [createAt this tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> disable)]
+    optionKey = T.takeWhile (/= '=')
+    removedKeys = [k | o <- old.options, let k = optionKey o, k `notElem` map optionKey new.options]
+    newOptions = T.intercalate ", " new.options
+    storageOptions =
+        [ createAt this tableSettingsRank (Shared, []) [i|alter table #{qualified t} set (#{newOptions})|]
+        | not (null new.options)
+        , L.sort new.options /= L.sort old.options
         ]
-    noRecipe = [create (Shared, [Manual "no recipe for this kind of object"]) ("-- " <> T.pack (show textual))]
-    -- The change as the kind of definition this recipe reads; a definition of another
-    -- kind is the catalog's mistake, left to a person.
-    typed :: (Definition -> Maybe a) -> (Change a -> [Step]) -> [Step]
-    typed as f = maybe (manual "the catalog described this object unexpectedly") f (traverse as change)
-    notValid = " NOT VALID" :: Text
-    -- Whether @new@ is @old@ validated.
-    validates old new = old.validity == NotValidated && new.validity == Validated && withoutValidity old == new
-    onEveryPartition s
-        | any (`elem` [DeletesData, MayRewriteTable, LongLock]) s.hazards = s{hazards = s.hazards <> [EveryPartition]}
-        | otherwise = s
-    namesAlteredColumn t = namesAlteredColumnOf (== t)
-    namesAlteredColumnOf onTable def =
-        let names = Set.fromList (T.split (\ch -> not (isAlphaNum ch || ch == '_')) def)
-         in any (\(t', c) -> onTable t' && nameText c `Set.member` names) (ctx.droppedColumns <> ctx.retypedColumns)
+            <> [ createAt this tableSettingsRank (Shared, []) [i|alter table #{qualified t} reset (#{T.intercalate ", " removedKeys})|]
+               | not (null removedKeys)
+               ]
 
-    extension e = typed asExtension \case
-        Added def -> [create (Shared, []) ("create extension if not exists " <> quoted e <> " with schema " <> quoted def.schema <> " version " <> literal def.version)]
-        Dropped _ -> [remove (Shared, []) ("drop extension " <> quoted e)]
-        Changed old new
-            | old.schema /= new.schema -> manual "extension moved to another schema"
-            | otherwise -> [create (Own, []) ("alter extension " <> quoted e <> " update to " <> literal new.version)]
 
-    table t = typed asTable \case
-        Added def -> createTable t def
-        Dropped _ -> [remove (Shared, [DeletesData]) ("drop table " <> qualified t)]
-        Changed old new -> alterTable t old new
-
-    createTable t def
-        | Just p <- def.partitionOf =
-            create (Shared, []) ("create table " <> qualified t <> " partition of " <> qualified p.parent <> " " <> p.bound) : settings
-        | otherwise =
-            create
-                (Shared, [])
-                ( (if def.unlogged then "create unlogged table " else "create table ")
-                    <> qualified t
-                    <> " ("
-                    <> columnList
-                    <> ")"
-                    <> (if null def.inherits then "" else " inherits (" <> T.intercalate ", " (map qualified def.inherits) <> ")")
-                    <> maybe "" (" partition by " <>) def.partitionBy
-                    <> maybe "" (" " <>) (withOptions def.options)
-                )
-                : settings
-      where
-        -- Columns a parent gives it are not declared again.
-        columnList = case [col | col@(_, d) <- Map.findWithDefault [] t ctx.newTableColumns, not d.inheritedOnly] of
-            [] -> ""
-            cols -> [i|\n#{T.intercalate ",\n" (map columnLine cols)}\n|]
-        columnLine (c, col) = [i|    #{quoted c} #{columnSql col}|]
-        settings =
-            [createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} enable row level security|] | def.rowSecurity]
-                <> [createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} force row level security|] | def.forceRowSecurity]
-
-    alterTable t old new
-        | (old.partitionBy, old.partitionOf) /= (new.partitionBy, new.partitionOf) = manual "partitioning changed"
-        | otherwise =
-            toggle (.unlogged) ("set unlogged", "set logged") [MayRewriteTable, LongLock]
-                <> toggle (.rowSecurity) ("enable row level security", "disable row level security") []
-                <> toggle (.forceRowSecurity) ("force row level security", "no force row level security") []
-                <> storageOptions
-                <> [create (Shared, []) [i|alter table #{qualified t} no inherit #{qualified p}|] | p <- old.inherits, p `notElem` new.inherits]
-                <> [create (Shared, []) [i|alter table #{qualified t} inherit #{qualified p}|] | p <- new.inherits, p `notElem` old.inherits]
-      where
-        toggle setting (enable, disable) hazards
-            | setting old == setting new = []
-            | setting new = [createAt tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> enable)]
-            | otherwise = [createAt tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> disable)]
-        optionKey = T.takeWhile (/= '=')
-        removedKeys = [k | o <- old.options, let k = optionKey o, k `notElem` map optionKey new.options]
-        newOptions = T.intercalate ", " new.options
-        storageOptions =
-            [ createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} set (#{newOptions})|]
-            | not (null new.options)
-            , L.sort new.options /= L.sort old.options
-            ]
-                <> [ createAt tableSettingsRank (Shared, []) [i|alter table #{qualified t} reset (#{T.intercalate ", " removedKeys})|]
-                   | not (null removedKeys)
+columnRecipe :: Target -> QName -> Identifier -> [Step]
+columnRecipe this t c = case traverse asColumn this.objectChange of
+    Nothing -> manual this "the catalog described the column without its column facts"
+    -- The parent's change brings it, changes it or takes it away.
+    Just ch | all (.inheritedOnly) ch -> []
+    Just (Added parsed)
+        | t `Set.member` this.context.newTables -> []
+        | otherwise ->
+            let rewrites = parsed.rewritesOnAdd || isJust (identityKindOf parsed) || fmap fst (generatedOf parsed) == Just Stored
+                hazards =
+                    [MayFail "a not null column without a default fails on a table with rows" | failsOnRows parsed]
+                        <> [h | rewrites, h <- [MayRewriteTable, LongLock]]
+             in [create this (Shared, hazards) (alter <> "add column " <> quoted c <> " " <> columnSql parsed)]
+    Just (Dropped _) -> [remove this (Shared, [DeletesData]) (alter <> "drop column " <> quoted c)]
+    Just (Changed old new) -> alterColumn old new
+  where
+    alter = [i|alter table #{qualified t} |]
+    col = [i|#{alter}alter column #{quoted c} |]
+    alterColumn old new =
+        let typeChanged = columnTypeChanged old new
+            defaultChanged = defaultExpr old /= defaultExpr new
+            serialToIdentity = isNothing (identityKindOf old) && isJust (identityKindOf new) && isJust (serialSequence old)
+            identityToSerial = isJust (identityKindOf old) && isNothing (identityKindOf new) && isJust (serialSequence new)
+            sequenceMoves = serialToIdentity || identityToSerial
+         in [create this (Shared, []) (col <> "drop default") | typeChanged, isJust (defaultExpr old)]
+                <> [ create
+                        this
+                        ( Shared
+                        , [MayRewriteTable, LongLock, ConversionMayFail]
+                            <> [MayFail "recreating a view fails when its query relies on the old type; then edit the view" | Map.member (t, c) this.context.viewsAround]
+                        )
+                        (aroundViews (col <> "type " <> typeText new.colType <> maybe "" ((" collate " <>) . collationSql) new.collation <> " using " <> quoted c <> "::" <> typeText new.colType))
+                   | typeChanged
                    ]
-
-    column t c = case traverse asColumn change of
-        Nothing -> manual "the catalog described the column without its column facts"
-        -- The parent's change brings it, changes it or takes it away.
-        Just ch | all (.inheritedOnly) ch -> []
-        Just (Added parsed)
-            | t `Set.member` ctx.newTables -> []
-            | otherwise ->
-                let rewrites = parsed.rewritesOnAdd || isJust (identityKindOf parsed) || fmap fst (generatedOf parsed) == Just Stored
-                    hazards =
-                        [MayFail "a not null column without a default fails on a table with rows" | failsOnRows parsed]
-                            <> [h | rewrites, h <- [MayRewriteTable, LongLock]]
-                 in [create (Shared, hazards) (alter <> "add column " <> quoted c <> " " <> columnSql parsed)]
-        Just (Dropped _) -> [remove (Shared, [DeletesData]) (alter <> "drop column " <> quoted c)]
-        Just (Changed old new) -> alterColumn old new
-      where
-        alter = [i|alter table #{qualified t} |]
-        col = [i|#{alter}alter column #{quoted c} |]
-        alterColumn old new =
-            let typeChanged = columnTypeChanged old new
-                defaultChanged = defaultExpr old /= defaultExpr new
-                serialToIdentity = isNothing (identityKindOf old) && isJust (identityKindOf new) && isJust (serialSequence old)
-                identityToSerial = isJust (identityKindOf old) && isNothing (identityKindOf new) && isJust (serialSequence new)
-                sequenceMoves = serialToIdentity || identityToSerial
-             in [create (Shared, []) (col <> "drop default") | typeChanged, isJust (defaultExpr old)]
-                    <> [ create
-                            ( Shared
-                            , [MayRewriteTable, LongLock, ConversionMayFail]
-                                <> [MayFail "recreating a view fails when its query relies on the old type; then edit the view" | Map.member (t, c) ctx.viewsAround]
-                            )
-                            (aroundViews (col <> "type " <> typeText new.colType <> maybe "" ((" collate " <>) . collationSql) new.collation <> " using " <> quoted c <> "::" <> typeText new.colType))
-                       | typeChanged
-                       ]
-                    <> case defaultExpr new of
-                        _ | sequenceMoves -> []
-                        Just e | defaultChanged || (typeChanged && isJust (defaultExpr old)) -> [create (Shared, []) (col <> "set default " <> e)]
-                        Nothing | defaultChanged && not typeChanged -> [create (Shared, []) (col <> "drop default")]
-                        _ -> []
-                    <> notNullSteps old new
-                    <> case (identityKindOf old, identityKindOf new) of
-                        _ | serialToIdentity, Just k <- identityKindOf new -> [create (Shared, []) (toIdentity (identityKindSql k <> " as identity" <> identityOptionsSql (identityOptionsOf new)))]
-                        _ | identityToSerial -> [create (Shared, []) (toSerial (typeText new.colType))]
-                        (Nothing, Just k) -> [create (Shared, []) (col <> "add generated " <> identityKindSql k <> " as identity" <> identityOptionsSql (identityOptionsOf new))]
-                        (Just _, Nothing) -> [create (Shared, []) (col <> "drop identity")]
-                        (Just a, Just b) ->
-                            let clauses = ["set generated " <> identityKindSql b | a /= b] <> identityOptionChanges (identityOptionsOf old) (identityOptionsOf new)
-                             in [create (Shared, []) (col <> T.unwords clauses) | not (null clauses)]
-                        _ -> []
-                    <> case (generatedOf old, generatedOf new) of
-                        (Just (k, _), Just (k', e))
-                            | k == k' && generatedOf old /= generatedOf new ->
-                                [create (Shared, [h | k == Stored, h <- [MayRewriteTable, LongLock]]) [i|#{col}set expression as (#{e})|]]
-                        (a, b) | a /= b -> manual "generated column added or removed"
-                        _ -> []
-        aroundViews statement = case Map.lookup (t, c) ctx.viewsAround of
-            Just around | not (null around.dropBefore) -> T.intercalate ";\n" (around.dropBefore <> [statement] <> around.createAfter)
-            _ -> statement
-        serialSequence d = defaultExpr d >>= T.stripPrefix "nextval('" >>= T.stripSuffix "'::regclass)"
-        tableLit = literal (qualified t)
-        columnLit = literal (nameText c)
-        serialName = let tableName = nameText t.name in qualified (QName t.schema (identifier [i|#{tableName}_#{nameText c}_seq|]))
-        toIdentity k =
-            doBlock
-                [i|
+                <> case defaultExpr new of
+                    _ | sequenceMoves -> []
+                    Just e | defaultChanged || (typeChanged && isJust (defaultExpr old)) -> [create this (Shared, []) (col <> "set default " <> e)]
+                    Nothing | defaultChanged && not typeChanged -> [create this (Shared, []) (col <> "drop default")]
+                    _ -> []
+                <> notNullSteps old new
+                <> case (identityKindOf old, identityKindOf new) of
+                    _ | serialToIdentity, Just k <- identityKindOf new -> [create this (Shared, []) (toIdentity (identityKindSql k <> " as identity" <> identityOptionsSql (identityOptionsOf new)))]
+                    _ | identityToSerial -> [create this (Shared, []) (toSerial (typeText new.colType))]
+                    (Nothing, Just k) -> [create this (Shared, []) (col <> "add generated " <> identityKindSql k <> " as identity" <> identityOptionsSql (identityOptionsOf new))]
+                    (Just _, Nothing) -> [create this (Shared, []) (col <> "drop identity")]
+                    (Just a, Just b) ->
+                        let clauses = ["set generated " <> identityKindSql b | a /= b] <> identityOptionChanges (identityOptionsOf old) (identityOptionsOf new)
+                         in [create this (Shared, []) (col <> T.unwords clauses) | not (null clauses)]
+                    _ -> []
+                <> case (generatedOf old, generatedOf new) of
+                    (Just (k, _), Just (k', e))
+                        | k == k' && generatedOf old /= generatedOf new ->
+                            [create this (Shared, [h | k == Stored, h <- [MayRewriteTable, LongLock]]) [i|#{col}set expression as (#{e})|]]
+                    (a, b) | a /= b -> manual this "generated column added or removed"
+                    _ -> []
+    aroundViews statement = case Map.lookup (t, c) this.context.viewsAround of
+        Just around | not (null around.dropBefore) -> T.intercalate ";\n" (around.dropBefore <> [statement] <> around.createAfter)
+        _ -> statement
+    serialSequence d = defaultExpr d >>= T.stripPrefix "nextval('" >>= T.stripSuffix "'::regclass)"
+    tableLit = literal (qualified t)
+    columnLit = literal (nameText c)
+    serialName = let tableName = nameText t.name in qualified (QName t.schema (identifier [i|#{tableName}_#{nameText c}_seq|]))
+    toIdentity k =
+        doBlock
+            [i|
 declare seq text := pg_get_serial_sequence(#{tableLit}, #{columnLit}); last bigint; called boolean; acl aclitem[];
 begin
     execute format('select last_value, is_called from %s', seq) into last, called;
@@ -423,9 +507,9 @@ begin
     perform setval(pg_get_serial_sequence(#{tableLit}, #{columnLit}), last, called);
     #{grantAcl serialOf}
 end |]
-        toSerial colType =
-            doBlock
-                [i|
+    toSerial colType =
+        doBlock
+            [i|
 declare last bigint; called boolean; acl aclitem[];
 begin
     execute format('select last_value, is_called from %s', pg_get_serial_sequence(#{tableLit}, #{columnLit})) into last, called;
@@ -436,248 +520,281 @@ begin
     #{col}set default nextval(#{literal serialName}::regclass);
     #{grantAcl (literal serialName)}
 end |]
-        serialOf = [i|pg_get_serial_sequence(#{tableLit}, #{columnLit})|] :: Text
-        grantAcl :: Text -> Text
-        grantAcl target =
-            [i|execute coalesce((select string_agg(format('grant %s on sequence %s to %s', x.privilege_type, #{target}, case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end), '; ') from aclexplode(acl) x where x.grantee <> x.grantor), 'select');|]
-        notNullSteps old new = case (isNotNull old, isNotNull new) of
-            (False, True) ->
-                create (Shared, []) [i|#{alter}add #{named new}not null #{quoted c} not valid|]
-                    : [create (Own, []) (onNotNull (notNullName new) "validate constraint" "") | notNullValid new]
-            (True, False) -> [create (Shared, []) (col <> "drop not null")]
-            (True, True) ->
-                [ create (Shared, []) (onNotNull (notNullName old) "rename constraint" (" to " <> quoted n))
-                | notNullName old /= notNullName new
-                , let n = fromMaybe (identifier (T.concat [nameText t.name, "_", nameText c, "_not_null"])) (notNullName new)
-                ]
-                    <> case (notNullValid old, notNullValid new) of
-                        (False, True) -> [create (Own, []) (onNotNull (notNullName new) "validate constraint" "")]
-                        (True, False) -> manual "a validated not null constraint cannot be made NOT VALID again"
-                        _ -> []
-            (False, False) -> []
-        named d = maybe "" (\n -> "constraint " <> quoted n <> " ") (notNullName d)
-        onNotNull name action rest = case name of
-            Just n -> alter <> action <> " " <> quoted n <> rest
-            Nothing ->
-                let command = literal [i|#{T.replace "%" "%%" (alter <> action)} %I#{T.replace "%" "%%" rest}|]
-                    tableLiteral = literal (qualified t)
-                 in doBlock [i| begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal (nameText c)})])); end |]
-
-    tableConstraint t c = typed asConstraint \ch -> if all (.inheritedOnly) ch then [] else tableConstraintOf t c ch
-    tableConstraintOf t c = \case
-        Added def -> addConstraint def <> restoreComments [TableConstraint t c]
-        Dropped old -> [dropConstraint old]
-        Changed old new
-            | validates old new -> [undoneBy [] $ create (Own, []) (alterT <> "validate constraint " <> quoted c)]
-            | validates new old -> manual "a validated constraint cannot be made NOT VALID again"
-            | otherwise -> dropConstraint old : addConstraint new <> restoreComments [TableConstraint t c, Index (QName t.schema c)]
-      where
-        alterT = [i|alter table #{qualified t} |]
-        dropConstraint old =
-            remove
-                (Shared, [MayFail "other objects depend on it, such as foreign keys; drop them first" | dependedOn] <> locksOther old)
-                (alterT <> "drop constraint " <> quoted c)
-        dependedOn = any (`Set.member` ctx.withDependents) [TableConstraint t c, Index (QName t.schema c)]
-        locksOther def = [LocksOther (qualified r.table) | Just r <- [def.references], r.table /= t]
-        plain hazards def clause = create (Shared, hazards <> locksOther def) (alterT <> "add constraint " <> quoted c <> " " <> clause)
-        addConstraint def
-            | t `Set.member` ctx.newTables = [plain [] def def.clause]
-            | validatable def && def.validity == NotValidated = [plain [] def def.clause]
-            | validatable def =
-                [ plain [] def (def.clause <> notValid)
-                , undoneBy [] $ create (Own, []) (alterT <> "validate constraint " <> quoted c)
-                ]
-            | Just (keyword, cols) <- simpleKey def
-            , not (t `Set.member` ctx.partitionedTables) =
-                let build = create (None, [IndexBuild]) (concurrentBuild (QName t.schema c) [i|create unique index concurrently #{quoted c} on #{qualified t} (#{cols})|])
-                 in [ builds (QName t.schema c) build
-                    , -- Dropping the constraint drops its index, which the build before made.
-                      undoneBy [create (Shared, []) (alterT <> "drop constraint " <> quoted c), build]
-                        $ create (Shared, []) (alterT <> "add constraint " <> quoted c <> " " <> keyword <> " using index " <> quoted c)
-                    ]
-            | otherwise = [plain [LongLock, IndexBuild] def def.clause]
-        validatable def = def.kind `elem` [Check, ForeignKey]
-        -- A primary key or unique constraint on plain columns and nothing more, which an
-        -- index built beforehand can back.
-        simpleKey def = do
-            keyword <- case def.kind of
-                PrimaryKey -> Just "PRIMARY KEY"
-                Unique -> Just "UNIQUE"
-                _ -> Nothing
-            let cols = T.intercalate ", " (map quoted def.columns)
-            guard (not (null def.columns) && def.clause == keyword <> " (" <> cols <> ")")
-            pure (keyword, cols)
-
-    domainConstraint d c = typed asConstraint \case
-        Added def -> add def <> restoreComments [DomainConstraint d c]
-        Dropped _ -> [remove (Shared, []) (alterD <> "drop constraint " <> quoted c)]
-        Changed old new
-            | validates old new -> [validate]
-            | validates new old -> manual "a validated constraint cannot be made NOT VALID again"
-            | otherwise -> remove (Shared, []) (alterD <> "drop constraint " <> quoted c) : add new <> restoreComments [DomainConstraint d c]
-      where
-        alterD = [i|alter domain #{typeText d} |]
-        validate = undoneBy [] $ create (Own, []) (alterD <> "validate constraint " <> quoted c)
-        add def
-            | def.validity == NotValidated = [create (Shared, []) (alterD <> "add constraint " <> quoted c <> " " <> def.clause)]
-            | otherwise = [create (Shared, []) (alterD <> "add constraint " <> quoted c <> " " <> def.clause <> notValid), validate]
-
-    indexRecipe ix = typed asIndex \case
-        Added def -> addIndex def <> restoreComments [Index ix]
-        Dropped def
-            | def.table `Set.member` ctx.droppedTables -> []
-            | def.partitioned -> [remove (Shared, [LongLock]) ("drop index " <> qualified ix)]
-            | otherwise -> [remove (None, []) ("drop index concurrently " <> qualified ix)]
-        Changed old new -> replaceIndex old new <> restoreComments [Index ix]
-      where
-        replaceIndex old new
-            | new.partitioned || old.partitioned = remove (Shared, [LongLock]) ("drop index " <> qualified ix) : addIndex new
-            | namesAlteredColumnOf (== old.table) old.statement =
-                remove (None, []) ("drop index concurrently if exists " <> qualified ix) : addIndex new
-            | otherwise =
-                let tmp = identifier (takeBytes 59 (nameText ix.name) <> "_new")
-                    oldName = quoted ix.name
-                 in [ builds (QName ix.schema tmp)
-                        $ create
-                            (None, [IndexBuild])
-                            (concurrentBuild (QName ix.schema tmp) (replaceInCode [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoted tmp} ON |] new.statement))
-                    , undoneBy (addIndex old <> restoreComments [Index ix]) $ create (None, []) ("drop index concurrently if exists " <> qualified ix)
-                    , undoneBy [create (Shared, []) ("alter index " <> qualified ix <> " rename to " <> quoted tmp)]
-                        $ create (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
-                    ]
-        addIndex def
-            | def.partitioned =
-                [ create (Shared, []) def.statement
-                , create
-                    (Shared, [Manual [i|build the index on each partition with create index concurrently, then alter index #{qualified ix} attach partition each one; it stays invalid until every partition has one|]])
-                    [i|-- create index concurrently and attach partition for #{qualified ix}|]
-                ]
-            | def.table `Set.member` ctx.newTables = [create (Shared, []) def.statement]
-            | otherwise = [builds ix $ create (None, [IndexBuild]) (concurrentBuild ix (replaceInCode " INDEX " " INDEX CONCURRENTLY " def.statement))]
-
-    sequenceRecipe s = typed asSequence \case
-        -- Made by the column's change to serial; it only needs its options.
-        Added def
-            | s `Set.member` ctx.convertedSequences ->
-                [createAt sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions def <> " owned by " <> maybe "none" ownerSql def.ownedBy)]
-        Added def ->
-            create (Shared, []) ("create sequence " <> qualified s <> " " <> sequenceOptions def)
-                : [createAt sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " owned by " <> ownerSql o) | Just o <- [def.ownedBy]]
-        Dropped def
-            | Just o <- def.ownedBy, ownedByDropped o -> []
-            -- Dropped by the column's change to identity.
-            | s `Set.member` ctx.convertedSequences -> []
-            | otherwise -> [remove (Shared, []) ("drop sequence " <> qualified s)]
-        Changed _ new -> [createAt sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions new <> " owned by " <> maybe "none" ownerSql new.ownedBy)]
-      where
-        ownerSql (t, c) = qualified t <> "." <> quoted c
-        -- Dropping the column, or its table, drops the sequence with it.
-        ownedByDropped (t, c) = t `Set.member` ctx.droppedTables || (t, c) `Set.member` ctx.droppedColumns
-
-    type' typ = typed asType \case
-        Added def -> [create (Shared, []) (createType def)]
-        Dropped (DomainType{}) -> [remove (Shared, []) ("drop domain " <> t)]
-        Dropped _ -> [remove (Shared, []) ("drop type " <> t)]
-        Changed (EnumType oldLabels) (EnumType newLabels)
-            | oldLabels `L.isSubsequenceOf` newLabels ->
-                [ create (Own, []) ("alter type " <> t <> " add value " <> literal label <> placement)
-                | (label, position) <- zip newLabels [0 :: Int ..]
-                , label `notElem` oldLabels
-                , let placement = case previous position newLabels of
-                        Just before -> " after " <> literal before
-                        Nothing -> maybe "" ((" before " <>) . literal) (L.headMaybe (filter (`elem` oldLabels) newLabels))
-                ]
-        Changed _ _ -> manual "only adding enum values is automated"
-      where
-        t = typeText typ
-        createType = \case
-            DomainType base notNull dflt -> T.unwords (["create domain " <> t <> " as " <> typeText base] <> ["not null" | notNull] <> ["default " <> d | Just d <- [dflt]])
-            def@(CompositeType _) -> "create type " <> t <> " as " <> fromMaybe "" (T.stripPrefix "composite " (printed (TypeDefinition def)))
-            def -> "create type " <> t <> " as " <> printed (TypeDefinition def)
-        -- The label before the one at @position@, if any.
-        previous position labels = if position == 0 then Nothing else L.headMaybe (L.drop (position - 1) labels)
-
-    routine kind q args = case textual of
-        Added def -> replaceRoutine def []
-        Changed old new
-            | take 2 (T.lines old) == take 2 (T.lines new) -> replaceRoutine new []
-            | otherwise -> replaceRoutine new [MayFail "fails when the return type or argument names change; then drop and create it"]
-        Dropped _ -> [remove (Shared, []) [i|drop #{keyword} #{qualified q}(#{argList args})|]]
-      where
-        keyword :: Text
-        keyword = case kind of
-            Function -> "function"
-            Procedure -> "procedure"
-            Aggregate -> "aggregate"
-        replaceRoutine def hazards
-            | kind == Aggregate = manual "aggregates are not automated"
-            | otherwise = case Map.lookup key ctx.bodyChecks of
-                Just (checked, check) | checked == def -> case check of
-                    DoesNotParse err -> manual ("PostgreSQL's printed body does not parse back: " <> err)
-                    Repaired text -> [create (Shared, hazards) (T.stripEnd text)]
-                    _ -> [create (Shared, hazards) (T.stripEnd def)]
-                _
-                    | "BEGIN ATOMIC" `T.isInfixOf` def || any ("RETURN " `T.isPrefixOf`) (T.lines def) ->
-                        [create (Shared, hazards <> [MayFail "a SQL-standard body that was not checked against the desired database"]) (T.stripEnd def)]
-                    | otherwise -> [create (Shared, hazards) (T.stripEnd def)]
-
-    viewRecipe v = typed asView \case
-        Added def -> [create (Shared, []) ("create view " <> viewSql v def)]
-        Changed old new
-            | extendsColumns old new -> [create (Shared, []) ("create or replace view " <> viewSql v new)]
-            -- create or replace view keeps the columns as they were, adding any at the
-            -- end; otherwise the view, and what depends on it, go and come back.
-            | otherwise ->
-                let dependents = Map.findWithDefault (Surrounding [] []) v ctx.viewDependents
-                 in map (create (Shared, [])) dependents.dropBefore
-                        <> [ create (Shared, [MayFail "fails when other objects depend on the view; then drop them first"]) ("drop view " <> qualified v)
-                           , create (Shared, []) ("create view " <> viewSql v new)
-                           ]
-                        <> restoreOnView v
-                        <> restoreComments (View v : [o | o@(OtherColumn OfView t _) <- Map.keys ctx.keptComments, t == v])
-                        <> map (create (Shared, [])) dependents.createAfter
-        Dropped _ -> [remove (Shared, []) ("drop view " <> qualified v)]
-
-    materializedView v = typed asView \case
-        -- Created again by a revert, it gets back its indexes, grants and comments.
-        Added def -> create (Shared, []) ("create materialized view " <> viewSql v def) : restoreOnView v <> restoreViewComments v
-        Changed _ new ->
-            [ remove (Shared, [MayFail "fails when other objects depend on it"]) ("drop materialized view " <> qualified v)
-            , create (Shared, [LongLock]) ("create materialized view " <> viewSql v new)
+    serialOf = [i|pg_get_serial_sequence(#{tableLit}, #{columnLit})|] :: Text
+    grantAcl :: Text -> Text
+    grantAcl target =
+        [i|execute coalesce((select string_agg(format('grant %s on sequence %s to %s', x.privilege_type, #{target}, case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end), '; ') from aclexplode(acl) x where x.grantee <> x.grantor), 'select');|]
+    notNullSteps old new = case (isNotNull old, isNotNull new) of
+        (False, True) ->
+            create this (Shared, []) [i|#{alter}add #{named new}not null #{quoted c} not valid|]
+                : [create this (Own, []) (onNotNull (notNullName new) "validate constraint" "") | notNullValid new]
+        (True, False) -> [create this (Shared, []) (col <> "drop not null")]
+        (True, True) ->
+            [ create this (Shared, []) (onNotNull (notNullName old) "rename constraint" (" to " <> quoted n))
+            | notNullName old /= notNullName new
+            , let n = fromMaybe (identifier (T.concat [nameText t.name, "_", nameText c, "_not_null"])) (notNullName new)
             ]
-                <> restoreOnView v
-                <> restoreViewComments v
-        Dropped _ -> [remove (Shared, []) ("drop materialized view " <> qualified v)]
+                <> case (notNullValid old, notNullValid new) of
+                    (False, True) -> [create this (Own, []) (onNotNull (notNullName new) "validate constraint" "")]
+                    (True, False) -> manual this "a validated not null constraint cannot be made NOT VALID again"
+                    _ -> []
+        (False, False) -> []
+    named d = maybe "" (\n -> "constraint " <> quoted n <> " ") (notNullName d)
+    onNotNull name action rest = case name of
+        Just n -> alter <> action <> " " <> quoted n <> rest
+        Nothing ->
+            let command = literal [i|#{T.replace "%" "%%" (alter <> action)} %I#{T.replace "%" "%%" rest}|]
+                tableLiteral = literal (qualified t)
+             in doBlock [i| begin execute format(#{command}, (select conname from pg_constraint where conrelid = #{tableLiteral}::regclass and contype = 'n' and conkey = array[(select attnum from pg_attribute where attrelid = #{tableLiteral}::regclass and attname = #{literal (nameText c)})])); end |]
 
-    restoreViewComments v = restoreComments (MaterializedView v : [o | o@(OtherColumn OfMaterializedView t _) <- Map.keys ctx.keptComments, t == v])
-    restoreOnView v = case Map.lookup v ctx.recreatedViews of
-        Nothing -> []
-        Just kept ->
-            [create (Shared, [IndexBuild]) def | (_, def) <- kept.keptIndexes]
-                <> restoreComments [Index q | (q, _) <- kept.keptIndexes]
-                <> [create (Shared, []) (revokeGranted (qualified v)) | isJust kept.keptGrants]
-                <> maybe [] (\(k, def) -> map asPartOfThis (privileges k k.object (Added def))) kept.keptGrants
 
-    trigger t n = case textual of
-        Added def -> create (Shared, []) def : restoreComments [Trigger t n]
-        Changed old new
-            | namesAlteredColumn t old -> [dropTrigger DropPhase, create (Shared, []) new] <> restoreComments [Trigger t n]
-            | Just rest <- T.stripPrefix "CREATE TRIGGER " new -> [create (Shared, []) ("CREATE OR REPLACE TRIGGER " <> rest)]
-            | otherwise -> [dropTrigger CreatePhase, create (Shared, []) new] <> restoreComments [Trigger t n]
-        Dropped _ -> [dropTrigger DropPhase]
-      where
-        dropTrigger phase =
-            Step phase (if phase == DropPhase then dropRank object else createRank object) object ("drop trigger " <> quoted n <> " on " <> qualified t) Shared [] key change UndoObject
+tableConstraintRecipe :: Target -> QName -> Identifier -> [Step]
+tableConstraintRecipe this t c = typed this asConstraint \ch -> if all (.inheritedOnly) ch then [] else tableConstraintChange this t c ch
 
-    policy t n = case textual of
-        Added def -> createPolicy def : restoreComments [Policy t n]
-        Changed old new
-            | namesAlteredColumn t old -> [remove (Shared, []) dropPolicy, createPolicy new] <> restoreComments [Policy t n]
-            | otherwise -> [create (Shared, []) dropPolicy, createPolicy new] <> restoreComments [Policy t n]
-        Dropped _ -> [remove (Shared, []) dropPolicy]
-      where
-        dropPolicy = "drop policy " <> quoted n <> " on " <> qualified t
-        createPolicy def = create (Shared, []) ("create policy " <> quoted n <> " on " <> qualified t <> "\n" <> def)
+
+tableConstraintChange :: Target -> QName -> Identifier -> Change ConstraintDef -> [Step]
+tableConstraintChange this t c = \case
+    Added def -> addConstraint def <> restoreComments this [TableConstraint t c]
+    Dropped old -> [dropConstraint old]
+    Changed old new
+        | validates old new -> [undoneBy [] $ create this (Own, []) (alterT <> "validate constraint " <> quoted c)]
+        | validates new old -> manual this "a validated constraint cannot be made NOT VALID again"
+        | otherwise -> dropConstraint old : addConstraint new <> restoreComments this [TableConstraint t c, Index (QName t.schema c)]
+  where
+    alterT = [i|alter table #{qualified t} |]
+    dropConstraint old =
+        remove
+            this
+            (Shared, [MayFail "other objects depend on it, such as foreign keys; drop them first" | dependedOn] <> locksOther old)
+            (alterT <> "drop constraint " <> quoted c)
+    dependedOn = any (`Set.member` this.context.withDependents) [TableConstraint t c, Index (QName t.schema c)]
+    locksOther def = [LocksOther (qualified r.table) | Just r <- [def.references], r.table /= t]
+    plain hazards def clause = create this (Shared, hazards <> locksOther def) (alterT <> "add constraint " <> quoted c <> " " <> clause)
+    addConstraint def
+        | t `Set.member` this.context.newTables = [plain [] def def.clause]
+        | validatable def && def.validity == NotValidated = [plain [] def def.clause]
+        | validatable def =
+            [ plain [] def (def.clause <> notValid)
+            , undoneBy [] $ create this (Own, []) (alterT <> "validate constraint " <> quoted c)
+            ]
+        | Just (keyword, cols) <- simpleKey def
+        , not (t `Set.member` this.context.partitionedTables) =
+            let build = create this (None, [IndexBuild]) (concurrentBuild (QName t.schema c) [i|create unique index concurrently #{quoted c} on #{qualified t} (#{cols})|])
+             in [ builds this (QName t.schema c) build
+                , -- Dropping the constraint drops its index, which the build before made.
+                  undoneBy [create this (Shared, []) (alterT <> "drop constraint " <> quoted c), build]
+                    $ create this (Shared, []) (alterT <> "add constraint " <> quoted c <> " " <> keyword <> " using index " <> quoted c)
+                ]
+        | otherwise = [plain [LongLock, IndexBuild] def def.clause]
+    validatable def = def.kind `elem` [Check, ForeignKey]
+    -- A primary key or unique constraint on plain columns and nothing more, which an
+    -- index built beforehand can back.
+    simpleKey def = do
+        keyword <- case def.kind of
+            PrimaryKey -> Just "PRIMARY KEY"
+            Unique -> Just "UNIQUE"
+            _ -> Nothing
+        let cols = T.intercalate ", " (map quoted def.columns)
+        guard (not (null def.columns) && def.clause == keyword <> " (" <> cols <> ")")
+        pure (keyword, cols)
+
+
+domainConstraintRecipe :: Target -> TypeName -> Identifier -> [Step]
+domainConstraintRecipe this d c = typed this asConstraint \case
+    Added def -> add def <> restoreComments this [DomainConstraint d c]
+    Dropped _ -> [remove this (Shared, []) (alterD <> "drop constraint " <> quoted c)]
+    Changed old new
+        | validates old new -> [validate]
+        | validates new old -> manual this "a validated constraint cannot be made NOT VALID again"
+        | otherwise -> remove this (Shared, []) (alterD <> "drop constraint " <> quoted c) : add new <> restoreComments this [DomainConstraint d c]
+  where
+    alterD = [i|alter domain #{typeText d} |]
+    validate = undoneBy [] $ create this (Own, []) (alterD <> "validate constraint " <> quoted c)
+    add def
+        | def.validity == NotValidated = [create this (Shared, []) (alterD <> "add constraint " <> quoted c <> " " <> def.clause)]
+        | otherwise = [create this (Shared, []) (alterD <> "add constraint " <> quoted c <> " " <> def.clause <> notValid), validate]
+
+
+indexRecipe :: Target -> QName -> [Step]
+indexRecipe this ix = typed this asIndex \case
+    Added def -> addIndex def <> restoreComments this [Index ix]
+    Dropped def
+        | def.table `Set.member` this.context.droppedTables -> []
+        | def.partitioned -> [remove this (Shared, [LongLock]) ("drop index " <> qualified ix)]
+        | otherwise -> [remove this (None, []) ("drop index concurrently " <> qualified ix)]
+    Changed old new -> replaceIndex old new <> restoreComments this [Index ix]
+  where
+    replaceIndex old new
+        | new.partitioned || old.partitioned = remove this (Shared, [LongLock]) ("drop index " <> qualified ix) : addIndex new
+        | namesAlteredColumnOf this (== old.table) old.statement =
+            remove this (None, []) ("drop index concurrently if exists " <> qualified ix) : addIndex new
+        | otherwise =
+            let tmp = identifier (takeBytes 59 (nameText ix.name) <> "_new")
+                oldName = quoted ix.name
+             in [ builds this (QName ix.schema tmp)
+                    $ create
+                        this
+                        (None, [IndexBuild])
+                        (concurrentBuild (QName ix.schema tmp) (replaceInCode [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoted tmp} ON |] new.statement))
+                , undoneBy (addIndex old <> restoreComments this [Index ix]) $ create this (None, []) ("drop index concurrently if exists " <> qualified ix)
+                , undoneBy [create this (Shared, []) ("alter index " <> qualified ix <> " rename to " <> quoted tmp)]
+                    $ create this (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
+                ]
+    addIndex def
+        | def.partitioned =
+            [ create this (Shared, []) def.statement
+            , create
+                this
+                (Shared, [Manual [i|build the index on each partition with create index concurrently, then alter index #{qualified ix} attach partition each one; it stays invalid until every partition has one|]])
+                [i|-- create index concurrently and attach partition for #{qualified ix}|]
+            ]
+        | def.table `Set.member` this.context.newTables = [create this (Shared, []) def.statement]
+        | otherwise = [builds this ix $ create this (None, [IndexBuild]) (concurrentBuild ix (replaceInCode " INDEX " " INDEX CONCURRENTLY " def.statement))]
+
+
+sequenceRecipe :: Target -> QName -> [Step]
+sequenceRecipe this s = typed this asSequence \case
+    -- Made by the column's change to serial; it only needs its options.
+    Added def
+        | s `Set.member` this.context.convertedSequences ->
+            [createAt this sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions def <> " owned by " <> maybe "none" ownerSql def.ownedBy)]
+    Added def ->
+        create this (Shared, []) ("create sequence " <> qualified s <> " " <> sequenceOptions def)
+            : [createAt this sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " owned by " <> ownerSql o) | Just o <- [def.ownedBy]]
+    Dropped def
+        | Just o <- def.ownedBy, ownedByDropped o -> []
+        -- Dropped by the column's change to identity.
+        | s `Set.member` this.context.convertedSequences -> []
+        | otherwise -> [remove this (Shared, []) ("drop sequence " <> qualified s)]
+    Changed _ new -> [createAt this sequenceOwnerRank (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions new <> " owned by " <> maybe "none" ownerSql new.ownedBy)]
+  where
+    ownerSql (t, c) = qualified t <> "." <> quoted c
+    -- Dropping the column, or its table, drops the sequence with it.
+    ownedByDropped (t, c) = t `Set.member` this.context.droppedTables || (t, c) `Set.member` this.context.droppedColumns
+
+
+typeRecipe :: Target -> TypeName -> [Step]
+typeRecipe this typ = typed this asType \case
+    Added def -> [create this (Shared, []) (createType def)]
+    Dropped (DomainType{}) -> [remove this (Shared, []) ("drop domain " <> t)]
+    Dropped _ -> [remove this (Shared, []) ("drop type " <> t)]
+    Changed (EnumType oldLabels) (EnumType newLabels)
+        | oldLabels `L.isSubsequenceOf` newLabels ->
+            [ create this (Own, []) ("alter type " <> t <> " add value " <> literal label <> placement)
+            | (label, position) <- zip newLabels [0 :: Int ..]
+            , label `notElem` oldLabels
+            , let placement = case previous position newLabels of
+                    Just before -> " after " <> literal before
+                    Nothing -> maybe "" ((" before " <>) . literal) (L.headMaybe (filter (`elem` oldLabels) newLabels))
+            ]
+    Changed _ _ -> manual this "only adding enum values is automated"
+  where
+    t = typeText typ
+    createType = \case
+        DomainType base notNull dflt -> T.unwords (["create domain " <> t <> " as " <> typeText base] <> ["not null" | notNull] <> ["default " <> d | Just d <- [dflt]])
+        def@(CompositeType _) -> "create type " <> t <> " as " <> fromMaybe "" (T.stripPrefix "composite " (printed (TypeDefinition def)))
+        def -> "create type " <> t <> " as " <> printed (TypeDefinition def)
+    -- The label before the one at @position@, if any.
+    previous position labels = if position == 0 then Nothing else L.headMaybe (L.drop (position - 1) labels)
+
+
+routineRecipe :: Target -> RoutineKind -> QName -> [TypeName] -> [Step]
+routineRecipe this kind q args = case textual this of
+    Added def -> replaceRoutine def []
+    Changed old new
+        | take 2 (T.lines old) == take 2 (T.lines new) -> replaceRoutine new []
+        | otherwise -> replaceRoutine new [MayFail "fails when the return type or argument names change; then drop and create it"]
+    Dropped _ -> [remove this (Shared, []) [i|drop #{keyword} #{qualified q}(#{argList args})|]]
+  where
+    keyword :: Text
+    keyword = case kind of
+        Function -> "function"
+        Procedure -> "procedure"
+        Aggregate -> "aggregate"
+    replaceRoutine def hazards
+        | kind == Aggregate = manual this "aggregates are not automated"
+        | otherwise = case Map.lookup this.objectKey this.context.bodyChecks of
+            Just (checked, check) | checked == def -> case check of
+                DoesNotParse err -> manual this ("PostgreSQL's printed body does not parse back: " <> err)
+                Repaired text -> [create this (Shared, hazards) (T.stripEnd text)]
+                _ -> [create this (Shared, hazards) (T.stripEnd def)]
+            _
+                | "BEGIN ATOMIC" `T.isInfixOf` def || any ("RETURN " `T.isPrefixOf`) (T.lines def) ->
+                    [create this (Shared, hazards <> [MayFail "a SQL-standard body that was not checked against the desired database"]) (T.stripEnd def)]
+                | otherwise -> [create this (Shared, hazards) (T.stripEnd def)]
+
+
+viewRecipe :: Target -> QName -> [Step]
+viewRecipe this v = typed this asView \case
+    Added def -> [create this (Shared, []) ("create view " <> viewSql v def)]
+    Changed old new
+        | extendsColumns old new -> [create this (Shared, []) ("create or replace view " <> viewSql v new)]
+        -- create or replace view keeps the columns as they were, adding any at the
+        -- end; otherwise the view, and what depends on it, go and come back.
+        | otherwise ->
+            let dependents = Map.findWithDefault (Surrounding [] []) v this.context.viewDependents
+             in map (create this (Shared, [])) dependents.dropBefore
+                    <> [ create this (Shared, [MayFail "fails when other objects depend on the view; then drop them first"]) ("drop view " <> qualified v)
+                       , create this (Shared, []) ("create view " <> viewSql v new)
+                       ]
+                    <> restoreOnView this v
+                    <> restoreComments this (View v : [o | o@(OtherColumn OfView t _) <- Map.keys this.context.keptComments, t == v])
+                    <> map (create this (Shared, [])) dependents.createAfter
+    Dropped _ -> [remove this (Shared, []) ("drop view " <> qualified v)]
+
+
+materializedViewRecipe :: Target -> QName -> [Step]
+materializedViewRecipe this v = typed this asView \case
+    -- Created again by a revert, it gets back its indexes, grants and comments.
+    Added def -> create this (Shared, []) ("create materialized view " <> viewSql v def) : restoreOnView this v <> restoreViewComments this v
+    Changed _ new ->
+        [ remove this (Shared, [MayFail "fails when other objects depend on it"]) ("drop materialized view " <> qualified v)
+        , create this (Shared, [LongLock]) ("create materialized view " <> viewSql v new)
+        ]
+            <> restoreOnView this v
+            <> restoreViewComments this v
+    Dropped _ -> [remove this (Shared, []) ("drop materialized view " <> qualified v)]
+
+
+restoreViewComments :: Target -> QName -> [Step]
+restoreViewComments this v = restoreComments this (MaterializedView v : [o | o@(OtherColumn OfMaterializedView t _) <- Map.keys this.context.keptComments, t == v])
+
+
+restoreOnView :: Target -> QName -> [Step]
+restoreOnView this v = case Map.lookup v this.context.recreatedViews of
+    Nothing -> []
+    Just kept ->
+        [create this (Shared, [IndexBuild]) def | (_, def) <- kept.keptIndexes]
+            <> restoreComments this [Index q | (q, _) <- kept.keptIndexes]
+            <> [create this (Shared, []) (revokeGranted (qualified v)) | isJust kept.keptGrants]
+            <> maybe [] (\(k, def) -> map (asPartOfThis this) (privileges k k.object (Added def))) kept.keptGrants
+
+
+triggerRecipe :: Target -> QName -> Identifier -> [Step]
+triggerRecipe this t n = case textual this of
+    Added def -> create this (Shared, []) def : restoreComments this [Trigger t n]
+    Changed old new
+        | namesAlteredColumn this t old -> [dropTrigger DropPhase, create this (Shared, []) new] <> restoreComments this [Trigger t n]
+        | Just rest <- T.stripPrefix "CREATE TRIGGER " new -> [create this (Shared, []) ("CREATE OR REPLACE TRIGGER " <> rest)]
+        | otherwise -> [dropTrigger CreatePhase, create this (Shared, []) new] <> restoreComments this [Trigger t n]
+    Dropped _ -> [dropTrigger DropPhase]
+  where
+    dropTrigger = \case
+        DropPhase -> remove this (Shared, []) dropSql
+        CreatePhase -> create this (Shared, []) dropSql
+    dropSql = "drop trigger " <> quoted n <> " on " <> qualified t
+
+
+policyRecipe :: Target -> QName -> Identifier -> [Step]
+policyRecipe this t n = case textual this of
+    Added def -> createPolicy def : restoreComments this [Policy t n]
+    Changed old new
+        | namesAlteredColumn this t old -> [remove this (Shared, []) dropPolicy, createPolicy new] <> restoreComments this [Policy t n]
+        | otherwise -> [create this (Shared, []) dropPolicy, createPolicy new] <> restoreComments this [Policy t n]
+    Dropped _ -> [remove this (Shared, []) dropPolicy]
+  where
+    dropPolicy = "drop policy " <> quoted n <> " on " <> qualified t
+    createPolicy def = create this (Shared, []) ("create policy " <> quoted n <> " on " <> qualified t <> "\n" <> def)
 
 
 privileges :: ObjectKey -> ObjectId -> Change Definition -> [Step]
