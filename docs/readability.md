@@ -120,9 +120,9 @@ the text with its values in place.
 
 ```haskell
 -- before
-"alter table " <> qualified t <> " alter column " <> quoted c <> " drop default"
+"create table " <> qualified t <> " partition of " <> qualified p.parent <> " " <> p.bound
 -- after
-[i|alter table #{qualified t} alter column #{quoted c} drop default|]
+[i|create table #{qualified t} partition of #{qualified p.parent} #{p.bound}|]
 ```
 
 `#{}` takes any expression, record fields included (string-interpolate 1.0 parses
