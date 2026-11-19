@@ -37,6 +37,7 @@ rule =
             [__i|
                 Write the whole text with the i quasi-quoter from Data.String.Interpolate, each value as \#{value}.
                 For a block of lines use __i, which drops the block's indentation and its first and last newline; for one line of prose wrapped in the source, iii, which turns every run of whitespace into one space.
+                A block with no values in it can also be a multiline string literal (the MultilineStrings extension), which GHC dedents the same way.
                 \#{} takes any expression, record fields included: \#{qualified t}, \#{def.statement}. Bind a long one to a name so the text stays readable.
                 Joining lists, or values with no literal between them, is not text building: leave <> there. Neither is choosing lines one by one, as a list comprehension does.
             |]
@@ -64,7 +65,7 @@ check context _ expressions =
                ]
             <> [ findingAt (ruleId rule) context (getLocA e) "A string literal continued across lines."
                | e <- expressions
-               , isStringLiteral e
+               , isGappedLiteral e
                , spansLines e
                ]
 
@@ -98,6 +99,15 @@ joinsLines e = case unLoc (peelExpr e) of
         HsLit _ (HsString _ t) -> t == "\n"
         HsOverLit _ OverLit{ol_val = HsIsString _ t} -> t == "\n"
         _ -> False
+
+
+-- | An ordinary string literal, which runs over several lines only with string gaps;
+-- a multiline string literal is meant to.
+isGappedLiteral :: LHsExpr GhcPs -> Bool
+isGappedLiteral e = case unLoc (peelExpr e) of
+    HsLit _ HsString{} -> True
+    HsOverLit _ OverLit{ol_val = HsIsString{}} -> True
+    _ -> False
 
 
 -- | A string literal or an interpolation.

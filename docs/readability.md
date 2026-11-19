@@ -147,6 +147,9 @@ T.unlines
 |]
 ```
 
+A block with no values in it can also be a multiline string literal (`"""...`"""`,
+the `MultilineStrings` extension), which GHC dedents the same way.
+
 One line of prose wrapped in the source, such as a rule's text, is `[iii|...|]`,
 which turns every run of whitespace into one space.
 
