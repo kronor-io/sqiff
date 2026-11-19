@@ -137,7 +137,9 @@
             os = githubPlatforms.${system};
             attr = "packages.${system}.${name}";
           })
-          (builtins.attrNames (builtins.removeAttrs self.packages.${system} [ "default" ])))
+          (builtins.attrNames (builtins.removeAttrs self.packages.${system}
+            # sqiff-lint only runs in CI's check job, which is on aarch64-linux.
+            ([ "default" ] ++ nixpkgs.lib.optional (system != "aarch64-linux") "sqiff-lint"))))
         systems;
 
       apps = forAllSystems (system: {
