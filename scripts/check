@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# The checks docs/readability.md describes. Run inside `nix develop`.
+#
+#   scripts/check fast     fourmolu and the HLint gate
+#   scripts/check full     fast, then build everything and run every test
+#   scripts/check advice   HLint's other suggestions, without failing
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# The HLint rules that fail the check; each enforces a rule of docs/readability.md.
+gated_hints=(
+    "Read the step's role, not its SQL"
+    "Use exactDependentsOf"
+    "Use routinesNaming"
+)
+
+need() {
+    command -v "$1" >/dev/null || {
+        echo "scripts/check: $1 is not on PATH; run inside nix develop" >&2
+        exit 2
+    }
+}
+
+haskell_files() {
+    git ls-files '*.hs'
+}
+
+fast() {
+    need fourmolu
+    need hlint
+    echo "== fourmolu"
+    haskell_files | xargs fourmolu --mode check --quiet
+    echo "== hlint"
+    local only=()
+    for hint in "${gated_hints[@]}"; do only+=(--only="$hint"); done
+    hlint "${only[@]}" src app test
+}
+
+full() {
+    fast
+    need cabal
+    echo "== build"
+    cabal build all
+    echo "== test"
+    cabal test all
+}
+
+advice() {
+    need hlint
+    hlint src app test || true
+}
+
+case "${1:-fast}" in
+    fast) fast ;;
+    full) full ;;
+    advice) advice ;;
+    *)
+        echo "usage: scripts/check [fast|full|advice]" >&2
+        exit 2
+        ;;
+esac

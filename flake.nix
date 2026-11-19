@@ -77,6 +77,9 @@
         let inherit (bySystem.${system}) pkgs project; in {
           default = project.shellFor {
             tools.cabal = { version = "3.16.1.0"; };
+            # scripts/check runs these.
+            tools.fourmolu = { version = "0.19.0.1"; };
+            tools.hlint = { version = "3.10"; };
             buildInputs = [ pkgs.postgresql_18 pkgs.sqitchPg pkgs.git ];
           };
         });
