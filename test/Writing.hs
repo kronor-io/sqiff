@@ -72,7 +72,18 @@ withSqitchProject action = withSystemTempDirectory "sqiff-writing" \dir -> do
 step :: Text -> Text -> Step
 step name sql =
     let object = Table (qname "public" name)
-     in Step CreatePhase Creates 4 object sql Shared [] (ObjectKey Definition object) (Added (Printed sql)) UndoObject
+     in Step
+            { phase = CreatePhase
+            , role = Creates
+            , rank = 4
+            , object
+            , sql
+            , txn = Shared
+            , hazards = []
+            , key = ObjectKey Definition object
+            , change = Added (Printed sql)
+            , undo = UndoObject
+            }
 
 
 unit :: UnitKind -> Text -> Text -> Unit
