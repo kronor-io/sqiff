@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | SQL text: which parts of it are code, quoted or comment, and how sqiff writes
@@ -22,6 +23,7 @@ module Sqiff.Sql (
 ) where
 
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
+import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
 import RIO.List qualified as L
@@ -167,8 +169,10 @@ replaceAllInCode pairs t = foldl' (\acc (old, new) -> replaceInCode old new acc)
 -- @standard_conforming_strings@ is.
 literal :: Text -> Text
 literal t
-    | "\\" `T.isInfixOf` t = "E'" <> T.replace "\\" "\\\\" (T.replace "'" "''" t) <> "'"
-    | otherwise = "'" <> T.replace "'" "''" t <> "'"
+    | "\\" `T.isInfixOf` t = let escaped = T.replace "\\" "\\\\" doubled in [i|E'#{escaped}'|]
+    | otherwise = [i|'#{doubled}'|]
+  where
+    doubled = T.replace "'" "''" t
 
 
 -- | @body@ between dollar quotes whose tag it does not contain.
@@ -177,7 +181,7 @@ dollarQuoted body = quote <> body <> quote
   where
     -- The candidates never run out, so the fallback is never taken.
     quote = fromMaybe "$$" (L.find (\q -> not (q `T.isInfixOf` (body <> "$"))) candidates)
-    candidates = "$$" : ["$sqiff" <> suffix <> "$" | suffix <- "" : map tshow [1 :: Int ..]]
+    candidates = "$$" : [[i|$sqiff#{suffix}$|] | suffix <- "" : map tshow [1 :: Int ..]]
 
 
 -- | An anonymous PL/pgSQL block.

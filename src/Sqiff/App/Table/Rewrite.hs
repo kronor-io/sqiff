@@ -160,7 +160,7 @@ changesTableIn table statement = case ws of
     ws = T.words (T.toLower (withoutLeadingComments statement))
     bare = T.takeWhile (`notElem` ("(;," :: String))
     unquoted = T.filter (/= '"')
-    qualifiedName = T.toLower (nameText table.schema <> "." <> nameText table.name)
+    qualifiedName = T.toLower (dotted table)
     plainName = T.toLower (nameText table.name)
     isTable n = let n' = unquoted (bare n) in n' == qualifiedName || (not ("." `T.isInfixOf` n') && n' == plainName)
     startsWithTable = \case

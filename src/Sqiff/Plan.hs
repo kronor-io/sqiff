@@ -194,6 +194,7 @@ renderStep s =
     T.unlines
         $ ["-- " <> render s.object]
         <> ["-- " <> note | note <- txnNote <> map hazardText s.hazards]
+        -- [allow:SqiffStepRole] writing the statement out: a "--" placeholder takes no semicolon
         <> [s.sql <> if "--" `T.isPrefixOf` s.sql then "" else ";"]
   where
     txnNote = case s.txn of

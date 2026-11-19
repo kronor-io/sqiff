@@ -343,13 +343,15 @@ shapeOf u = case u.deploy of
         , Added _ <- s.change
         , plain t
         , quoted c == nameText c
-        , Just options <- T.stripPrefix [S.i|alter table #{qualified t} add column #{quoted c} |] s.sql
+        , -- [allow:SqiffStepRole] reads a template variable back out of the SQL; steps do not carry it yet
+          Just options <- T.stripPrefix [S.i|alter table #{qualified t} add column #{quoted c} |] s.sql
         , not (any (`elem` [MayRewriteTable, RewritesTable, LongLock]) s.hazards) ->
             AddColumnShape t c options
         | u.placement == Migration
         , Just t <- owningTable s.object
         , plain t
-        , Just c <- T.stripPrefix [S.i|alter table #{qualified t} validate constraint |] s.sql
+        , -- [allow:SqiffStepRole] reads a template variable back out of the SQL; steps do not carry it yet
+          Just c <- T.stripPrefix [S.i|alter table #{qualified t} validate constraint |] s.sql
         , quoteIdent c == c ->
             ValidateShape t (identifier c)
     _ -> OtherShape
@@ -405,11 +407,14 @@ renderScript header placement steps =
     -- deploying as a change that does nothing.
     stopUntilWritten s =
         [ doBlock [S.i| begin raise exception using message = #{literal message}; end |] <> ";"
-        | "--" `T.isPrefixOf` s.sql
+        | placeholder s
         , why <- take 1 [w | Manual w <- s.hazards]
         , let what = render s.object
               message = [S.i|sqiff could not write this step for #{what}: #{why}; write it here and remove this block|] :: Text
         ]
+    -- A step left to a person: its SQL is a "--" note saying what to write.
+    -- [allow:SqiffStepRole] such a step has no role of its own yet
+    placeholder s = "--" `T.isPrefixOf` s.sql
     indent = T.intercalate "\n" . map (\l -> if T.null l then l else "  " <> l) . T.lines
     safeToIndent sql = not ("$" `T.isInfixOf` sql) && all (even . T.count "'") (T.lines sql)
     tidy s sql = case T.lines sql of
@@ -553,7 +558,7 @@ verifyScript header steps =
         MaterializedView q -> [relation s q]
         Sequence q -> [relation s q]
         Routine _ q args ->
-            let signature = qualified q <> "(" <> T.intercalate ", " (map typeText args) <> ")"
+            let signature = [S.i|#{qualified q}(#{T.intercalate ", " (map typeText args)})|]
              in [lookupBy s "to_regprocedure" signature]
         Type t ->
             lookupBy s "to_regtype" (typeText t)
@@ -585,4 +590,6 @@ verifyScript header steps =
     reg t = let name = literal (qualified t) in [S.i|#{name}::regclass|]
     assertBlock
         | null asserts = []
-        | otherwise = ["    " <> doBlock (T.intercalate "\n" ([""] <> ["    begin"] <> map ("        " <>) asserts <> ["    end", "    "])) <> ";"]
+        | otherwise =
+            let block = doBlock (T.intercalate "\n" ([""] <> ["    begin"] <> map ("        " <>) asserts <> ["    end", "    "]))
+             in [[S.i|    #{block};|]]

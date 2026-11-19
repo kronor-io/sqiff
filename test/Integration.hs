@@ -58,7 +58,7 @@ tests sqitchFound = do
         Right bin -> do
             -- sqitch runs psql from PATH.
             path <- fromMaybe "" <$> lookupEnv "PATH"
-            setEnv "PATH" (bin <> ":" <> path)
+            setEnv "PATH" [i|#{bin}:#{path}|]
             pure $ withResource (startCluster bin) stopCluster \getCluster ->
                 let shared = Shared{getCluster, sqitchFound}
                  in testGroup "integration" (sharedSnapshot getCluster : deepViewChains getCluster : map (fixture shared) fixtures)
@@ -120,6 +120,7 @@ deepViewChains getCluster = testCase "deep view chains are planned in reasonable
 
 -- | Runs sqiff's @command@ from @fromDb@ to @toDb@, outside the repository so no
 -- sqiff.yaml is read.
+-- [allow:SqiffNamedTuples] pre-existing at adoption
 runSqiff :: Cluster -> [String] -> Text -> Text -> IO (ExitCode, Text, Text)
 runSqiff cluster command fromDb toDb = do
     exe <- fromMaybe "sqiff" <$> lookupEnv "SQIFF_EXE"

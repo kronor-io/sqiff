@@ -18,7 +18,16 @@ common shared
     DerivingStrategies
     LambdaCase
 
-  ghc-options:        -Wall
+  -- The warnings docs/readability.md relies on fail the build; the rest of -Wall
+  -- stays advice.
+  ghc-options:
+    -Wall
+    -Werror=missing-signatures
+    -Werror=missing-fields
+    -Werror=incomplete-patterns
+    -Werror=incomplete-uni-patterns
+    -Werror=incomplete-record-updates
+    -Werror=incomplete-record-selectors
 
 library
   import:          shared

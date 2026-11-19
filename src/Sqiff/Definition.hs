@@ -84,6 +84,7 @@ module Sqiff.Definition (
 
 import Data.Aeson (FromJSON (..), Value (Null, String), withObject, (.!=), (.:), (.:?))
 import Data.Aeson.Types (Parser)
+import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
 import RIO.List qualified as L
@@ -119,7 +120,7 @@ printed = \case
     IndexDefinition ix -> ix.statement
     ConstraintDefinition c -> c.clause
     SequenceDefinition q -> sequenceText q
-    ExtensionDefinition e -> "version " <> e.version <> " schema " <> quoted e.schema
+    ExtensionDefinition (ExtensionDef version schema) -> [i|version #{version} schema #{quoted schema}|]
     TypeDefinition t -> typeDefText t
     Printed t -> t
 
@@ -386,12 +387,14 @@ columnText c =
         <> case c.nullability of
             Nullable -> []
             NotNull validity name ->
-                ["not null" <> (if validity == NotValidated then " not valid" else "") <> maybe "" ((" constraint " <>) . nameText) name]
+                let notValid = if validity == NotValidated then " not valid" else "" :: Text
+                    constraint = maybe "" ((" constraint " <>) . nameText) name
+                 in [[i|not null#{notValid}#{constraint}|]]
         <> case c.value of
             PlainColumn e -> ["default " <> x | Just x <- [e]]
             IdentityColumn kind options ->
                 ["identity " <> identityKindSql kind] <> ["identity options " <> T.intercalate ", " options | not (null options)]
-            GeneratedColumn storage e -> ["generated " <> storageSql storage <> " " <> e]
+            GeneratedColumn storage e -> [[i|generated #{storageSql storage} #{e}|]]
         <> ["rewrites the table when added" | c.rewritesOnAdd]
 
 
@@ -465,7 +468,7 @@ data PartitionOf = PartitionOf
 withOptions :: [Text] -> Maybe Text
 withOptions = \case
     [] -> Nothing
-    options -> Just ("with (" <> T.intercalate ", " options <> ")")
+    options -> let list = T.intercalate ", " options in Just [i|with (#{list})|]
 
 
 tableText :: TableDef -> Text
@@ -473,7 +476,7 @@ tableText t =
     T.intercalate "\n"
         $ ["unlogged" | t.unlogged]
         <> ["partition by " <> key | Just key <- [t.partitionBy]]
-        <> ["partition of " <> qualified p.parent <> " " <> p.bound | Just p <- [t.partitionOf]]
+        <> [[i|partition of #{qualified parent} #{bound}|] | Just (PartitionOf parent bound) <- [t.partitionOf]]
         <> ["inherits " <> qualified p | p <- t.inherits]
         <> ["row level security" | t.rowSecurity]
         <> ["force row level security" | t.forceRowSecurity]
@@ -515,7 +518,7 @@ extendsColumns old new = viewColumns old `L.isPrefixOf` viewColumns new
 
 
 viewText :: ViewDef -> Text
-viewText v = T.intercalate "\n" (["with (" <> T.intercalate ", " o <> ")" | Just o <- [v.options]] <> [v.query])
+viewText v = T.intercalate "\n" ([[i|with (#{T.intercalate ", " o})|] | Just o <- [v.options]] <> [v.query])
 
 
 data IndexDef = IndexDef
@@ -654,7 +657,7 @@ sequenceOptions q =
 
 
 sequenceText :: SequenceDef -> Text
-sequenceText q = sequenceOptions q <> foldMap (\(t, c) -> " owned by " <> qualified t <> "." <> quoted c) q.ownedBy
+sequenceText q = sequenceOptions q <> foldMap (\(t, c) -> [i| owned by #{qualified t}.#{quoted c}|]) q.ownedBy
 
 
 data ExtensionDef = ExtensionDef
@@ -682,10 +685,10 @@ data TypeDef
 
 typeDefText :: TypeDef -> Text
 typeDefText = \case
-    EnumType labels -> "enum (" <> T.intercalate ", " (map literal labels) <> ")"
+    EnumType labels -> let list = T.intercalate ", " (map literal labels) in [i|enum (#{list})|]
     DomainType base notNull dflt -> T.unwords (["domain " <> typeText base] <> ["not null" | notNull] <> ["default " <> d | Just d <- [dflt]])
-    CompositeType attributes -> "composite (" <> T.intercalate ", " [quoted a <> " " <> typeText t | (a, t) <- attributes] <> ")"
-    RangeType options -> "range (" <> T.intercalate ", " [k <> " = " <> v | (k, v) <- options] <> ")"
+    CompositeType attributes -> let list = T.intercalate ", " [[i|#{quoted a} #{typeText t}|] | (a, t) <- attributes] in [i|composite (#{list})|]
+    RangeType options -> let list = T.intercalate ", " [[i|#{k} = #{v}|] | (k, v) <- options] in [i|range (#{list})|]
 
 
 instance FromJSON SequenceDef where
@@ -769,13 +772,12 @@ aclText = \case
     ExplicitAcl grants -> T.intercalate "\n" (L.sort (map line (Set.toList grants)))
   where
     line g =
-        granteeText g.grantee
-            <> " "
-            <> g.privilege
-            <> (if g.grantable then " with grant option" else "")
-            <> case g.grantor of
+        let who = granteeText g.grantee
+            option = if g.grantable then " with grant option" else "" :: Text
+            by = case g.grantor of
                 ByOwner -> ""
                 ByRole r -> " granted by " <> nameText r
+         in [i|#{who} #{g.privilege}#{option}#{by}|]
     granteeText = \case
         Public -> "public"
         Role r -> nameText r

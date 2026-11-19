@@ -408,7 +408,7 @@ shortName listed object = kind <> T.intercalate "." address.objectNames <> args
     address = toAddress object
     kind = if isRoutine object then "" else address.objectType <> " "
     args
-        | withoutArgs object `Set.member` overloaded = "(" <> T.intercalate ", " address.objectArgs <> ")"
+        | withoutArgs object `Set.member` overloaded = [i|(#{T.intercalate ", " address.objectArgs})|]
         | otherwise = ""
     overloaded = Map.keysSet (Map.filter (> (1 :: Int)) (Map.fromListWith (+) [(withoutArgs a, 1) | a <- Set.toList listed]))
     withoutArgs = \case

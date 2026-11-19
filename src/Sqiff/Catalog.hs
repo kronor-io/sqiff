@@ -247,6 +247,7 @@ relationColumns conn relations =
         |]
 
 
+-- [allow:SqiffNamedTuples] pre-existing at adoption
 describeParams :: E.Params ([Text], Bool, Maybe Text, Maybe Int32)
 describeParams =
     contramap (\(excluded, _, _, _) -> excluded) excludedParam

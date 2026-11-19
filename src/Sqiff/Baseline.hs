@@ -140,7 +140,7 @@ bringTo cfg repo common p rev wanted = do
     for_ cfg.deploy \step -> do
         present <- maybe (pure True) (doesPathExist . (p.checkout </>)) step.ifExists
         when present $ sqitchIn cfg p step.args
-    writeFileUtf8 p.stateFile (commit <> "\n" <> wanted.settings <> "\n")
+    writeFileUtf8 p.stateFile [i|#{commit}\n#{wanted.settings}\n|]
 
 
 note :: Text -> IO ()
@@ -276,6 +276,7 @@ compose cfg p args = do
         ExitFailure n -> failWith [i|docker compose -p #{project} #{unwords args} failed with exit code #{n}|]
 
 
+-- [allow:SqiffNamedTuples] pre-existing at adoption
 readCompose :: BaselineConfig -> Paths -> [String] -> IO (ExitCode, Text, Text)
 readCompose cfg p args = do
     env <- composeEnv cfg

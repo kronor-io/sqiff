@@ -1,0 +1,42 @@
+cabal-version: 3.0
+name:          sqiff-lint
+version:       0.1.0.0
+synopsis:      The rules of docs/readability.md that a tool can check, for hopinion
+
+common shared
+  default-language: GHC2021
+  ghc-options:
+    -Wall
+    -Werror=missing-signatures
+    -Werror=incomplete-patterns
+
+library
+  import:          shared
+  hs-source-dirs:  src
+  exposed-modules:
+    Sqiff.Lint
+    Sqiff.Lint.Rule.Interpolate
+    Sqiff.Lint.Rule.NamedFields
+    Sqiff.Lint.Rule.NamedQueries
+    Sqiff.Lint.Rule.NamedTuples
+    Sqiff.Lint.Rule.SmallWhere
+    Sqiff.Lint.Rule.StepRole
+    Sqiff.Lint.Syntax
+
+  build-depends:
+    , base
+    , containers
+    , ghc-lib-parser
+    , hopinion
+    , string-interpolate
+    , syb
+    , text
+
+executable sqiff-lint
+  import:         shared
+  hs-source-dirs: app
+  main-is:        SqiffLint.hs
+  ghc-options:    -main-is SqiffLint.main
+  build-depends:
+    , base
+    , sqiff-lint

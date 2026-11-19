@@ -206,9 +206,11 @@ toAddress = \case
 
 -- | The object as messages name it: its kind, dotted names and arguments.
 render :: ObjectId -> Text
-render object = addr.objectType <> " " <> T.intercalate "." addr.objectNames <> args
+render object = [i|#{addr.objectType} #{names}#{args}|]
   where
     addr = toAddress object
+    names = T.intercalate "." addr.objectNames
+    args :: Text
     args
         | null addr.objectArgs = ""
         | otherwise = let list = T.intercalate ", " addr.objectArgs in [i|(#{list})|]

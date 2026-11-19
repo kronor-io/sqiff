@@ -1,0 +1,9 @@
+# HLint, for scripts/check advice only: its suggestions are advice, and several,
+# such as eta reduction or bimap, work against docs/readability.md. The rules
+# that gate are sqiff's hopinion rules, in lint/.
+- arguments:
+    - -XGHC2021
+    - -XBlockArguments
+    - -XStrictData
+    - -XDerivingStrategies
+    - -XLambdaCase

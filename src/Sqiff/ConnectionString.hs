@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Where a database is, as libpq takes it, with a redacted form that never shows the
@@ -12,6 +13,7 @@ module Sqiff.ConnectionString (
 ) where
 
 import Data.Char (isSpace)
+import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
 
@@ -42,7 +44,7 @@ connectionString t
 
 -- | A keyword connection string from its settings, each value quoted.
 fromPairs :: [(Text, Text)] -> ConnectionString
-fromPairs pairs = ConnInfo (T.unwords [k <> "='" <> escape v <> "'" | (k, v) <- pairs])
+fromPairs pairs = ConnInfo (T.unwords [[i|#{k}='#{escape v}'|] | (k, v) <- pairs])
   where
     escape = T.replace "'" "\\'" . T.replace "\\" "\\\\"
 
@@ -73,7 +75,7 @@ redactUri t =
                 | not (T.null at)
                 , (user, colon) <- T.breakOn ":" userInfo
                 , not (T.null colon) ->
-                    user <> ":***" <> at
+                    [i|#{user}:***#{at}|]
             _ -> authority
         (beforeQuery, query) = T.breakOn "?" path
         query' = case T.stripPrefix "?" query of
@@ -96,8 +98,8 @@ redactKeywords = go
                 (spaces, rest) = T.span isSpace afterKey
                 startsKey = T.null before || isSpace (T.last before)
              in case T.stripPrefix "=" rest of
-                    Just value | startsKey -> before <> "password=***" <> go (dropValue (T.stripStart value))
-                    _ -> before <> "password" <> spaces <> go rest
+                    Just value | startsKey -> [i|#{before}password=***#{go (dropValue (T.stripStart value))}|]
+                    _ -> [i|#{before}password#{spaces}#{go rest}|]
     dropValue v = case T.uncons v of
         Just ('\'', quoted) -> closing quoted
         _ -> T.dropWhile (not . isSpace) v

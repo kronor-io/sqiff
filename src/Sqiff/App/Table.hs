@@ -95,6 +95,7 @@ startingIf now get action
 
 
 -- | The file's absolute path, its sqitch change and its table, by the table name pattern.
+-- [allow:SqiffNamedTuples] pre-existing at adoption
 locateTable :: Names -> Layout -> FilePath -> FilePath -> IO (FilePath, Text, QName)
 locateTable names layout root file = do
     absFile <- makeAbsolute file
