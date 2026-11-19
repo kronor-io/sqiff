@@ -31,10 +31,12 @@ import Hasql.Connection qualified as Connection
 import Hasql.Session qualified as Session
 import Hasql.TH (singletonStatement, vectorStatement)
 import RIO
+import RIO.Char (isAlphaNum, isSpace)
+import RIO.List (scanl)
 import RIO.List qualified as L
 import RIO.Map qualified as Map
 import Sqiff.Catalog (Partitions (..), describeOn)
-import Sqiff.Connection (errorText, failWith, inRolledBackTransaction, serverError)
+import Sqiff.Connection (errorPosition, errorText, failWith, inRolledBackTransaction, serverError)
 import Sqiff.Definition (Definition (..), IndexDef (..), TableDef (..), mapNames, mapText)
 import Sqiff.Diff (Change (..), Changes, diff)
 import Sqiff.Identifier
@@ -239,7 +241,7 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
                 _ | describing == SkipDescribe -> pure Map.empty
                 BaseFile base -> do
                     script "savepoint sqiff_base"
-                    built <- build xact "before the edit" base
+                    built <- build xact " at --base" base
                     script "rollback to savepoint sqiff_base"
                     pure built
                 LiveTable SameDatabase _ -> do
@@ -248,7 +250,7 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
                 LiveTable (OtherDatabase other) _ -> do
                     schema <- timed "tableEdit.describeOther" $ fst <$> describeOn [other] [] SkipPartitions (Just (qualified table))
                     pure (Map.filterWithKey (belongsTo table) schema)
-            desired <- timed "tableEdit.desired" $ build xact "as edited" statements
+            desired <- timed "tableEdit.desired" $ build xact "" statements
             afterResult <- timed "tableEdit.after" $ afterEdit beforeResult
             pure (current, desired, afterResult)
     let kept = case baseline of
@@ -278,10 +280,10 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
     build xact label stmts = do
         for_ (zip [1 :: Int ..] stmts) \(n, statement) -> do
             Connection.use conn (Session.script statement)
-                >>= either (\e -> failWith [i|statement #{n} of the file #{label} failed: #{errorText e}|]) pure
+                >>= either (failWith . statementFailed label n statement) pure
             after <- currentXact
             when (after /= xact)
-                $ failWith [i|statement #{n} of the file #{label} ended the transaction the comparison runs in|]
+                $ failWith [i|statement #{n} of the deploy file#{label} ended the transaction the comparison runs in|]
         if describing == DescribeTable
             then do
                 schema <- describeTable table
@@ -309,6 +311,10 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
         |]
 
     withoutLineComments = T.unlines . map (fst . T.breakOn "--") . T.lines
+
+    statementFailed label n statement e =
+        let within = maybe "" (\c -> [i|, in constraint #{c}|]) (constraintAt statement =<< errorPosition e) :: Text
+         in [i|the deploy file#{label} failed on --db at statement #{n}#{within}: #{errorText e}|]
 
     asideRef = quoted aside <> "."
     tableSchemaRef = quoted table.schema <> "."
@@ -346,3 +352,21 @@ editTable describing conn baseline table statements beforeEdit afterEdit = do
             (Policy _ _, Dropped _) -> Just "not in the file; policies may be kept in other files"
             (_, Dropped _) | LiveTable _ ReportDrops <- baseline -> Just "in the database but not in the file; --allow-drops drops it"
             _ -> Nothing
+
+
+-- | The name in the @constraint name ...@ clause that holds a 1-based character
+-- position of the statement, when the position is inside one.
+constraintAt :: Text -> Int -> Maybe Text
+constraintAt statement position = do
+    let before = T.take (position - 1) statement
+        lower = T.toLower before
+    guard (T.length lower == T.length before)
+    let identChar c = isAlphaNum c || c == '_'
+        keyword b = maybe True (not . identChar . snd) (T.unsnoc b) && maybe False (isSpace . fst) (T.uncons (T.drop (T.length b + 10) lower))
+    start <- listToMaybe (reverse [T.length b | (b, _) <- T.breakOnAll "constraint" lower, keyword b])
+    let clause = T.drop (start + 10) before
+        name = T.dropAround (== '"') (T.takeWhile (\c -> identChar c || c == '"') (T.stripStart clause))
+        depths = scanl (\d c -> d + (if c == '(' then 1 else if c == ')' then -1 else 0)) (0 :: Int) (T.unpack clause)
+        leftClause = or [d < 0 || (c == ',' && d == 0) | (d, c) <- zip depths (T.unpack clause)]
+    guard (not (T.null name) && not leftClause)
+    pure name

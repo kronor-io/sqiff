@@ -144,15 +144,15 @@ undeployedTouching live = do
 -- it is treated as one that does.
 changesTableIn :: QName -> Text -> Bool
 changesTableIn table statement = case ws of
-    "alter" : "table" : rest -> first (dropWhile (`elem` ["if", "exists", "only"]) rest)
+    "alter" : "table" : rest -> startsWithTable (dropWhile (`elem` ["if", "exists", "only"]) rest)
     "drop" : "table" : rest -> anyIn (dropWhile (`elem` ["if", "exists"]) rest)
     "comment" : "on" : "column" : n : _ -> isTable (T.dropWhileEnd (== '.') (T.dropWhileEnd (/= '.') (bare n)))
-    "comment" : "on" : "table" : rest -> first rest
+    "comment" : "on" : "table" : rest -> startsWithTable rest
     "comment" : "on" : _ -> afterOn
     verb : _ | verb `elem` ["grant", "revoke"] -> anyIn (dropWhile (== "table") (drop 1 (dropWhile (/= "on") ws)))
     "create" : rest
         | any (`elem` ["function", "procedure", "view", "materialized"]) (take 3 rest) -> False
-        | "table" `elem` take 3 rest -> first (dropWhile (`elem` ["if", "not", "exists"]) (drop 1 (dropWhile (/= "table") rest)))
+        | "table" `elem` take 3 rest -> startsWithTable (dropWhile (`elem` ["if", "not", "exists"]) (drop 1 (dropWhile (/= "table") rest)))
         | otherwise -> afterOn
     "do" : _ -> named
     _ -> False
@@ -163,12 +163,12 @@ changesTableIn table statement = case ws of
     qualifiedName = T.toLower (nameText table.schema <> "." <> nameText table.name)
     plainName = T.toLower (nameText table.name)
     isTable n = let n' = unquoted (bare n) in n' == qualifiedName || (not ("." `T.isInfixOf` n') && n' == plainName)
-    first = \case
+    startsWithTable = \case
         n : _ -> isTable n
         [] -> False
     -- A list of names, up to the word after it.
     anyIn = any isTable . concatMap (filter (not . T.null) . T.split (== ',')) . takeWhile (`notElem` ["to", "from", "cascade", "restrict"])
-    afterOn = first (dropWhile (== "only") (drop 1 (dropWhile (/= "on") ws)))
+    afterOn = startsWithTable (dropWhile (== "only") (drop 1 (dropWhile (/= "on") ws)))
     named = any mentions (nubOrd [qualifiedName, T.toLower (qualified table), plainName])
     mentions needle = any (\(before, rest) -> boundary (T.takeEnd 1 before) && boundary (T.take 1 (T.drop (T.length needle) rest))) (TP.breakOnAll needle (T.toLower statement))
     boundary t = maybe True (\(c, _) -> not (isAlphaNum c || c == '_' || c == '.')) (T.uncons t)
