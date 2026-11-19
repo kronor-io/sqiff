@@ -436,6 +436,12 @@ Guiding rules:
     the multirange type.
   - A changed range type remains a step to write by hand; PostgreSQL cannot alter one.
 
+- [x] **Object owners are left out, by decision (Codex 28, the rest).** Owner roles
+  usually differ between environments, and each environment's own role runs its
+  migrations. Describing owners would report every object as changed between, say, a
+  local database and staging. Grants are compared relative to the owner for the same
+  reason.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**
