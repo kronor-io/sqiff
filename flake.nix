@@ -1,6 +1,12 @@
 {
   description = "PostgreSQL schema diffs written as sqitch changes";
 
+  # What CI builds is pushed here (.github/workflows/check.yml).
+  nixConfig = {
+    extra-substituters = "https://kronor-open.cachix.org";
+    extra-trusted-public-keys = "kronor-open.cachix.org-1:D1shHZh5BRkmM8RB9BaEqBURIgD/n5+u8KFXD1+DbF8=";
+  };
+
   inputs = {
     haskell-nix.url = "github:kronor-io/haskell.nix/nixpkgs-ghc-601a4d19";
     nixpkgs.url = "github:NixOS/nixpkgs/release-26.05";

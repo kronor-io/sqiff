@@ -24,8 +24,15 @@ jobs:
         env:
           GH_TOKEN_FOR_NIX: ${{ secrets.GITHUB_TOKEN }}
         run: echo "NIX_CONFIG=access-tokens = github.com=$GH_TOKEN_FOR_NIX" >> "$GITHUB_ENV"
-      # docs/readability.md: formatting, the HLint gate, the build with its
-      # warnings as errors, and every test.
+      # Reads from kronor-open and pushes what this job builds to it, as kronor's
+      # other public packages do, so the dev shell, sqiff-lint's dependencies and
+      # sqiff are built once.
+      - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+        with:
+          name: kronor-open
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      # docs/readability.md: formatting, sqiff's hopinion rules, the build with
+      # its warnings as errors, and every test.
       - name: Check
         run: nix develop --print-build-logs --command scripts/check full
       - name: Build
