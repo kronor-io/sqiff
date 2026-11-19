@@ -36,6 +36,7 @@ module Sqiff.Catalog (
     relationColumns,
     bodyErrors,
     errorText,
+    errorPosition,
     notChecked,
     serverError,
     tempTableStatements,
@@ -544,6 +545,14 @@ errorText = \case
     Errors.ScriptSessionError _ (Errors.ServerError _ message detail _ _) -> message <> maybe "" ("; " <>) detail
     Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ message detail _ _)) -> message <> maybe "" ("; " <>) detail
     e -> tshow e
+
+
+-- | Where in the SQL the server put the error, as a 1-based character index.
+errorPosition :: Errors.SessionError -> Maybe Int
+errorPosition = \case
+    Errors.ScriptSessionError _ (Errors.ServerError _ _ _ _ position) -> position
+    Errors.StatementSessionError _ _ _ _ _ (Errors.ServerStatementError (Errors.ServerError _ _ _ _ position)) -> position
+    _ -> Nothing
 
 
 -- | The column names of the given relations, by schema and name.
