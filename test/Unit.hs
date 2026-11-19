@@ -293,6 +293,12 @@ statementScanner =
         , testCase "psql output commands are skipped"
             $ splitStatements "\\set ON_ERROR_STOP on\n\\pset pager off\n\\unset QUIET\nselect 1;"
             @?= Right ["select 1"]
+        , testCase "a quote in a skipped psql command opens no string"
+            $ splitStatements "\\echo it's done\nselect 1; select 2;"
+            @?= Right ["select 1", "select 2"]
+        , testCase "each statement is a slice of the script"
+            $ splitStatements "-- setup\n\\set QUIET on\n-- the table\ncreate table a ();"
+            @?= Right ["-- the table\ncreate table a ()"]
         , testCase "other psql commands are refused"
             $ splitStatements "\\i other.sql\nselect 1;"
             @?= Left "psql's \\i cannot run outside psql"
