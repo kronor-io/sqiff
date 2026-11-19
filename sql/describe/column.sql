@@ -8,10 +8,14 @@ select
         -- Only there because a parent table has it.
         'inherited', not a.attislocal,
         'type', format_type(a.atttypid, a.atttypmod),
-        -- The schema is left out for pg_catalog, where the built-in collations are.
-        'collation', case when a.attcollation <> t.typcollation then jsonb_build_object(
-            'schema', nullif(con.nspname, 'pg_catalog'),
-            'name', co.collname
+        -- The schema is left out for pg_catalog, where the built-in collations are. Looked
+        -- up only for the columns that need it: as a join the planner may compare every
+        -- column with every collation.
+        'collation', case when a.attcollation <> t.typcollation then (
+            select jsonb_build_object('schema', nullif(con.nspname, 'pg_catalog'), 'name', co.collname)
+            from pg_collation co
+            join pg_namespace con on con.oid = co.collnamespace
+            where co.oid = a.attcollation
         ) end,
         'not_null', case
             when nn.oid is not null then jsonb_build_object(
@@ -81,8 +85,6 @@ from pg_attribute a
 join pg_class c on c.oid = a.attrelid
 join pg_namespace n on n.oid = c.relnamespace
 join pg_type t on t.oid = a.atttypid
-left join pg_collation co on co.oid = a.attcollation
-left join pg_namespace con on con.oid = co.collnamespace
 left join pg_attrdef ad on ad.adrelid = a.attrelid and ad.adnum = a.attnum
 left join pg_constraint nn on nn.conrelid = a.attrelid and nn.contype = 'n' and nn.conkey = array[a.attnum]
 where a.attnum > 0

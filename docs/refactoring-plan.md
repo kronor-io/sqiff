@@ -465,6 +465,18 @@ Guiding rules:
   `createAgain` walked every definition to find each recreated view's indexes,
   triggers and comments. `attachedIn` groups those once per schema. Planning now
   takes about 120 ms and the whole run about 1.05 s, with the same plan.
+- [x] **Two describe-side queries no longer compare everything with everything.**
+  PostgreSQL guesses an array parameter holds 10 rows, so in `depend_on.sql` it
+  compared each of 3,560 targets with each candidate edge, and checked both ends
+  against 28,000 described objects: 443 ms on the server. The caller now keeps the
+  edges whose referenced end is a target, and `edgesBetween` already dropped those
+  with an undescribed end, so the described list is no longer sent: 28 ms. In
+  `describe/column.sql` a join compared each column with every collation; the
+  collation is now looked up only for a column whose collation differs from its
+  type's: about 290 ms down to 95 ms per half. Reading both databases went from
+  887 ms to 532 ms, and the run from 1.05 s to about 0.77 s. What remains is mostly
+  `pg_get_viewdef` and `pg_get_constraintdef` on the server, and decoding in a build
+  that `cabal.project` compiles without optimisation.
 
 ## Phases (each one builds, passes tests, and ships on its own)
 

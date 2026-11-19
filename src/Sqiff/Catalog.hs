@@ -183,10 +183,10 @@ dependenciesOn _ _ [] = pure []
 dependenciesOn conn addresses targets =
     timed [i|dependenciesOn n=#{length targets}|]
         $ edgesBetween addresses
-        <$> run
-            conn
-            (Map.keys addresses, targets)
-            (Statement.unpreparable (decodeUtf8Lenient dependOnQuery) (contramap fst catalogIdsParams <> contramap snd catalogIdsParams) edgeRows)
+        . filter (\(_, referenced) -> referenced `Set.member` targetSet)
+        <$> run conn targets (Statement.unpreparable (decodeUtf8Lenient dependOnQuery) catalogIdsParams edgeRows)
+  where
+    targetSet = Set.fromList targets
 
 
 dependOnQuery :: ByteString
