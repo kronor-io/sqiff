@@ -371,7 +371,7 @@ builds this index = undoneBy [create this (None, []) ("drop index concurrently i
 -- old object, and nothing else in the plan sets them.
 restoreComments :: Target -> [ObjectId] -> [Step]
 restoreComments this objects =
-    [ undoneBy [] (configure this (createRank this.objectKey.object) (Shared, []) ("comment on " <> subject <> " is " <> literal text))
+    [ undoneBy [] (configure this (createRank this.objectKey.object) (Shared, []) [i|comment on #{subject} is #{literal text}|])
     | o <- objects
     , Just text <- [Map.lookup o this.context.keptComments]
     , Just subject <- [commentTarget o]
@@ -413,11 +413,16 @@ namesAlteredColumnOf this onTable def =
 
 extensionRecipe :: Target -> Identifier -> [Step]
 extensionRecipe this e = typed this asExtension \case
-    Added def -> [create this (Shared, []) ("create extension if not exists " <> quoted e <> " with schema " <> quoted def.schema <> " version " <> literal def.version)]
+    Added def ->
+        let schema = quoted def.schema
+            version = literal def.version
+         in [create this (Shared, []) [i|create extension if not exists #{quoted e} with schema #{schema} version #{version}|]]
     Dropped _ -> [remove this (Shared, []) ("drop extension " <> quoted e)]
     Changed old new
         | old.schema /= new.schema -> manual this "extension moved to another schema"
-        | otherwise -> [create this (Own, []) ("alter extension " <> quoted e <> " update to " <> literal new.version)]
+        | otherwise ->
+            let version = literal new.version
+             in [create this (Own, []) [i|alter extension #{quoted e} update to #{version}|]]
 
 
 tableRecipe :: Target -> QName -> [Step]
@@ -430,23 +435,23 @@ tableRecipe this t = typed this asTable \case
 createTable :: Target -> QName -> TableDef -> [Step]
 createTable this t def
     | Just p <- def.partitionOf =
-        create this (Shared, []) ("create table " <> qualified t <> " partition of " <> qualified p.parent <> " " <> p.bound) : settings
+        create this (Shared, []) [i|create table #{qualified t} partition of #{qualified p.parent} #{p.bound}|] : settings
     | otherwise =
         create
             this
             (Shared, [])
-            ( (if def.unlogged then "create unlogged table " else "create table ")
-                <> qualified t
-                <> " ("
-                <> columnList
-                <> ")"
-                <> (if null def.inherits then "" else " inherits (" <> T.intercalate ", " (map qualified def.inherits) <> ")")
-                <> maybe "" (" partition by " <>) def.partitionBy
-                <> maybe "" (" " <>) (withOptions def.options)
-            )
+            [i|create #{unloggedKeyword}table #{qualified t} (#{columnList})#{inheritsClause}#{partitionClause}#{storageClause}|]
             : settings
   where
+    unloggedKeyword, inheritsClause, partitionClause, storageClause :: Text
+    unloggedKeyword = if def.unlogged then "unlogged " else ""
+    inheritsClause = case map qualified def.inherits of
+        [] -> ""
+        parents -> [i| inherits (#{T.intercalate ", " parents})|]
+    partitionClause = maybe "" (" partition by " <>) def.partitionBy
+    storageClause = maybe "" (" " <>) (withOptions def.options)
     -- Columns a parent gives it are not declared again.
+    columnList :: Text
     columnList = case [col | col@(_, d) <- Map.findWithDefault [] t this.context.newTableColumns, not d.inheritedOnly] of
         [] -> ""
         cols -> [i|\n#{T.intercalate ",\n" (map columnLine cols)}\n|]
@@ -467,10 +472,11 @@ alterTable this t old new
             <> [create this (Shared, []) [i|alter table #{qualified t} no inherit #{qualified p}|] | p <- old.inherits, p `notElem` new.inherits]
             <> [create this (Shared, []) [i|alter table #{qualified t} inherit #{qualified p}|] | p <- new.inherits, p `notElem` old.inherits]
   where
+    toggle :: (TableDef -> Bool) -> (Text, Text) -> [Hazard] -> [Step]
     toggle setting (enable, disable) hazards
         | setting old == setting new = []
-        | setting new = [configure this tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> enable)]
-        | otherwise = [configure this tableSettingsRank (Shared, hazards) ("alter table " <> qualified t <> " " <> disable)]
+        | setting new = [configure this tableSettingsRank (Shared, hazards) [i|alter table #{qualified t} #{enable}|]]
+        | otherwise = [configure this tableSettingsRank (Shared, hazards) [i|alter table #{qualified t} #{disable}|]]
     optionKey = T.takeWhile (/= '=')
     removedKeys = [k | o <- old.options, let k = optionKey o, k `notElem` map optionKey new.options]
     newOptions = T.intercalate ", " new.options
@@ -497,8 +503,8 @@ columnRecipe this t c = case traverse asColumn this.objectChange of
                 hazards =
                     [MayFail "a not null column without a default fails on a table with rows" | failsOnRows parsed]
                         <> [h | rewrites, h <- [MayRewriteTable, LongLock]]
-             in [create this (Shared, hazards) (alter <> "add column " <> quoted c <> " " <> columnSql parsed)]
-    Just (Dropped _) -> [remove this (Shared, [DeletesData]) (alter <> "drop column " <> quoted c)]
+             in [create this (Shared, hazards) [i|#{alter}add column #{quoted c} #{columnSql parsed}|]]
+    Just (Dropped _) -> [remove this (Shared, [DeletesData]) [i|#{alter}drop column #{quoted c}|]]
     Just (Changed old new) -> alterColumn old new
   where
     alter = [i|alter table #{qualified t} |]
@@ -509,6 +515,8 @@ columnRecipe this t c = case traverse asColumn this.objectChange of
             serialToIdentity = isNothing (identityKindOf old) && isJust (identityKindOf new) && isJust (serialSequence old)
             identityToSerial = isJust (identityKindOf old) && isNothing (identityKindOf new) && isJust (serialSequence new)
             sequenceMoves = serialToIdentity || identityToSerial
+            newType = typeText new.colType
+            collate = maybe "" ((" collate " <>) . collationSql) new.collation
          in [create this (Shared, []) (col <> "drop default") | typeChanged, isJust (defaultExpr old)]
                 <> [ create
                         this
@@ -516,19 +524,19 @@ columnRecipe this t c = case traverse asColumn this.objectChange of
                         , [MayRewriteTable, LongLock, ConversionMayFail]
                             <> [MayFail "recreating a view fails when its query relies on the old type; then edit the view" | Map.member (t, c) this.context.viewsAround]
                         )
-                        (aroundViews (col <> "type " <> typeText new.colType <> maybe "" ((" collate " <>) . collationSql) new.collation <> " using " <> quoted c <> "::" <> typeText new.colType))
+                        (aroundViews [i|#{col}type #{newType}#{collate} using #{quoted c}::#{newType}|])
                    | typeChanged
                    ]
                 <> case defaultExpr new of
                     _ | sequenceMoves -> []
-                    Just e | defaultChanged || (typeChanged && isJust (defaultExpr old)) -> [create this (Shared, []) (col <> "set default " <> e)]
+                    Just e | defaultChanged || (typeChanged && isJust (defaultExpr old)) -> [create this (Shared, []) [i|#{col}set default #{e}|]]
                     Nothing | defaultChanged && not typeChanged -> [create this (Shared, []) (col <> "drop default")]
                     _ -> []
                 <> notNullSteps old new
                 <> case (identityKindOf old, identityKindOf new) of
-                    _ | serialToIdentity, Just k <- identityKindOf new -> [create this (Shared, []) (toIdentity (identityKindSql k <> " as identity" <> identityOptionsSql (identityOptionsOf new)))]
+                    _ | serialToIdentity, Just k <- identityKindOf new -> [create this (Shared, []) (toIdentity [i|#{identityKindSql k} as identity#{identityOptionsSql (identityOptionsOf new)}|])]
                     _ | identityToSerial -> [create this (Shared, []) (toSerial (typeText new.colType))]
-                    (Nothing, Just k) -> [create this (Shared, []) (col <> "add generated " <> identityKindSql k <> " as identity" <> identityOptionsSql (identityOptionsOf new))]
+                    (Nothing, Just k) -> [create this (Shared, []) [i|#{col}add generated #{identityKindSql k} as identity#{identityOptionsSql (identityOptionsOf new)}|]]
                     (Just _, Nothing) -> [create this (Shared, []) (col <> "drop identity")]
                     (Just a, Just b) ->
                         let clauses = ["set generated " <> identityKindSql b | a /= b] <> identityOptionChanges (identityOptionsOf old) (identityOptionsOf new)
@@ -547,6 +555,7 @@ columnRecipe this t c = case traverse asColumn this.objectChange of
     tableLit = literal (qualified t)
     columnLit = literal (nameText c)
     serialName = let tableName = nameText t.name in qualified (QName t.schema (identifier [i|#{tableName}_#{nameText c}_seq|]))
+    toIdentity :: Text -> Text
     toIdentity k =
         doBlock
             [i|
@@ -592,9 +601,10 @@ end |]
                     (True, False) -> manual this "a validated not null constraint cannot be made NOT VALID again"
                     _ -> []
         (False, False) -> []
-    named d = maybe "" (\n -> "constraint " <> quoted n <> " ") (notNullName d)
+    named :: ColumnDef -> Text
+    named d = maybe "" (\n -> [i|constraint #{quoted n} |]) (notNullName d)
     onNotNull name action rest = case name of
-        Just n -> alter <> action <> " " <> quoted n <> rest
+        Just n -> [i|#{alter}#{action} #{quoted n}#{rest}|]
         Nothing ->
             let command = literal [i|#{T.replace "%" "%%" (alter <> action)} %I#{T.replace "%" "%%" rest}|]
                 tableLiteral = literal (qualified t)
@@ -610,62 +620,67 @@ tableConstraintChange this t c = \case
     Added def -> addConstraint def <> restoreComments this [TableConstraint t c]
     Dropped old -> [dropConstraint old]
     Changed old new
-        | validates old new -> [undoneBy [] $ create this (Own, []) (alterT <> "validate constraint " <> quoted c)]
+        | validates old new -> [undoneBy [] $ create this (Own, []) [i|#{alterT}validate constraint #{quoted c}|]]
         | validates new old -> manual this "a validated constraint cannot be made NOT VALID again"
         | otherwise -> dropConstraint old : addConstraint new <> restoreComments this [TableConstraint t c, Index (QName t.schema c)]
   where
+    alterT :: Text
     alterT = [i|alter table #{qualified t} |]
     dropConstraint old =
         remove
             this
             (Shared, [MayFail "other objects depend on it, such as foreign keys; drop them first" | dependedOn] <> locksOther old)
-            (alterT <> "drop constraint " <> quoted c)
+            [i|#{alterT}drop constraint #{quoted c}|]
     dependedOn = any (`Set.member` this.context.withDependents) [TableConstraint t c, Index (QName t.schema c)]
     locksOther def = [LocksOther (qualified r.table) | Just r <- [def.references], r.table /= t]
-    plain hazards def clause = create this (Shared, hazards <> locksOther def) (alterT <> "add constraint " <> quoted c <> " " <> clause)
+    plain hazards def clause = create this (Shared, hazards <> locksOther def) [i|#{alterT}add constraint #{quoted c} #{clause}|]
     addConstraint def
         | t `Set.member` this.context.newTables = [plain [] def def.clause]
         | validatable def && def.validity == NotValidated = [plain [] def def.clause]
         | validatable def =
             [ plain [] def (def.clause <> notValid)
-            , undoneBy [] $ create this (Own, []) (alterT <> "validate constraint " <> quoted c)
+            , undoneBy [] $ create this (Own, []) [i|#{alterT}validate constraint #{quoted c}|]
             ]
         | Just (keyword, cols) <- simpleKey def
         , not (t `Set.member` this.context.partitionedTables) =
             let build = buildIndex this (None, [IndexBuild]) (concurrentBuild (QName t.schema c) [i|create unique index concurrently #{quoted c} on #{qualified t} (#{cols})|])
              in [ builds this (QName t.schema c) build
                 , -- Dropping the constraint drops its index, which the build before made.
-                  undoneBy [create this (Shared, []) (alterT <> "drop constraint " <> quoted c), build]
-                    $ create this (Shared, []) (alterT <> "add constraint " <> quoted c <> " " <> keyword <> " using index " <> quoted c)
+                  undoneBy [create this (Shared, []) [i|#{alterT}drop constraint #{quoted c}|], build]
+                    $ create this (Shared, []) [i|#{alterT}add constraint #{quoted c} #{keyword} using index #{quoted c}|]
                 ]
         | otherwise = [plain [LongLock, IndexBuild] def def.clause]
     validatable def = def.kind `elem` [Check, ForeignKey]
     -- A primary key or unique constraint on plain columns and nothing more, which an
     -- index built beforehand can back.
+    simpleKey :: ConstraintDef -> Maybe (Text, Text)
     simpleKey def = do
         keyword <- case def.kind of
             PrimaryKey -> Just "PRIMARY KEY"
             Unique -> Just "UNIQUE"
             _ -> Nothing
         let cols = T.intercalate ", " (map quoted def.columns)
-        guard (not (null def.columns) && def.clause == keyword <> " (" <> cols <> ")")
+        guard (not (null def.columns) && def.clause == [i|#{keyword} (#{cols})|])
         pure (keyword, cols)
 
 
 domainConstraintRecipe :: Target -> TypeName -> Identifier -> [Step]
 domainConstraintRecipe this d c = typed this asConstraint \case
     Added def -> add def <> restoreComments this [DomainConstraint d c]
-    Dropped _ -> [remove this (Shared, []) (alterD <> "drop constraint " <> quoted c)]
+    Dropped _ -> [remove this (Shared, []) [i|#{alterD}drop constraint #{quoted c}|]]
     Changed old new
         | validates old new -> [validate]
         | validates new old -> manual this "a validated constraint cannot be made NOT VALID again"
-        | otherwise -> remove this (Shared, []) (alterD <> "drop constraint " <> quoted c) : add new <> restoreComments this [DomainConstraint d c]
+        | otherwise -> remove this (Shared, []) [i|#{alterD}drop constraint #{quoted c}|] : add new <> restoreComments this [DomainConstraint d c]
   where
+    alterD :: Text
     alterD = [i|alter domain #{typeText d} |]
-    validate = undoneBy [] $ create this (Own, []) (alterD <> "validate constraint " <> quoted c)
+    validate = undoneBy [] $ create this (Own, []) [i|#{alterD}validate constraint #{quoted c}|]
     add def
-        | def.validity == NotValidated = [create this (Shared, []) (alterD <> "add constraint " <> quoted c <> " " <> def.clause)]
-        | otherwise = [create this (Shared, []) (alterD <> "add constraint " <> quoted c <> " " <> def.clause <> notValid), validate]
+        | def.validity == NotValidated = [create this (Shared, []) (addClause def.clause)]
+        | otherwise = [create this (Shared, []) (addClause (def.clause <> notValid)), validate]
+    addClause :: Text -> Text
+    addClause clause = [i|#{alterD}add constraint #{quoted c} #{clause}|]
 
 
 indexRecipe :: Target -> QName -> [Step]
@@ -683,6 +698,7 @@ indexRecipe this ix = typed this asIndex \case
             remove this (None, []) ("drop index concurrently if exists " <> qualified ix) : addIndex new
         | otherwise =
             let tmp = identifier (takeBytes 59 (nameText ix.name) <> "_new")
+                tmpIndex = QName ix.schema tmp
                 oldName = quoted ix.name
              in [ builds this (QName ix.schema tmp)
                     $ buildIndex
@@ -690,8 +706,8 @@ indexRecipe this ix = typed this asIndex \case
                         (None, [IndexBuild])
                         (concurrentBuild (QName ix.schema tmp) (replaceInCode [i| INDEX #{oldName} ON |] [i| INDEX CONCURRENTLY #{quoted tmp} ON |] new.statement))
                 , undoneBy (addIndex old <> restoreComments this [Index ix]) $ dropToRecreate this (None, []) ("drop index concurrently if exists " <> qualified ix)
-                , undoneBy [create this (Shared, []) ("alter index " <> qualified ix <> " rename to " <> quoted tmp)]
-                    $ create this (Shared, []) ("alter index " <> qualified (QName ix.schema tmp) <> " rename to " <> oldName)
+                , undoneBy [create this (Shared, []) [i|alter index #{qualified ix} rename to #{quoted tmp}|]]
+                    $ create this (Shared, []) [i|alter index #{qualified tmpIndex} rename to #{oldName}|]
                 ]
     addIndex def
         | def.partitioned =
@@ -710,18 +726,22 @@ sequenceRecipe this s = typed this asSequence \case
     -- Made by the column's change to serial; it only needs its options.
     Added def
         | s `Set.member` this.context.convertedSequences ->
-            [ownSequence this (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions def <> " owned by " <> maybe "none" ownerSql def.ownedBy)]
+            [ownSequence this (Shared, []) (alterSequence def)]
     Added def ->
-        create this (Shared, []) ("create sequence " <> qualified s <> " " <> sequenceOptions def)
-            : [ownSequence this (Shared, []) ("alter sequence " <> qualified s <> " owned by " <> ownerSql o) | Just o <- [def.ownedBy]]
+        create this (Shared, []) [i|create sequence #{qualified s} #{sequenceOptions def}|]
+            : [ownSequence this (Shared, []) [i|alter sequence #{qualified s} owned by #{ownerSql o}|] | Just o <- [def.ownedBy]]
     Dropped def
         | Just o <- def.ownedBy, ownedByDropped o -> []
         -- Dropped by the column's change to identity.
         | s `Set.member` this.context.convertedSequences -> []
         | otherwise -> [remove this (Shared, []) ("drop sequence " <> qualified s)]
-    Changed _ new -> [ownSequence this (Shared, []) ("alter sequence " <> qualified s <> " " <> sequenceOptions new <> " owned by " <> maybe "none" ownerSql new.ownedBy)]
+    Changed _ new -> [ownSequence this (Shared, []) (alterSequence new)]
   where
-    ownerSql (t, c) = qualified t <> "." <> quoted c
+    alterSequence def =
+        let owner = maybe "none" ownerSql def.ownedBy
+         in [i|alter sequence #{qualified s} #{sequenceOptions def} owned by #{owner}|]
+    ownerSql :: (QName, Identifier) -> Text
+    ownerSql (t, c) = [i|#{qualified t}.#{quoted c}|]
     -- Dropping the column, or its table, drops the sequence with it.
     ownedByDropped (t, c) = t `Set.member` this.context.droppedTables || (t, c) `Set.member` this.context.droppedColumns
 
@@ -733,7 +753,7 @@ typeRecipe this typ = typed this asType \case
     Dropped _ -> [remove this (Shared, []) ("drop type " <> t)]
     Changed (EnumType oldLabels) (EnumType newLabels)
         | oldLabels `L.isSubsequenceOf` newLabels ->
-            [ create this (Own, []) ("alter type " <> t <> " add value " <> literal label <> placement)
+            [ create this (Own, []) [i|alter type #{t} add value #{literal label}#{placement}|]
             | (label, position) <- zip newLabels [0 :: Int ..]
             , label `notElem` oldLabels
             , let placement = case previous position newLabels of
@@ -744,9 +764,11 @@ typeRecipe this typ = typed this asType \case
   where
     t = typeText typ
     createType = \case
-        DomainType base notNull dflt -> T.unwords (["create domain " <> t <> " as " <> typeText base] <> ["not null" | notNull] <> ["default " <> d | Just d <- [dflt]])
-        def@(CompositeType _) -> "create type " <> t <> " as " <> fromMaybe "" (T.stripPrefix "composite " (printed (TypeDefinition def)))
-        def -> "create type " <> t <> " as " <> printed (TypeDefinition def)
+        DomainType base notNull dflt -> T.unwords ([[i|create domain #{t} as #{typeText base}|]] <> ["not null" | notNull] <> ["default " <> d | Just d <- [dflt]])
+        def@(CompositeType _) ->
+            let fields = fromMaybe "" (T.stripPrefix "composite " (printed (TypeDefinition def)))
+             in [i|create type #{t} as #{fields}|]
+        def -> [i|create type #{t} as #{printed (TypeDefinition def)}|]
     -- The label before the one at @position@, if any.
     previous position labels = if position == 0 then Nothing else L.headMaybe (L.drop (position - 1) labels)
 
@@ -835,7 +857,7 @@ triggerRecipe this t n = case textual this of
     dropTrigger = \case
         DropPhase -> remove this (Shared, []) dropSql
         CreatePhase -> dropToRecreate this (Shared, []) dropSql
-    dropSql = "drop trigger " <> quoted n <> " on " <> qualified t
+    dropSql = [i|drop trigger #{quoted n} on #{qualified t}|]
 
 
 policyRecipe :: Target -> QName -> Identifier -> [Step]
@@ -846,8 +868,8 @@ policyRecipe this t n = case textual this of
         | otherwise -> [dropToRecreate this (Shared, []) dropPolicy, createPolicy new] <> restoreComments this [Policy t n]
     Dropped _ -> [remove this (Shared, []) dropPolicy]
   where
-    dropPolicy = "drop policy " <> quoted n <> " on " <> qualified t
-    createPolicy def = create this (Shared, []) ("create policy " <> quoted n <> " on " <> qualified t <> "\n" <> def)
+    dropPolicy = [i|drop policy #{quoted n} on #{qualified t}|]
+    createPolicy def = create this (Shared, []) [i|create policy #{quoted n} on #{qualified t}\n#{def}|]
 
 
 privileges :: ObjectKey -> ObjectId -> Change Definition -> [Step]
@@ -955,11 +977,15 @@ grantDepth held = go Set.empty
 -- | The statement for a grant edit on @onObject@.
 grantEditSql :: Text -> GrantEdit -> Text
 grantEditSql onObject = \case
-    RevokeGrant k -> "revoke " <> onTarget k <> " from " <> granteeSql k.grantee
-    RevokeGrantOption k -> "revoke grant option for " <> onTarget k <> " from " <> granteeSql k.grantee
-    GiveGrant k grantable -> "grant " <> onTarget k <> " to " <> granteeSql k.grantee <> (if grantable then " with grant option" else "")
+    RevokeGrant k -> [i|revoke #{onTarget k} from #{granteeOf k}|]
+    RevokeGrantOption k -> [i|revoke grant option for #{onTarget k} from #{granteeOf k}|]
+    GiveGrant k grantable -> [i|grant #{onTarget k} to #{granteeOf k}#{withGrantOption grantable}|]
   where
-    onTarget k = k.privilege <> " on " <> onObject
+    onTarget, granteeOf :: GrantKey -> Text
+    onTarget k = let granted = k.privilege in [i|#{granted} on #{onObject}|]
+    granteeOf k = granteeSql k.grantee
+    withGrantOption :: Bool -> Text
+    withGrantOption grantable = if grantable then " with grant option" else ""
 
 
 comment :: Context -> ObjectKey -> Change Definition -> [Step]
@@ -967,8 +993,8 @@ comment ctx key change = case (commentTarget key.object, printed <$> change) of
     (Nothing, _) -> []
     (Just _, Dropped _) | key.object `Set.member` ctx.droppedObjects -> []
     (Just subject, Dropped _) -> [step (subject <> " is null")]
-    (Just subject, Added new) -> [step (subject <> " is " <> literal new)]
-    (Just subject, Changed _ new) -> [step (subject <> " is " <> literal new)]
+    (Just subject, Added new) -> [step [i|#{subject} is #{literal new}|]]
+    (Just subject, Changed _ new) -> [step [i|#{subject} is #{literal new}|]]
   where
     step sql =
         Step{phase = CreatePhase, role = Configures, rank = commentRank, object = key.object, sql = "comment on " <> sql, txn = Shared, hazards = [], key, change, undo = UndoObject}
@@ -980,15 +1006,15 @@ commentTarget = \case
     Table t -> Just ("table " <> qualified t)
     View t -> Just ("view " <> qualified t)
     MaterializedView t -> Just ("materialized view " <> qualified t)
-    Column t c -> Just ("column " <> qualified t <> "." <> quoted c)
-    OtherColumn OfView t c -> Just ("column " <> qualified t <> "." <> quoted c)
-    OtherColumn OfMaterializedView t c -> Just ("column " <> qualified t <> "." <> quoted c)
+    Column t c -> Just [i|column #{qualified t}.#{quoted c}|]
+    OtherColumn OfView t c -> Just [i|column #{qualified t}.#{quoted c}|]
+    OtherColumn OfMaterializedView t c -> Just [i|column #{qualified t}.#{quoted c}|]
     Index ix -> Just ("index " <> qualified ix)
     Sequence s -> Just ("sequence " <> qualified s)
-    TableConstraint t c -> Just ("constraint " <> quoted c <> " on " <> qualified t)
-    DomainConstraint d c -> Just ("constraint " <> quoted c <> " on domain " <> typeText d)
-    Trigger t n -> Just ("trigger " <> quoted n <> " on " <> qualified t)
-    Policy t n -> Just ("policy " <> quoted n <> " on " <> qualified t)
+    TableConstraint t c -> Just [i|constraint #{quoted c} on #{qualified t}|]
+    DomainConstraint d c -> Just [i|constraint #{quoted c} on domain #{typeText d}|]
+    Trigger t n -> Just [i|trigger #{quoted n} on #{qualified t}|]
+    Policy t n -> Just [i|policy #{quoted n} on #{qualified t}|]
     Routine Function q args -> Just [i|function #{qualified q}(#{argList args})|]
     Routine Procedure q args -> Just [i|procedure #{qualified q}(#{argList args})|]
     Routine Aggregate q args -> Just [i|aggregate #{qualified q}(#{argList args})|]
@@ -1013,9 +1039,9 @@ columnSql c =
     T.unwords
         $ [typeText c.colType]
         <> ["collate " <> collationSql co | Just co <- [c.collation]]
-        <> ["generated always as (" <> e <> ") " <> storageSql storage | Just (storage, e) <- [generatedOf c]]
-        <> ["generated " <> identityKindSql kind <> " as identity" <> identityOptionsSql options | IdentityColumn kind options <- [c.value]]
-        <> [maybe "" (\n -> "constraint " <> quoted n <> " ") (notNullName c) <> "not null" | isNotNull c]
+        <> [[i|generated always as (#{e}) #{storageSql storage}|] | Just (storage, e) <- [generatedOf c]]
+        <> [[i|generated #{identityKindSql kind} as identity#{identityOptionsSql options}|] | IdentityColumn kind options <- [c.value]]
+        <> [maybe "" (\n -> [i|constraint #{quoted n} |]) (notNullName c) <> "not null" | isNotNull c]
         <> ["default " <> e | Just e <- [defaultExpr c]]
 
 
@@ -1046,10 +1072,10 @@ identityOptionChanges old new =
 -- | A view's name, options and query, as @create view@ takes them after its keywords.
 viewSql :: QName -> ViewDef -> Text
 viewSql v def =
-    qualified v
-        <> foldMap (\o -> " with (" <> T.intercalate ", " o <> ")") def.options
-        <> " as\n"
-        <> T.dropWhileEnd (\ch -> ch == ';' || ch == ' ' || ch == '\n') (T.stripStart def.query)
+    let withClause :: Text
+        withClause = foldMap (\o -> [i| with (#{T.intercalate ", " o})|]) def.options
+        query = T.dropWhileEnd (\ch -> ch == ';' || ch == ' ' || ch == '\n') (T.stripStart def.query)
+     in [i|#{qualified v}#{withClause} as\n#{query}|]
 
 
 -- | A concurrent index build that first fails when an invalid index of that name is left
@@ -1057,22 +1083,22 @@ viewSql v def =
 concurrentBuild :: QName -> Text -> Text
 concurrentBuild index build =
     let regclass = literal (qualified index)
-        message = literal ("index " <> qualified index <> " is invalid from an earlier failed build; drop it first")
-     in doBlock
-            ( T.unlines
-                [ ""
-                , "begin"
-                , "    if exists ("
-                , "        select from pg_index"
-                , [i|        where indexrelid = to_regclass(#{regclass}) and not indisvalid|]
-                , "    ) then"
-                , [i|        raise exception using message = #{message};|]
-                , "    end if;"
-                , "end"
-                ]
-            )
-            <> ";\n\n"
-            <> build
+        message = literal [i|index #{qualified index} is invalid from an earlier failed build; drop it first|]
+        failIfInvalid =
+            doBlock
+                ( T.unlines
+                    [ ""
+                    , "begin"
+                    , "    if exists ("
+                    , "        select from pg_index"
+                    , [i|        where indexrelid = to_regclass(#{regclass}) and not indisvalid|]
+                    , "    ) then"
+                    , [i|        raise exception using message = #{message};|]
+                    , "    end if;"
+                    , "end"
+                    ]
+                )
+     in [i|#{failIfInvalid};\n\n#{build}|]
 
 
 -- | The longest prefix of at most @n@ bytes in UTF-8.
