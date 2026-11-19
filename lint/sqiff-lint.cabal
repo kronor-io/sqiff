@@ -28,6 +28,7 @@ library
     , containers
     , ghc-lib-parser
     , hopinion
+    , string-interpolate
     , syb
     , text
 

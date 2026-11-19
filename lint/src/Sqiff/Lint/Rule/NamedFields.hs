@@ -1,10 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 
 -- | H1: a constructor with many fields is built by field name.
 module Sqiff.Lint.Rule.NamedFields (rule) where
 
 import Data.Char (isUpper)
 import Data.Map.Strict qualified as Map
+import Data.String.Interpolate (iii, __i)
 import Data.Text qualified as T
 import GHC.Hs
 import GHC.Types.SrcLoc (RealSrcSpan, SrcSpan (..))
@@ -19,13 +21,21 @@ rule :: Rule
 rule =
     Rule
         { ruleId = RuleId "SqiffNamedFields"
-        , ruleText = "Apply a constructor to at most four positional arguments; name the fields beyond that."
+        , ruleText =
+            [iii|
+                Apply a constructor to at most four positional arguments; name the fields
+                beyond that.
+            |]
         , ruleWhy =
-            "Past a handful of arguments, a reader has to count to know which value is which, and two fields of one type can be swapped without the compiler noticing.\n\
-            \Field names say at the call which value is which."
+            [__i|
+                Past a handful of arguments, a reader has to count to know which value is which, and two fields of one type can be swapped without the compiler noticing.
+                Field names say at the call which value is which.
+            |]
         , ruleFix =
-            "Give the type named fields and build it with them: Step{phase = CreatePhase, role = Creates, ...}.\n\
-            \For tests, a builder with defaults and a record update for the fields the test is about."
+            [__i|
+                Give the type named fields and build it with them: Step{phase = CreatePhase, role = Creates, ...}.
+                For tests, a builder with defaults and a record update for the fields the test is about.
+            |]
         , ruleImpl = RuleImplModule (ModuleCheckOverNodes check)
         }
 

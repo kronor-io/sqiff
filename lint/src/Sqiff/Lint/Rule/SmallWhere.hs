@@ -1,9 +1,11 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 
 -- | R1: a function's where block does not hide a program of its own.
 module Sqiff.Lint.Rule.SmallWhere (rule) where
 
+import Data.String.Interpolate (iii, __i)
 import Data.Text qualified as T
 import GHC.Hs
 import GHC.Types.SrcLoc (unLoc)
@@ -18,14 +20,22 @@ rule :: Rule
 rule =
     Rule
         { ruleId = RuleId "SqiffSmallWhere"
-        , ruleText = "Keep a where block to at most twelve bindings; give the stages of a bigger one names of their own."
+        , ruleText =
+            [iii|
+                Keep a where block to at most twelve bindings; give the stages of a bigger
+                one names of their own.
+            |]
         , ruleWhy =
-            "Bindings in a where block see every argument and every other binding, so a reader cannot tell what each depends on without reading them all.\n\
-            \A large block is usually several jobs sharing one scope, as findingsFor's thirty-nine bindings were."
+            [__i|
+                Bindings in a where block see every argument and every other binding, so a reader cannot tell what each depends on without reading them all.
+                A large block is usually several jobs sharing one scope, as findingsFor's thirty-nine bindings were.
+            |]
         , ruleFix =
-            "Find the stages the block computes and make each a top-level function with a signature and explicit arguments.\n\
-            \Keep small helpers local; the function that remains should read as the list of its stages.\n\
-            \Where the size is the right shape, say why in an [allow:SqiffSmallWhere] annotation."
+            [__i|
+                Find the stages the block computes and make each a top-level function with a signature and explicit arguments.
+                Keep small helpers local; the function that remains should read as the list of its stages.
+                Where the size is the right shape, say why in an [allow:SqiffSmallWhere] annotation.
+            |]
         , ruleImpl = RuleImplModule (ModuleCheckOverNodes check)
         }
 

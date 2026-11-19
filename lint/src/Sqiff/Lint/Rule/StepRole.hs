@@ -1,9 +1,11 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 
 -- | R3 for steps: what a step does is in its role, not in its SQL.
 module Sqiff.Lint.Rule.StepRole (rule) where
 
 import Data.Maybe (mapMaybe)
+import Data.String.Interpolate (__i)
 import Data.Text (Text)
 import GHC.Hs
 import GHC.Types.SrcLoc (unLoc)
@@ -20,12 +22,16 @@ rule =
         { ruleId = RuleId "SqiffStepRole"
         , ruleText = "Decide what a step does from its role, not by reading its SQL."
         , ruleWhy =
-            "A step's SQL is output. Code that searches it for a phrase breaks silently when the SQL is worded differently, and hides what it is asking.\n\
-            \The builder that makes a step knows what it does, and says so in its role."
+            [__i|
+                A step's SQL is output. Code that searches it for a phrase breaks silently when the SQL is worded differently, and hides what it is asking.
+                The builder that makes a step knows what it does, and says so in its role.
+            |]
         , ruleFix =
-            "Read the step's role, or the hazard or field that holds the fact.\n\
-            \If no field holds it, add one where the step is built.\n\
-            \Code that only writes the SQL out, such as adding the semicolon, can carry an [allow:SqiffStepRole] annotation saying so."
+            [__i|
+                Read the step's role, or the hazard or field that holds the fact.
+                If no field holds it, add one where the step is built.
+                Code that only writes the SQL out, such as adding the semicolon, can carry an [allow:SqiffStepRole] annotation saying so.
+            |]
         , ruleImpl = RuleImplModule (ModuleCheckOverNodes check)
         }
 

@@ -1,10 +1,12 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 
 -- | R2: a top-level signature does not pass wide or nested tuples.
 module Sqiff.Lint.Rule.NamedTuples (rule) where
 
 import Data.Generics (listify)
+import Data.String.Interpolate (iii, __i)
 import Data.Text qualified as T
 import GHC.Hs
 import GHC.Types.SrcLoc (GenLocated (..), unLoc)
@@ -20,13 +22,21 @@ rule :: Rule
 rule =
     Rule
         { ruleId = RuleId "SqiffNamedTuples"
-        , ruleText = "A top-level signature takes and returns no tuple of three or more, and no tuple inside a tuple."
+        , ruleText =
+            [iii|
+                A top-level signature takes and returns no tuple of three or more, and no
+                tuple inside a tuple.
+            |]
         , ruleWhy =
-            "A tuple's parts are told apart only by position, so every caller has to remember which is which, and two parts of one type can be swapped silently.\n\
-            \A pair is often obvious; three parts, or tuples inside tuples, rarely are."
+            [__i|
+                A tuple's parts are told apart only by position, so every caller has to remember which is which, and two parts of one type can be swapped silently.
+                A pair is often obvious; three parts, or tuples inside tuples, rarely are.
+            |]
         , ruleFix =
-            "Make a record whose field names say what each part is, as ComparisonInputs{source, target, bodyChecks} replaced ((Schema, Dependencies), (Schema, Dependencies), checks).\n\
-            \Keep a local intermediate as a tuple if it never crosses a function boundary."
+            [__i|
+                Make a record whose field names say what each part is, as ComparisonInputs{source, target, bodyChecks} replaced ((Schema, Dependencies), (Schema, Dependencies), checks).
+                Keep a local intermediate as a tuple if it never crosses a function boundary.
+            |]
         , ruleImpl = RuleImplModule (ModuleCheckFromSource check)
         }
 
