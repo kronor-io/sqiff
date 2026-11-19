@@ -424,6 +424,14 @@ Guiding rules:
     and the round trip could not notice. Fixtures `table-inherits` and
     `table-inherit-changed` cover it.
 
+- [x] **Range-type options (Codex 28, in part).**
+  - A range type records every option `create type … as range` takes, defaults left out:
+    subtype, operator class, collation, canonical and difference functions, and the
+    multirange type's name. Before, only the subtype was kept, so a new range type
+    lost the rest. `range-type-options` covers it. The `types-added` golden now names
+    the multirange type.
+  - A changed range type remains a step to write by hand; PostgreSQL cannot alter one.
+
 ## Phases (each one builds, passes tests, and ships on its own)
 
 **Phase 0: safety net.**

@@ -30,7 +30,25 @@ select
         )
         when 'r' then jsonb_build_object(
             'kind', 'range',
-            'subtype', (select format_type(r.rngsubtype, null) from pg_range r where r.rngtypid = t.oid)
+            'subtype', (select format_type(r.rngsubtype, null) from pg_range r where r.rngtypid = t.oid),
+            -- Every option create type ... as range takes, in its order, the defaults left out.
+            'options', (
+                select (select jsonb_agg(o) from jsonb_array_elements(jsonb_build_array(
+                    jsonb_build_array('subtype', format_type(r.rngsubtype, null)),
+                    case when not opc.opcdefault then jsonb_build_array('subtype_opclass', quote_ident(opn.nspname) || '.' || quote_ident(opc.opcname)) end,
+                    case when r.rngcollation <> 0 and r.rngcollation <> st.typcollation then jsonb_build_array('collation', quote_ident(cn.nspname) || '.' || quote_ident(co.collname)) end,
+                    case when r.rngcanonical <> 0 then jsonb_build_array('canonical', r.rngcanonical::regproc::text) end,
+                    case when r.rngsubdiff <> 0 then jsonb_build_array('subtype_diff', r.rngsubdiff::regproc::text) end,
+                    jsonb_build_array('multirange_type_name', format_type(r.rngmultitypid, null))
+                )) o where o <> 'null'::jsonb)
+                from pg_range r
+                join pg_type st on st.oid = r.rngsubtype
+                join pg_opclass opc on opc.oid = r.rngsubopc
+                join pg_namespace opn on opn.oid = opc.opcnamespace
+                left join pg_collation co on co.oid = r.rngcollation
+                left join pg_namespace cn on cn.oid = co.collnamespace
+                where r.rngtypid = t.oid
+            )
         )
     end::text as definition
 from pg_type t

@@ -8,5 +8,5 @@ create type app.pair as (x integer, "Y" text);
 create domain app.positive as integer not null default 1;
 
 -- type app.span
-create type app.span as range (subtype = double precision);
+create type app.span as range (subtype = double precision, multirange_type_name = app.span_multirange);
 

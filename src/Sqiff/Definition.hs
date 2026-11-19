@@ -667,8 +667,9 @@ data TypeDef
       DomainType TypeName Bool (Maybe Text)
     | -- | The attributes and their types.
       CompositeType [(Identifier, TypeName)]
-    | -- | The subtype.
-      RangeType TypeName
+    | -- | The options @create type ... as range@ takes, the subtype first, the defaults
+      -- left out.
+      RangeType [(Text, Text)]
     deriving stock (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -678,7 +679,7 @@ typeDefText = \case
     EnumType labels -> "enum (" <> T.intercalate ", " (map literal labels) <> ")"
     DomainType base notNull dflt -> T.unwords (["domain " <> typeText base] <> ["not null" | notNull] <> ["default " <> d | Just d <- [dflt]])
     CompositeType attributes -> "composite (" <> T.intercalate ", " [quoted a <> " " <> typeText t | (a, t) <- attributes] <> ")"
-    RangeType subtype -> "range (subtype = " <> typeText subtype <> ")"
+    RangeType options -> "range (" <> T.intercalate ", " [k <> " = " <> v | (k, v) <- options] <> ")"
 
 
 instance FromJSON SequenceDef where
@@ -710,7 +711,9 @@ instance FromJSON TypeDef where
             "enum" -> EnumType <$> o .:? "labels" .!= []
             "domain" -> DomainType <$> (typeName <$> o .: "base") <*> o .: "not_null" <*> o .:? "default"
             "composite" -> CompositeType . map (\(a, t) -> (identifier a, typeName t)) <$> o .:? "attributes" .!= []
-            "range" -> RangeType . typeName <$> o .: "subtype"
+            "range" -> do
+                subtype <- o .: "subtype"
+                RangeType . filter (not . T.null . snd) <$> o .:? "options" .!= [("subtype", subtype)]
             other -> fail ("unknown kind of type " <> T.unpack other)
 
 
