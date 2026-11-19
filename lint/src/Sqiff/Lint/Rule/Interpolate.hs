@@ -27,7 +27,7 @@ rule =
             \An interpolated string reads as the text it produces, with the values in their places."
         , ruleFix =
             "Write the whole text as [i|...|] from Data.String.Interpolate, with each value as #{value}.\n\
-            \Inside #{} keep to names and function applications; bind a record field or an operator expression to a name first.\n\
+            \#{} takes any expression, record fields included: #{qualified t}, #{def.statement}; bind a long one to a name so the text stays readable.\n\
             \Joining lists, or two values with no literal between them, is not text building: leave <> there."
         , ruleImpl = RuleImplModule (ModuleCheckOverNodes check)
         }

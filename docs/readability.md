@@ -112,6 +112,24 @@ A refactor that depends on an invariant — every retyped column is a key of
 the code that produces the value. Comments explain contracts, order and surprises;
 they do not restate the code, and not every helper needs one.
 
+### R8. Write text as the text it makes
+
+A chain of `<>` between quoted pieces makes the reader assemble the text in their
+head, and a missing space between two pieces is easy to miss. Interpolation shows
+the text with its values in place.
+
+```haskell
+-- before
+"alter table " <> qualified t <> " alter column " <> quoted c <> " drop default"
+-- after
+[i|alter table #{qualified t} alter column #{quoted c} drop default|]
+```
+
+`#{}` takes any expression, record fields included (string-interpolate 1.0 parses
+it with GHC's own parser); bind a long one to a name so the text stays readable. A
+string literal whose type the chain used to fix may need a signature. Joining lists, or values with no literal between them, is not
+building text: keep `<>` there.
+
 ## Haskell
 
 ### H1. Build records with many fields by field name
@@ -177,6 +195,7 @@ performance thresholds in CI. Each of these would be met by worse code.
 | R2 | `SqiffNamedTuples`: no tuple of three or more, or tuple in a tuple, in a top-level signature |
 | R3 for steps | `SqiffStepRole`: no reading a step's `.sql` with a text test |
 | R6 | `SqiffNamedQueries`: `exactDependentsOf` and `routinesNaming`, not the maps behind them |
+| R8 | `SqiffInterpolate`: no run of `<>` or `++` joining three or more pieces, one of them a string literal |
 | H1 | `SqiffNamedFields`: no constructor applied to more than four positional arguments |
 | H2 (signatures), exhaustive matches | GHC: `-Werror` for missing signatures, missing fields, incomplete patterns and partial record selectors and updates (`sqiff.cabal`) |
 | Layout | fourmolu (`fourmolu.yaml`) |
