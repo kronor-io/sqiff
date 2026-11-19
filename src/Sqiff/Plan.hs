@@ -123,7 +123,7 @@ context checks fromSchema toSchema fromDeps changes =
         , withDependents = Set.fromList [e.referenced | e <- edges fromDeps]
         , recreatedViews =
             Map.fromList
-                [ (v, (indexesOn v, (grantsKey,) <$> mfilter explicit (Map.lookup grantsKey toSchema)))
+                [ (v, KeptOnView{keptIndexes = indexesOn v, keptGrants = (grantsKey,) <$> mfilter explicit (Map.lookup grantsKey toSchema)})
                 | (k, Changed _ _) <- Map.toList changes
                 , k.aspect == Definition
                 , let grantsKey = k{aspect = Privileges}

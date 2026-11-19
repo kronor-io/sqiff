@@ -13,6 +13,8 @@ module Sqiff.Recipe (
     Step (..),
     Undo (..),
     Context (..),
+    Surrounding (..),
+    KeptOnView (..),
     columnSql,
     recipe,
     createRank,
@@ -113,6 +115,23 @@ data Undo
     deriving stock (Eq, Show)
 
 
+-- | What has to go before a statement and come back after it: the statements that drop
+-- the objects in the way, and the ones that create them again.
+data Surrounding = Surrounding
+    { dropBefore :: [Text]
+    , createAfter :: [Text]
+    }
+    deriving stock (Eq, Show)
+
+
+-- | What a view dropped and created again gets back: its indexes (name and definition)
+-- and its privileges.
+data KeptOnView = KeptOnView
+    { keptIndexes :: [(QName, Text)]
+    , keptGrants :: Maybe (ObjectKey, Definition)
+    }
+
+
 data Context = Context
     { newTables :: Set QName
     , droppedTables :: Set QName
@@ -124,17 +143,16 @@ data Context = Context
     -- ^ Body checks, with the definition each was made for.
     , withDependents :: Set ObjectId
     -- ^ Objects that something else depends on, in the database being changed.
-    , recreatedViews :: Map QName ([(QName, Text)], Maybe (ObjectKey, Definition))
-    -- ^ Materialized views dropped and created again, with the indexes (name and
-    -- definition) and privileges to restore on them.
+    , recreatedViews :: Map QName KeptOnView
+    -- ^ Views dropped and created again, with what to restore on them.
     , keptComments :: Map ObjectId Text
     -- ^ The desired database's comments that do not change, which an object dropped and
     -- created again gets back.
-    , viewsAround :: Map (QName, Identifier) ([Text], [Text])
+    , viewsAround :: Map (QName, Identifier) Surrounding
     -- ^ For a column whose type changes, the statements that drop the views reading it
     -- and the ones that create them again, with their grants, indexes, triggers and comments.
     , droppedObjects :: Set ObjectId
-    , viewDependents :: Map QName ([Text], [Text])
+    , viewDependents :: Map QName Surrounding
     -- ^ For a view whose columns change other than at the end, the statements that drop
     -- what depends on it and the ones that create those again.
     , convertedSequences :: Set QName
@@ -386,7 +404,7 @@ definition ctx key object change = case object of
                         (a, b) | a /= b -> manual "generated column added or removed"
                         _ -> []
         aroundViews statement = case Map.lookup (t, c) ctx.viewsAround of
-            Just (drops, creates) | not (null drops) -> T.intercalate ";\n" (drops <> [statement] <> creates)
+            Just around | not (null around.dropBefore) -> T.intercalate ";\n" (around.dropBefore <> [statement] <> around.createAfter)
             _ -> statement
         serialSequence d = defaultExpr d >>= T.stripPrefix "nextval('" >>= T.stripSuffix "'::regclass)"
         tableLit = literal (qualified t)
@@ -610,14 +628,14 @@ end |]
             -- create or replace view keeps the columns as they were, adding any at the
             -- end; otherwise the view, and what depends on it, go and come back.
             | otherwise ->
-                let (dropDependents, createDependents) = Map.findWithDefault ([], []) v ctx.viewDependents
-                 in map (create (Shared, [])) dropDependents
+                let dependents = Map.findWithDefault (Surrounding [] []) v ctx.viewDependents
+                 in map (create (Shared, [])) dependents.dropBefore
                         <> [ create (Shared, [MayFail "fails when other objects depend on the view; then drop them first"]) ("drop view " <> qualified v)
                            , create (Shared, []) ("create view " <> viewSql v new)
                            ]
                         <> restoreOnView v
                         <> restoreComments (View v : [o | o@(OtherColumn OfView t _) <- Map.keys ctx.keptComments, t == v])
-                        <> map (create (Shared, [])) createDependents
+                        <> map (create (Shared, [])) dependents.createAfter
         Dropped _ -> [remove (Shared, []) ("drop view " <> qualified v)]
 
     materializedView v = typed asView \case
@@ -634,11 +652,11 @@ end |]
     restoreViewComments v = restoreComments (MaterializedView v : [o | o@(OtherColumn OfMaterializedView t _) <- Map.keys ctx.keptComments, t == v])
     restoreOnView v = case Map.lookup v ctx.recreatedViews of
         Nothing -> []
-        Just (indexes, grants) ->
-            [create (Shared, [IndexBuild]) def | (_, def) <- indexes]
-                <> restoreComments [Index q | (q, _) <- indexes]
-                <> [create (Shared, []) (revokeGranted (qualified v)) | isJust grants]
-                <> maybe [] (\(k, def) -> map asPartOfThis (privileges k k.object (Added def))) grants
+        Just kept ->
+            [create (Shared, [IndexBuild]) def | (_, def) <- kept.keptIndexes]
+                <> restoreComments [Index q | (q, _) <- kept.keptIndexes]
+                <> [create (Shared, []) (revokeGranted (qualified v)) | isJust kept.keptGrants]
+                <> maybe [] (\(k, def) -> map asPartOfThis (privileges k k.object (Added def))) kept.keptGrants
 
     trigger t n = case textual of
         Added def -> create (Shared, []) def : restoreComments [Trigger t n]

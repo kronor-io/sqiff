@@ -36,7 +36,7 @@ import Sqiff.Identifier
 import Sqiff.Model
 import Sqiff.Plan (DependencyCycle, planWith)
 import Sqiff.Recipe (Context (viewsAround), Hazard (..), Phase (..), Step (..), Txn (..), Undo (..))
-import Sqiff.Recreate (viewsAroundTypeChanges)
+import Sqiff.Recreate (Recreation (..), viewsAroundTypeChanges)
 import Sqiff.TableEdit (TableEdit (..), TableRewrite (..), TargetType (..), TypeChange (..))
 
 
@@ -134,8 +134,8 @@ findingsFor env migrate ev = do
     mentions = Map.map (Set.filter (\a -> a `Map.notMember` breaking && a `Set.notMember` passed)) deps.named
     retypedAddresses = Set.fromList (map retypedObject retyped)
     around = viewsAroundTypeChanges deps.exact deps.dbSchema deps.dbDeps [(r.table, r.column, retypedObject r) | r <- retyped]
-    withViews c = c{viewsAround = Map.map snd around}
-    aroundOf addr = fold [members | r <- retyped, retypedObject r == addr, Just (members, _) <- [Map.lookup (r.table, r.column) around]]
+    withViews c = c{viewsAround = Map.map (.statements) around}
+    aroundOf addr = fold [recreation.members | r <- retyped, retypedObject r == addr, Just recreation <- [Map.lookup (r.table, r.column) around]]
     foreignKeysFor addr = Map.findWithDefault [] addr ev.foreignKeyBreaks
     renameHazard = MayFail ("breaks running code that still uses the old name" <> foldMap ("; " <>) env.config.renameHint)
     renameSteps =
