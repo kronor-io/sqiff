@@ -7,164 +7,105 @@
 -- | Splits a deploy script into statements, so it can run inside a transaction of ours.
 module Sqiff.Script (splitStatements, withoutTransactionControl) where
 
-import Data.Char (isAlphaNum, isAsciiUpper, isDigit, isSpace, toLower)
+import Data.Char (isAlphaNum, isAsciiUpper, isDigit, isSpace)
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
-import RIO.List qualified as L
-import Sqiff.Sql (codeOnly)
-
-
-data Mode = Plain | Single | Escaped | Double | Dollar String | LineComment | BlockComment Int
-    deriving stock (Eq)
-
-
--- | Where the scanner stands in a script. The @Rev@ fields are built by consing, so they
--- hold their text, or their statements, latest first.
-data ScanState = ScanState
-    { mode :: Mode
-    , statementRev :: String
-    -- ^ The statement so far, comments and all, reversed.
-    , hasCode :: Bool
-    -- ^ Whether the statement so far has more than whitespace and comments.
-    , wordRev :: String
-    -- ^ The word being read, reversed; empty between words and outside 'Plain'.
-    , previousWord :: Maybe String
-    -- ^ The last word read, lowercased, if only whitespace and comments came since.
-    , atomicDepth :: Int
-    -- ^ How many @BEGIN ATOMIC@ bodies and @CASE@ blocks in them are open; a semicolon
-    -- inside one does not end the statement.
-    , statementsRev :: [Text]
-    -- ^ The finished statements, reversed.
-    }
+import Sqiff.Sql (Region (..), closed, codeOnly, regions)
 
 
 -- | Statements without their terminating semicolon, skipping psql meta-commands that only
--- affect psql's output and refusing the rest.
+-- affect psql's output and refusing the rest. Each statement is a slice of the script.
 splitStatements :: Text -> Either Text [Text]
-splitStatements = scan startOfScript . T.unpack
+splitStatements script = do
+    split <- firstStatement script
+    more <- maybe (Right []) splitStatements split.after
+    Right (maybeToList split.statement <> more)
 
 
-startOfScript :: ScanState
-startOfScript =
-    ScanState
-        { mode = Plain
-        , statementRev = ""
-        , hasCode = False
-        , wordRev = ""
-        , previousWord = Nothing
-        , atomicDepth = 0
-        , statementsRev = []
-        }
+-- | A script's first statement and the script after it.
+data FirstStatement = FirstStatement
+    { statement :: Maybe Text
+    -- ^ Nothing when there are only whitespace and comments before the split.
+    , after :: Maybe Text
+    -- ^ Nothing when the statement ends the script.
+    }
 
 
--- | Reads the rest of a script, a character or a delimiter at a time.
-scan :: ScanState -> String -> Either Text [Text]
-scan state input = case (state.mode, input) of
-    (Plain, []) -> do
-        let ended = finishWord state
-        when (ended.atomicDepth > 0) $ Left "a BEGIN ATOMIC body has no END"
-        Right (reverse (finishStatement ended).statementsRev)
-    (LineComment, []) -> scan state{mode = Plain} []
-    (_, []) -> Left "a quote, dollar quote or comment is not closed"
-    (Plain, c : rest)
-        | isWordChar c || (c == '$' && not (null state.wordRev)) ->
-            scan (keep [c] state){hasCode = True, wordRev = c : state.wordRev} rest
-        | otherwise -> scanPlain state c rest
-    (Single, '\'' : '\'' : rest) -> scan (keep "''" state) rest
-    (Single, '\'' : rest) -> scan (backToPlain "'" state) rest
-    (Escaped, '\\' : x : rest) -> scan (keep ['\\', x] state) rest
-    (Escaped, '\'' : '\'' : rest) -> scan (keep "''" state) rest
-    (Escaped, '\'' : rest) -> scan (backToPlain "'" state) rest
-    (Double, '"' : '"' : rest) -> scan (keep "\"\"" state) rest
-    (Double, '"' : rest) -> scan (backToPlain "\"" state) rest
-    (Dollar tag, rest)
-        | Just after <- L.stripPrefix tag rest -> scan (backToPlain tag state) after
-    (LineComment, '\n' : rest) -> scan (backToPlain "\n" state) rest
-    (BlockComment n, '/' : '*' : rest) -> scan (keep "/*" state){mode = BlockComment (n + 1)} rest
-    (BlockComment n, '*' : '/' : rest) ->
-        scan (keep "*/" state){mode = if n == 1 then Plain else BlockComment (n - 1)} rest
-    (_, c : rest) -> scan (keep [c] state) rest
+-- | What 'firstStatement' looks at in a script: its words, the semicolons and backslashes
+-- in its code, and what lies between them.
+data Token
+    = -- | A word of code, lowercased.
+      Word Text
+    | Semicolon
+    | Backslash
+    | -- | Whitespace or a comment: the word before it stays the previous word.
+      Blank
+    | -- | Any other code, or a quoted character: it parts @BEGIN@ from @ATOMIC@.
+      Mark
 
 
--- | Reads plain SQL from a character that is no part of a word, so it ends the word
--- being read.
-scanPlain :: ScanState -> Char -> String -> Either Text [Text]
-scanPlain state c rest = case c : rest of
-    '\'' : more
-        | map toLower state.wordRev == "e" -> scan (openQuote Escaped "'" ended) more
-        | otherwise -> scan (openQuote Single "'" ended) more
-    '"' : more -> scan (openQuote Double "\"" ended) more
-    '-' : '-' : more -> scan (keep "--" ended){mode = LineComment} more
-    '/' : '*' : more -> scan (keep "/*" ended){mode = BlockComment 1} more
-    '$' : more
-        | Just tag <- dollarTag more ->
-            scan (openQuote (Dollar ('$' : tag)) ('$' : tag) ended) (drop (length tag) more)
-    ';' : more
-        | ended.atomicDepth == 0 -> scan (finishStatement ended) more
-    '\\' : more
-        | not state.hasCode -> skipPsqlCommand ended more
-    _ ->
-        scan
-            (keep [c] ended)
-                { hasCode = ended.hasCode || not (isSpace c)
-                , previousWord = if isSpace c then ended.previousWord else Nothing
-                }
-            rest
+-- | Each token of the script, with where it starts.
+tokens :: Text -> [(Int, Token)]
+tokens = go . zip [0 ..] . regions
   where
-    ended = finishWord state
+    go = \case
+        [] -> []
+        xs@((k, (c, Code)) : rest)
+            | isWordChar c ->
+                let (w, more) = span (\(_, (ch, r)) -> r == Code && (isWordChar ch || ch == '$')) xs
+                 in (k, Word (T.toLower (T.pack (map (fst . snd) w)))) : go more
+            | c == ';' -> (k, Semicolon) : go rest
+            | c == '\\' -> (k, Backslash) : go rest
+            | isSpace c -> (k, Blank) : go rest
+            | otherwise -> (k, Mark) : go rest
+        (k, (_, Remark)) : rest -> (k, Blank) : go rest
+        (k, (_, Quoted)) : rest -> (k, Mark) : go rest
 
 
--- | Skips a psql meta-command up to the end of its line if it only affects psql's output,
--- and refuses it otherwise.
-skipPsqlCommand :: ScanState -> String -> Either Text [Text]
-skipPsqlCommand state afterBackslash
-    | command `elem` outputOnly || (command `elem` ["set", "unset"] && psqlVariable) =
-        scan state{previousWord = Nothing} afterLine
+-- | The script's first statement, unless it has only whitespace and comments, and the
+-- script after it, unless it ends the script. A semicolon ends a statement in code, outside
+-- any @BEGIN ATOMIC@ body; a backslash before any code starts a psql meta-command, which
+-- runs to the end of its line.
+--
+-- 'splitStatements' lexes the script after a split afresh. That reads it as the lexer
+-- would have read it in place: both splits are in code, after a character that is no
+-- part of a word, which is where 'regions' starts.
+firstStatement :: Text -> Either Text FirstStatement
+firstStatement script = go (0 :: Int) Nothing False (tokens script)
+  where
+    -- How many @BEGIN ATOMIC@ bodies and @CASE@ blocks in them are open, the last word if
+    -- only blanks came since, and whether the statement has code yet.
+    go depth previous hasCode = \case
+        []
+            | not (closed script) -> Left "a quote, dollar quote or comment is not closed"
+            | depth > 0 -> Left "a BEGIN ATOMIC body has no END"
+            | otherwise -> Right (FirstStatement (statement hasCode script) Nothing)
+        (k, Semicolon) : _ | depth == 0 -> Right (FirstStatement (statement hasCode (T.take k script)) (Just (T.drop (k + 1) script)))
+        (k, Backslash) : _ | not hasCode -> FirstStatement Nothing . Just <$> skipPsqlCommand (T.drop (k + 1) script)
+        (_, Word w) : rest -> go (atomicDepthAfter previous w depth) (Just w) True rest
+        (_, Blank) : rest -> go depth previous hasCode rest
+        _ : rest -> go depth Nothing True rest
+    statement hasCode t = if hasCode then Just (T.strip t) else Nothing
+
+
+-- | The script after a psql meta-command's line, if the command only affects psql's
+-- output; refuses the command otherwise.
+skipPsqlCommand :: Text -> Either Text Text
+skipPsqlCommand afterBackslash
+    | command `elem` outputOnly || (command `elem` ["set", "unset"] && psqlVariable) = Right afterLine
     | otherwise = Left [i|psql's \\#{command} cannot run outside psql|]
   where
-    (line, afterLine) = break (== '\n') afterBackslash
-    command = takeWhile isWordChar line
-    psqlVariable = case words (drop (length command) line) of
-        name : _ -> all (\x -> isAsciiUpper x || isDigit x || x == '_') name
+    (line, afterLine) = T.break (== '\n') afterBackslash
+    command = T.takeWhile isWordChar line
+    psqlVariable = case T.words (T.drop (T.length command) line) of
+        name : _ -> T.all (\x -> isAsciiUpper x || isDigit x || x == '_') name
         [] -> True
     outputOnly = ["pset", "o", "out", "echo", "qecho", "timing", "x"]
 
 
--- | Adds text, in reading order, to the statement so far.
-keep :: String -> ScanState -> ScanState
-keep text state = state{statementRev = reverse text <> state.statementRev}
-
-
--- | Opens a quote or dollar quote with its delimiter. A quote is code, and parts
--- @BEGIN@ from @ATOMIC@.
-openQuote :: Mode -> String -> ScanState -> ScanState
-openQuote quoted delimiter state =
-    (keep delimiter state){mode = quoted, hasCode = True, previousWord = Nothing}
-
-
--- | Closes a quote, dollar quote or comment with its delimiter.
-backToPlain :: String -> ScanState -> ScanState
-backToPlain delimiter state = (keep delimiter state){mode = Plain}
-
-
--- | Ends the word being read: it becomes the previous word, and may open or close a
--- @BEGIN ATOMIC@ body or a @CASE@ in one.
-finishWord :: ScanState -> ScanState
-finishWord state
-    | null state.wordRev = state
-    | otherwise =
-        state
-            { wordRev = ""
-            , previousWord = Just word
-            , atomicDepth = atomicDepthAfter state.previousWord word state.atomicDepth
-            }
-  where
-    word = map toLower (reverse state.wordRev)
-
-
 -- | The @BEGIN ATOMIC@ depth after a lowercased word, given the word before it.
-atomicDepthAfter :: Maybe String -> String -> Int -> Int
+atomicDepthAfter :: Maybe Text -> Text -> Int -> Int
 atomicDepthAfter previous word depth
     | previous == Just "begin" && word == "atomic" && depth == 0 = 1
     | depth > 0 && word == "case" = depth + 1
@@ -172,27 +113,8 @@ atomicDepthAfter previous word depth
     | otherwise = depth
 
 
--- | Ends the statement so far, keeping it if it has code, and starts the next.
-finishStatement :: ScanState -> ScanState
-finishStatement state =
-    startOfScript
-        { statementsRev =
-            if state.hasCode
-                then T.strip (T.pack (reverse state.statementRev)) : state.statementsRev
-                else state.statementsRev
-        }
-
-
 isWordChar :: Char -> Bool
 isWordChar c = isAlphaNum c || c == '_'
-
-
--- | The tag of a dollar quote and its closing @$@, from the text after the opening @$@.
--- A tag does not start with a digit, so @$1@ is a parameter.
-dollarTag :: String -> Maybe String
-dollarTag more = case span isWordChar more of
-    (tag, '$' : _) | maybe True (not . isDigit) (listToMaybe tag) -> Just (tag <> "$")
-    _ -> Nothing
 
 
 -- | Drops @BEGIN@, @COMMIT@ and the like in all their forms, so the statements run in a

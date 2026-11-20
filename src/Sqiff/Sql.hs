@@ -9,6 +9,7 @@
 module Sqiff.Sql (
     Region (..),
     regions,
+    closed,
     codeOnly,
     topWords,
     codeWords,
@@ -73,6 +74,12 @@ regions = code ' ' . T.unpack
         '*' : '/' : more -> ('*', Remark) : ('/', Remark) : if depth == 1 then code '/' more else block (depth - 1) more
         '/' : '*' : more -> ('/', Remark) : ('*', Remark) : block (depth + 1) more
         c : more -> (c, Remark) : block depth more
+
+
+-- | Whether every quote, dollar quote and block comment in the text is closed: a newline
+-- after it is code, not inside one of them.
+closed :: Text -> Bool
+closed t = fmap snd (L.lastMaybe (regions (t <> "\n"))) == Just Code
 
 
 -- | The text with its comments blanked out.
