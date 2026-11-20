@@ -87,7 +87,15 @@ Each version tag also publishes an image for amd64 and arm64, with sqitch, psql 
 docker run --rm -v "$PWD:/work" ghcr.io/kronor-io/sqiff --help
 ```
 
-In a clone, `nix build .#sqiff` puts the binary in `result/bin`, and `nix build .#dockerImage` the image. `nix develop` gives a shell with GHC, cabal, Postgres, sqitch and git, where `cabal build` and `cabal install` work with the dependency versions in `cabal.project.freeze`.
+On Linux without nix, each [release](https://github.com/kronor-io/sqiff/releases) has a static binary for x86_64 and aarch64, which runs on any distribution. The tarball holds `bin/sqiff` and its bash, zsh and fish completions under `share/`, so unpacking it into `~/.local` (or `/usr/local`) installs both:
+
+```bash
+curl -fsSL "https://github.com/kronor-io/sqiff/releases/latest/download/sqiff-$(uname -m)-linux.tar.xz" | tar -xJ -C ~/.local
+```
+
+The binary is sqiff alone: install sqitch, psql and git (and docker for `--from master`) beside it.
+
+In a clone, `nix build .#sqiff` puts the binary in `result/bin`, `nix build .#dockerImage` the image, and `scripts/build-static` the release tarball, in `dist-static/`. `nix develop` gives a shell with GHC, cabal, Postgres, sqitch and git, where `cabal build` and `cabal install` work with the dependency versions in `cabal.project.freeze`.
 
 sqiff needs a reachable Postgres, given with `--db` (`--from` and `--to` for `diff`, `plan` and `sqitch`) or with libpq's `PG*` variables. It also runs `git` and `sqitch`, and `docker` for `--from master`.
 

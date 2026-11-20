@@ -2,3 +2,4 @@ dist-newstyle/
 result
 result-*
 .claude/worktrees/
+dist-static/
