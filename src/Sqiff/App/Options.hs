@@ -22,8 +22,8 @@ module Sqiff.App.Options (
     parseCommand,
 ) where
 
-import Data.Version (makeVersion)
 import OptEnvConf hiding (Command, commandParser)
+import Paths_sqiff (version)
 import RIO hiding (many, optional)
 import RIO.Text qualified as T
 import Sqiff.App.Env (BodyChecks (..), Scope (..), Source, source)
@@ -149,7 +149,7 @@ tableOptions f = do
 
 -- | The command the arguments name. Flags that do not apply together are a parse error.
 parseCommand :: IO Command
-parseCommand = runParser (makeVersion [0, 1, 0, 0]) "Compare PostgreSQL schemas and write the migrations between them" commandParser
+parseCommand = runParser version "Compare PostgreSQL schemas and write the migrations between them" commandParser
 
 
 commandParser :: Parser Command
