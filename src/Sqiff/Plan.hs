@@ -27,6 +27,7 @@ import Sqiff.Diff (Change (..), Changes, invert)
 import Sqiff.Graph (schedule, topoOrder)
 import Sqiff.Model
 import Sqiff.Recipe
+import Sqiff.Sql (terminator)
 
 
 -- | Objects whose steps depend on each other in a circle, so no order works.
@@ -194,8 +195,7 @@ renderStep s =
     T.unlines
         $ ["-- " <> render s.object]
         <> ["-- " <> note | note <- txnNote <> map hazardText s.hazards]
-        -- [allow:SqiffStepRole] writing the statement out: a "--" placeholder takes no semicolon
-        <> [s.sql <> if "--" `T.isPrefixOf` s.sql then "" else ";"]
+        <> [s.sql <> terminator s.sql]
   where
     txnNote = case s.txn of
         Shared -> []
