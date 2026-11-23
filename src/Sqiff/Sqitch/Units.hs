@@ -38,7 +38,7 @@ import Sqiff.Model
 import Sqiff.Plan (invert)
 import Sqiff.Recipe
 import Sqiff.Sqitch.Plan (SqitchPlan (..))
-import Sqiff.Sql (doBlock, literal, replaceAllInCode)
+import Sqiff.Sql (doBlock, literal, replaceAllInCode, terminator)
 
 
 data UnitKind = AddChange | ReworkChange
@@ -402,7 +402,7 @@ renderScript header placement steps =
                 <> map (\s -> if safeToIndent s.sql then indent (statement s.sql s) else statement s.sql s) group'
                 <> ["COMMIT;"]
     statement sql s =
-        T.intercalate "\n" (map ("-- " <>) (hazardNotes s) <> [tidy s sql <> if "--" `T.isPrefixOf` sql then "" else ";"] <> stopUntilWritten s)
+        T.intercalate "\n" (map ("-- " <>) (hazardNotes s) <> [tidy s sql <> terminator sql] <> stopUntilWritten s)
     -- A step sqiff cannot write stops the deploy until someone writes it, rather than
     -- deploying as a change that does nothing.
     stopUntilWritten s =
@@ -552,7 +552,14 @@ verifyScript header steps =
             let c = nameText con
                 domain = literal (typeText d)
              in [presence s [S.i|select from pg_constraint where contypid = to_regtype(#{domain}) and conname = #{literal c}|] [S.i|constraint #{c} on domain #{typeText d}|]]
-        Index q -> [relation s q]
+        Index q ->
+            relation s q
+                : [ [S.i|assert (select indisvalid from pg_index where indexrelid = #{reg q}), #{literal message};|]
+                  | not (gone s)
+                  , Just (IndexDefinition def) <- [after s.change]
+                  , def.partitioned
+                  , let message = [S.i|#{qualified q} is invalid: a partition has no index attached to it|] :: Text
+                  ]
         Table q -> [relation s q]
         View q -> [relation s q]
         MaterializedView q -> [relation s q]

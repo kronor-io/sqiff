@@ -712,10 +712,13 @@ indexRecipe this ix = typed this asIndex \case
     addIndex def
         | def.partitioned =
             [ create this (Shared, []) def.statement
-            , create
-                this
-                (Shared, [Manual [i|build the index on each partition with create index concurrently, then alter index #{qualified ix} attach partition each one; it stays invalid until every partition has one|]])
-                [i|-- create index concurrently and attach partition for #{qualified ix}|]
+            , case eachPartition ix def of
+                Just query -> create this (None, [IndexBuild]) query
+                Nothing ->
+                    create
+                        this
+                        (Shared, [Manual [i|build the index on each partition with create index concurrently, then alter index #{qualified ix} attach partition each one; it stays invalid until every partition has one|]])
+                        [i|-- create index concurrently and attach partition for #{qualified ix}|]
             ]
         | def.table `Set.member` this.context.newTables = [create this (Shared, []) def.statement]
         | otherwise = [builds this ix $ buildIndex this (None, [IndexBuild]) (concurrentBuild ix (replaceInCode " INDEX " " INDEX CONCURRENTLY " def.statement))]
@@ -1097,6 +1100,37 @@ concurrentBuild index build =
                     end\n
                 |]
      in [i|#{failIfInvalid};\n\n#{build}|]
+
+
+-- | A query whose rows psql runs with @\\gexec@: for each partition of the table with no
+-- index attached to the partitioned index @ix@ yet, a concurrent build of its index and
+-- the attach. It reads the partitions when it runs, so it covers those the database has
+-- then. Nothing when @def@ is not the @ON ONLY@ statement it expects.
+eachPartition :: QName -> IndexDef -> Maybe Text
+eachPartition ix def = do
+    let escape = T.replace "%" "%%"
+        onOnly = escape [i| INDEX #{quoted ix.name} ON ONLY #{qualified def.table} |]
+        statement = escape def.statement
+        build = replaceInCode onOnly " INDEX CONCURRENTLY IF NOT EXISTS %I ON %I.%I " statement
+        name = [i|left(c.relname || '_' || #{literal (nameText ix.name)}, 63)|] :: Text
+    guard (build /= statement)
+    pure
+        [__i|
+            select
+                format(#{literal build}, #{name}, n.nspname, c.relname),
+                format('alter index %s attach partition %I.%I', #{literal (qualified ix)}, n.nspname, #{name})
+            from pg_inherits h
+            join pg_class c on c.oid = h.inhrelid
+            join pg_namespace n on n.oid = c.relnamespace
+            where h.inhparent = #{literal (qualified def.table)}::regclass
+                and not exists (
+                    select from pg_inherits a
+                    join pg_index x on x.indexrelid = a.inhrelid
+                    where a.inhparent = #{literal (qualified ix)}::regclass and x.indrelid = c.oid
+                )
+            order by c.relname
+            \\gexec
+        |]
 
 
 -- | The longest prefix of at most @n@ bytes in UTF-8.

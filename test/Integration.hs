@@ -11,7 +11,7 @@
 -- * @from.sql@ and @to.sql@ build the two databases;
 -- * @diff.golden@ and @plan.golden@ hold what @sqiff diff@ and @sqiff plan@ print, as a
 --   record of the current behaviour (refresh with @--accept@);
--- * the round trip applies the plan to @from@, statement by statement, and expects
+-- * the round trip has psql run the plan on @from@, and expects
 --   @sqiff diff@ to find nothing left;
 -- * the sqitch round trip writes the plan as sqitch changes into a new project, has
 --   sqitch deploy and verify them on a fresh copy of @from@, and expects the same;
@@ -35,10 +35,9 @@ import RIO.List (sort)
 import RIO.Text qualified as T
 import Sqiff.Connection (withConnections, withSharedSnapshot)
 import Sqiff.ConnectionString (connectionString)
-import Sqiff.Script (splitStatements)
 import Sqiff.Sqitch.Plan (SqitchPlan (..), readPlan)
 import System.Environment (lookupEnv, setEnv)
-import System.Process.Typed (proc, readProcess, setWorkingDir)
+import System.Process.Typed (byteStringInput, proc, readProcess, setStdin, setWorkingDir)
 import Test.Tasty (TestTree, testGroup, withResource)
 import Test.Tasty.ExpectedFailure (expectFailBecause)
 import Test.Tasty.Golden (goldenVsStringDiff)
@@ -249,17 +248,16 @@ golden f label field getBefore =
         <$> getBefore
 
 
--- | The plan, applied to @from@ statement by statement, leaves nothing for diff to find.
+-- | The plan, run by psql on @from@, leaves nothing for diff to find.
 roundTrip :: Shared -> Fixture -> IO Before -> TestTree
 roundTrip shared f getBefore = testCase "round trip" do
     before <- getBefore
     cluster <- shared.getCluster
     let databases = fixtureDatabases f
-    statements <- either (assertFailure . T.unpack) pure (splitStatements before.planOut)
-    failures <- fmap catMaybes . for statements $ \s ->
-        runScript cluster databases.from s <&> either (\e -> Just [i|#{T.strip s}\n  => #{e}|]) (const Nothing)
-    unless (null failures)
-        $ assertFailure (T.unpack (T.unlines ("the plan did not apply:" : failures)))
+        psql = proc "psql" ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", T.unpack (conninfo cluster databases.from), "-f", "-"]
+    (applied, psqlOut, psqlErr) <- readProcess (setStdin (byteStringInput (BL.fromStrict (encodeUtf8 before.planOut))) psql)
+    unless (applied == ExitSuccess)
+        $ assertFailure (T.unpack [i|the plan did not apply:\n#{decodeOutput psqlOut}#{decodeOutput psqlErr}|])
     (code, out, err) <- runSqiff cluster ["diff"] databases.from databases.to
     unless (code == ExitSuccess)
         $ assertFailure (T.unpack [i|after the plan, diff still finds:\n#{out}#{err}|])

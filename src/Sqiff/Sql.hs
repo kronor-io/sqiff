@@ -20,6 +20,7 @@ module Sqiff.Sql (
     literal,
     dollarQuoted,
     doBlock,
+    terminator,
 ) where
 
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
@@ -187,3 +188,11 @@ dollarQuoted body = quote <> body <> quote
 -- | An anonymous PL/pgSQL block.
 doBlock :: Text -> Text
 doBlock body = "do " <> dollarQuoted body
+
+
+-- | What ends a statement in a psql script: nothing after a "--" note or a query psql
+-- runs with @\\gexec@, a semicolon otherwise.
+terminator :: Text -> Text
+terminator sql
+    | "--" `T.isPrefixOf` sql || "\\gexec" `T.isSuffixOf` sql = ""
+    | otherwise = ";"
