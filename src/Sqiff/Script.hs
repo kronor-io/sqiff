@@ -5,13 +5,14 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 -- | Splits a deploy script into statements, so it can run inside a transaction of ours.
-module Sqiff.Script (splitStatements, withoutTransactionControl) where
+module Sqiff.Script (splitStatements, withoutTransactionControl, withoutCommitsInDoBlock) where
 
 import Data.Char (isAlphaNum, isAsciiUpper, isDigit, isSpace)
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
-import Sqiff.Sql (Region (..), closed, codeOnly, regions)
+import RIO.List qualified as L
+import Sqiff.Sql (Region (..), closed, codeOnly, regions, splitTopLevel, topWords)
 
 
 -- | Statements without their terminating semicolon, skipping psql meta-commands that only
@@ -129,3 +130,42 @@ withoutTransactionControl = fmap catMaybes . traverse classify
         "rollback" : rest | "to" : _ <- dropWhile (`elem` ["work", "transaction"]) rest -> Right (Just s)
         w : _ | w `elem` ["begin", "start", "commit", "end", "rollback", "abort"] -> Right Nothing
         _ -> Right (Just s)
+
+
+-- | A @do@ block with the @COMMIT@ and @ROLLBACK@ statements of its body left out, so it
+-- runs inside a transaction of ours; any other statement unchanged. A batched backfill
+-- commits between batches: against the comparison's scratch tables it has no rows to
+-- batch, and without its commits it does the same work in one transaction. The body's
+-- other statements keep their text, rejoined one per line. A commit nested in an @IF@ or a
+-- @CASE@ is not its own statement at the top of the body, so it stays, and still fails.
+withoutCommitsInDoBlock :: Text -> Text
+withoutCommitsInDoBlock statement = case (topWords statement, dollarBody statement) of
+    ((_, "do") : _, Just block) -> [i|#{block.leading}#{block.quote}#{withoutCommits block.body}#{block.quote}#{block.trailing}|]
+    _ -> statement
+  where
+    withoutCommits = T.intercalate ";\n" . filter (not . transactionControl) . splitTopLevel ';'
+    transactionControl s = case T.words (T.toLower (codeOnly s)) of
+        w : _ -> w `elem` ["commit", "rollback"]
+        [] -> False
+
+
+-- | A statement's first dollar-quoted body, and the text around it.
+data DollarBody = DollarBody
+    { leading :: Text
+    , quote :: Text
+    -- ^ The opening and closing quote, tag included: @$@ or @$tag$@.
+    , body :: Text
+    , trailing :: Text
+    }
+
+
+dollarBody :: Text -> Maybe DollarBody
+dollarBody statement = do
+    start <- L.findIndex (\(c, r) -> c == '$' && r == Quoted) (regions statement)
+    let (leading, rest) = T.splitAt start statement
+        tag = T.takeWhile (\c -> isAlphaNum c || c == '_') (T.drop 1 rest)
+        quote = [i|$#{tag}$|]
+    opened <- T.stripPrefix quote rest
+    let (body, closing) = T.breakOn quote opened
+    trailing <- T.stripPrefix quote closing
+    pure DollarBody{leading, quote, body, trailing}
