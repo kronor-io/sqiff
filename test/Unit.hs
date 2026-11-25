@@ -37,7 +37,7 @@ import Sqiff.Model (Address (..), Aspect (..), Edge (..), ObjectId (..), ObjectK
 import Sqiff.Plan (context, invert, topoOrder)
 import Sqiff.Recipe (Hazard (..), Phase (..), Role (..), Step (..), Txn (..), Undo (..))
 import Sqiff.Rewrite (fileDrift)
-import Sqiff.Script (splitStatements, withoutTransactionControl)
+import Sqiff.Script (splitStatements, withoutCommitsInDoBlock, withoutTransactionControl)
 import Sqiff.Sqitch.Check (Tagging (..), batchProblems, changeNameProblem, chooseTag, tagNameProblem)
 import Sqiff.Sqitch.Layout (Layout (..), resolveLayout, sqitchConf)
 import Sqiff.Sqitch.Plan (SqitchPlan (..), parsePlan)
@@ -255,6 +255,18 @@ scripts =
         , testCase "keeps ROLLBACK WORK TO"
             $ withoutTransactionControl ["rollback work to sp"]
             @?= Right ["rollback work to sp"]
+        , testCase "leaves out the commits of a batched do block"
+            $ withoutCommitsInDoBlock "do $$\nbegin\n  loop\n    update t set a = 1;\n    commit; -- between batches\n    exit;\n  end loop;\nend\n$$"
+            @?= "do $$begin\n  loop\n    update t set a = 1;\n-- between batches\n    exit;\nend loop;\nend$$"
+        , testCase "keeps a do block's tagged quote and what follows it"
+            $ withoutCommitsInDoBlock "do language plpgsql $body$ begin perform 1; rollback; end $body$"
+            @?= "do language plpgsql $body$begin perform 1;\nend$body$"
+        , testCase "keeps commit in a string and in a nested IF"
+            $ withoutCommitsInDoBlock "do $$ begin raise notice 'commit'; if true then commit; end if; end $$"
+            @?= "do $$begin raise notice 'commit';\nif true then commit;\nend if;\nend$$"
+        , testCase "leaves statements that are not do blocks alone"
+            $ withoutCommitsInDoBlock "create function f() returns void language plpgsql as $$ begin commit; end $$"
+            @?= "create function f() returns void language plpgsql as $$ begin commit; end $$"
         ]
 
 

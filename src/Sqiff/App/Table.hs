@@ -44,7 +44,7 @@ import Sqiff.Model
 import Sqiff.Plan (context, cycleMessage, invert, renderStep)
 import Sqiff.Recipe (Step (..))
 import Sqiff.Recreate (standardBody)
-import Sqiff.Script (splitStatements, withoutTransactionControl)
+import Sqiff.Script (splitStatements, withoutCommitsInDoBlock, withoutTransactionControl)
 import Sqiff.Sqitch (PreviousFile (..), moveToEnd, requireSqitch, reworkEdited, withProject, writeUnits)
 import Sqiff.Sqitch.Check (Tagging (..))
 import Sqiff.Sqitch.Layout (Layout (..), Script (..), findLayout, planPath, scriptPath)
@@ -375,8 +375,9 @@ forTable names t n =
 
 
 -- | A migration's statements as they can run inside the comparison's transaction:
--- without session settings, and with concurrent index builds made plain.
+-- without session settings, with concurrent index builds made plain, and with the
+-- commits of a batched backfill's @do@ block left out.
 replayable :: [Text] -> [Text]
-replayable = map (replaceInCode "concurrently " "" . replaceInCode "CONCURRENTLY " "") . filter (not . setting)
+replayable = map (withoutCommitsInDoBlock . replaceInCode "concurrently " "" . replaceInCode "CONCURRENTLY " "") . filter (not . setting)
   where
     setting s = any (`T.isPrefixOf` T.toLower (withoutLeadingComments s)) ["set ", "reset ", "select set_config("]
