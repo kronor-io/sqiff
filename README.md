@@ -53,6 +53,8 @@ What sqiff takes care of:
 - **Reverts.** Each migration gets a revert script that undoes it, view recreation included.
 - **Real catalogs.** sqiff reads both schemas from PostgreSQL itself rather than parsing SQL. Your edit is built in a transaction that is rolled back, so it is never left in the database.
 
+sqiff is one of a set of tools for keeping a PostgreSQL schema in sqitch, with [sqint](https://github.com/kronor-io/sqint), [create-migration](https://github.com/kronor-io/sqitch-with-templates) and [psql-retry](https://github.com/kronor-io/psql-retry). [sqitchcraft](https://kronor-io.github.io/sqitchcraft/) shows how they fit together: the repository layout they assume, one change from an edited file to a deploy, and instructions for coding agents.
+
 ## Contents
 
 1. [Install](#install)
