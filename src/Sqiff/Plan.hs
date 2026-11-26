@@ -27,7 +27,7 @@ import Sqiff.Diff (Change (..), Changes, invert)
 import Sqiff.Graph (schedule, topoOrder)
 import Sqiff.Model
 import Sqiff.Recipe
-import Sqiff.Sql (terminator)
+import Sqiff.Sql (lowerCode, terminator)
 
 
 -- | Objects whose steps depend on each other in a circle, so no order works.
@@ -190,12 +190,16 @@ context checks fromSchema toSchema fromDeps changes =
     isDropped = \case Dropped _ -> True; _ -> False
 
 
+-- | A step as the plan prints it. Its code is lowercased here, where it is printed and
+-- not where it is built: steps carry statements copied from the catalog
+-- (@pg_get_viewdef@, @pg_get_indexdef@, …) in its upper case, and the recipes match on
+-- that text.
 renderStep :: Step -> Text
 renderStep s =
     T.unlines
         $ ["-- " <> render s.object]
         <> ["-- " <> note | note <- txnNote <> map hazardText s.hazards]
-        <> [s.sql <> terminator s.sql]
+        <> [lowerCode s.sql <> terminator s.sql]
   where
     txnNote = case s.txn of
         Shared -> []

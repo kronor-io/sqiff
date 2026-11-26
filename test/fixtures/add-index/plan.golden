@@ -12,5 +12,5 @@ begin
 end
 $$;
 
-CREATE INDEX CONCURRENTLY t_email ON public.t USING btree (lower(email)) WHERE (NOT deleted);
+create index concurrently t_email on public.t using btree (lower(email)) where (not deleted);
 

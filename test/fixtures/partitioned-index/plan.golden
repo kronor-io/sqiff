@@ -1,5 +1,5 @@
 -- index app.events_at
-CREATE INDEX events_at ON ONLY app.events USING btree (at);
+create index events_at on only app.events using btree (at);
 
 -- index app.events_at
 -- outside a transaction
@@ -20,7 +20,7 @@ order by c.relname
 \gexec
 
 -- index app.events_id_at
-CREATE UNIQUE INDEX events_id_at ON ONLY app.events USING btree (id, at) WHERE (note ~~ 'it''s %'::text);
+create unique index events_id_at on only app.events using btree (id, at) where (note ~~ 'it''s %'::text);
 
 -- index app.events_id_at
 -- outside a transaction

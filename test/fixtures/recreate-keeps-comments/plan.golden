@@ -11,15 +11,15 @@ drop materialized view app.totals;
 -- materialized view app.totals
 -- hazard: holds an ACCESS EXCLUSIVE lock, which blocks reads and writes, while it runs
 create materialized view app.totals as
-SELECT status,
-    sum(amount) AS total,
-    count(*) AS orders
-   FROM app.orders
-  GROUP BY status;
+select status,
+    sum(amount) as total,
+    count(*) as orders
+   from app.orders
+  group by status;
 
 -- materialized view app.totals
 -- hazard: builds an index
-CREATE UNIQUE INDEX totals_status ON app.totals USING btree (status);
+create unique index totals_status on app.totals using btree (status);
 
 -- materialized view app.totals
 comment on index app.totals_status is 'one row per status';
@@ -31,7 +31,7 @@ comment on materialized view app.totals is 'totals per status';
 comment on column app.totals.total is 'sum of amounts';
 
 -- table constraint app.orders.amount_positive
-alter table app.orders add constraint amount_positive CHECK ((amount >= (1)::numeric)) NOT VALID;
+alter table app.orders add constraint amount_positive check ((amount >= (1)::numeric)) not valid;
 
 -- table constraint app.orders.amount_positive
 -- own transaction
@@ -41,7 +41,7 @@ alter table app.orders validate constraint amount_positive;
 comment on constraint amount_positive on app.orders is 'no free orders';
 
 -- domain constraint app.code(code_short)
-alter domain app.code add constraint code_short CHECK ((length(VALUE) < 12)) NOT VALID;
+alter domain app.code add constraint code_short check ((length(value) < 12)) not valid;
 
 -- domain constraint app.code(code_short)
 -- own transaction
@@ -64,7 +64,7 @@ begin
 end
 $$;
 
-CREATE INDEX CONCURRENTLY orders_amount_new ON app.orders USING btree (amount DESC);
+create index concurrently orders_amount_new on app.orders using btree (amount desc);
 
 -- index app.orders_amount
 -- outside a transaction
@@ -80,7 +80,7 @@ comment on index app.orders_amount is 'for range scans';
 drop trigger orders_touch on app.orders;
 
 -- trigger app.orders.orders_touch
-CREATE CONSTRAINT TRIGGER orders_touch AFTER INSERT OR UPDATE ON app.orders NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION app.touch();
+create constraint trigger orders_touch after insert or update on app.orders not deferrable initially immediate for each row execute function app.touch();
 
 -- trigger app.orders.orders_touch
 comment on trigger orders_touch on app.orders is 'checks inserts';
@@ -93,7 +93,7 @@ create policy open_orders on app.orders
 as permissive
 for all
 to public
-using ((status = ANY (ARRAY['open'::text, 'new'::text])));
+using ((status = any (array['open'::text, 'new'::text])));
 
 -- policy app.orders.open_orders
 comment on policy open_orders on app.orders is 'only open orders';

@@ -15,5 +15,5 @@ $$;
 create unique index concurrently t_email_key on public.t (email);
 
 -- table constraint public.t.t_email_key
-alter table public.t add constraint t_email_key UNIQUE using index t_email_key;
+alter table public.t add constraint t_email_key unique using index t_email_key;
 

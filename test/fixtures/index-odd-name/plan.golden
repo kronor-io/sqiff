@@ -12,7 +12,7 @@ begin
 end
 $sqiff$;
 
-CREATE INDEX CONCURRENTLY "odd$$name%s" ON public.t USING btree (note) WHERE ((note <> ' INDEX '::text) AND (note <> 'concurrently '::text));
+create index concurrently "odd$$name%s" on public.t using btree (note) where ((note <> ' INDEX '::text) and (note <> 'concurrently '::text));
 
 -- table public.t
 comment on table public.t is E'a\\b';

@@ -38,7 +38,7 @@ import Sqiff.Model
 import Sqiff.Plan (invert)
 import Sqiff.Recipe
 import Sqiff.Sqitch.Plan (SqitchPlan (..))
-import Sqiff.Sql (doBlock, literal, replaceAllInCode, terminator)
+import Sqiff.Sql (doBlock, literal, lowerCode, replaceAllInCode, terminator)
 
 
 data UnitKind = AddChange | ReworkChange
@@ -397,12 +397,12 @@ renderScript header placement steps =
         [s] | s.txn == None -> statement (idempotent s.sql) s
         _ ->
             T.intercalate "\n\n"
-                $ ["BEGIN;"]
+                $ ["begin;"]
                 <> ["  -- Do not remove this line\n  select set_config('lock_timeout', '50ms', false);" | placement == Migration]
                 <> map (\s -> if safeToIndent s.sql then indent (statement s.sql s) else statement s.sql s) group'
-                <> ["COMMIT;"]
+                <> ["commit;"]
     statement sql s =
-        T.intercalate "\n" (map ("-- " <>) (hazardNotes s) <> [tidy s sql <> terminator sql] <> stopUntilWritten s)
+        T.intercalate "\n" (map ("-- " <>) (hazardNotes s) <> [lowerCode (tidy s sql) <> terminator sql] <> stopUntilWritten s)
     -- A step sqiff cannot write stops the deploy until someone writes it, rather than
     -- deploying as a change that does nothing.
     stopUntilWritten s =
@@ -498,7 +498,7 @@ tidyIndex line
 -- types print as the plan has them.
 verifyScript :: Text -> [Step] -> Text
 verifyScript header steps =
-    T.intercalate "\n\n" ([header, "BEGIN;", "    set local search_path = '';"] <> map ("    " <>) selects <> assertBlock <> ["ROLLBACK;"]) <> "\n"
+    T.intercalate "\n\n" ([header, "begin;", "    set local search_path = '';"] <> map ("    " <>) selects <> assertBlock <> ["rollback;"]) <> "\n"
   where
     final = Map.elems (Map.fromList [(s.object, s) | s <- steps, s.key.aspect == Definition])
     gone :: Step -> Bool

@@ -6,8 +6,8 @@
 drop view public.v;
 alter table public.t alter column amount type bigint using amount::bigint;
 create view public.v as
-SELECT id,
+select id,
     amount
-   FROM public.t;
+   from public.t;
 comment on view public.v is 'amounts';
 

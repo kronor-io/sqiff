@@ -1,27 +1,27 @@
 -- table public.t
-grant SELECT on table public.t to reader;
+grant select on table public.t to reader;
 
 -- table public.t
-grant DELETE on table public.t to sqiff;
+grant delete on table public.t to sqiff;
 
 -- table public.t
-grant INSERT on table public.t to sqiff;
+grant insert on table public.t to sqiff;
 
 -- table public.t
-grant MAINTAIN on table public.t to sqiff;
+grant maintain on table public.t to sqiff;
 
 -- table public.t
-grant REFERENCES on table public.t to sqiff;
+grant references on table public.t to sqiff;
 
 -- table public.t
-grant SELECT on table public.t to sqiff;
+grant select on table public.t to sqiff;
 
 -- table public.t
-grant TRIGGER on table public.t to sqiff;
+grant trigger on table public.t to sqiff;
 
 -- table public.t
-grant TRUNCATE on table public.t to sqiff;
+grant truncate on table public.t to sqiff;
 
 -- table public.t
-grant UPDATE on table public.t to sqiff;
+grant update on table public.t to sqiff;
 
