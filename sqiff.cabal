@@ -96,8 +96,6 @@ library
   -- The version above, for sqiff --version.
   other-modules:   Paths_sqiff
   autogen-modules: Paths_sqiff
-  -- hasql-th's bound asks for Kronor's fork (cabal.project's repository),
-  -- whose syntax the quoters use; Hackage's 0.5.1.1 is older.
   build-depends:
     , aeson              ^>=2.3.1.0
     , base               >=4.21 && <5
@@ -108,7 +106,7 @@ library
     , file-embed         ^>=0.0.16.0
     , filepath           ^>=1.5.5.0
     , hasql              ^>=2.0.1.0
-    , hasql-th           ^>=0.5.1.1.0.0.0.0.1
+    , hasql-th-kronor    ^>=0.5.1.1
     , opt-env-conf       ^>=0.15.0.2
     , pqi-ffi            ^>=1.0.1.0
     , rio                ^>=0.1.25.0
@@ -155,7 +153,7 @@ test-suite sqiff-test
     , directory
     , filepath
     , hasql
-    , hasql-th
+    , hasql-th-kronor
     , hedgehog
     , rio
     , sqiff
