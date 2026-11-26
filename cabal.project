@@ -40,4 +40,4 @@ allow-newer:
 package postgresql-libpq
   flags: +use-pkg-config
 
-index-state: hackage.haskell.org 2026-10-26T00:00:00Z
+index-state: hackage.haskell.org 2026-11-26T00:00:00Z
