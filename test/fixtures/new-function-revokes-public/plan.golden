@@ -1,12 +1,12 @@
 -- function public.secret
-CREATE OR REPLACE FUNCTION public.secret()
- RETURNS integer
- LANGUAGE sql
-AS $function$ select 42 $function$;
+create or replace function public.secret()
+ returns integer
+ language sql
+as $function$ select 42 $function$;
 
 -- function public.secret
-revoke EXECUTE on function public.secret() from public;
+revoke execute on function public.secret() from public;
 
 -- function public.secret
-grant EXECUTE on function public.secret() to sqiff;
+grant execute on function public.secret() to sqiff;
 

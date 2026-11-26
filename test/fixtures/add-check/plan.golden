@@ -1,5 +1,5 @@
 -- table constraint public.t.qty_positive
-alter table public.t add constraint qty_positive CHECK ((qty > 0)) NOT VALID;
+alter table public.t add constraint qty_positive check ((qty > 0)) not valid;
 
 -- table constraint public.t.qty_positive
 -- own transaction

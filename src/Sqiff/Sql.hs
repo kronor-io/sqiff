@@ -17,13 +17,14 @@ module Sqiff.Sql (
     splitTopLevel,
     replaceInCode,
     replaceAllInCode,
+    lowerCode,
     literal,
     dollarQuoted,
     doBlock,
     terminator,
 ) where
 
-import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
+import Data.Char (isAlpha, isAlphaNum, isAsciiUpper, isDigit, isSpace, toLower)
 import Data.String.Interpolate (i)
 import Data.Text qualified as T
 import RIO
@@ -158,6 +159,14 @@ replaceInCode old new t
              in if inCode at
                     then before <> new <> go (at + T.length old) (T.drop (T.length old) match)
                     else before <> T.take 1 match <> go (at + 1) (T.drop 1 match)
+
+
+-- | The text with its code in lower case, as sqiff writes SQL, keeping quotes and
+-- comments as they are. It reads the same to PostgreSQL, which folds unquoted words to
+-- lower case: catalog functions such as @pg_get_viewdef@ quote every name that is not
+-- already lower case. Only ASCII letters are folded, as PostgreSQL folds them.
+lowerCode :: Text -> Text
+lowerCode t = T.pack [if r == Code && isAsciiUpper c then toLower c else c | (c, r) <- regions t]
 
 
 -- | Each pair's replacement, in order, in code only.

@@ -1,13 +1,13 @@
 -- view public.v
 create view public.v as
-SELECT id,
+select id,
     a
-   FROM public.t;
+   from public.t;
 
 -- function public.total
-CREATE OR REPLACE FUNCTION public.total()
- RETURNS bigint
- LANGUAGE sql
- STABLE
-AS $function$ select sum(a) from public.v $function$;
+create or replace function public.total()
+ returns bigint
+ language sql
+ stable
+as $function$ select sum(a) from public.v $function$;
 

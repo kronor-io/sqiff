@@ -1,6 +1,6 @@
 -- table constraint public.child.child_parent_id_fkey
 -- hazard: also locks public.parent while it runs
-alter table public.child add constraint child_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id) ON DELETE CASCADE NOT VALID;
+alter table public.child add constraint child_parent_id_fkey foreign key (parent_id) references public.parent(id) on delete cascade not valid;
 
 -- table constraint public.child.child_parent_id_fkey
 -- own transaction

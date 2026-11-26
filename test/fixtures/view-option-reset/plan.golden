@@ -1,5 +1,5 @@
 -- view public.v
 create or replace view public.v as
-SELECT id
-   FROM public.t;
+select id
+   from public.t;
 

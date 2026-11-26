@@ -7,21 +7,21 @@ drop view public.w;
 drop view public.v;
 alter table public.t alter column amount type bigint using amount::bigint;
 create view public.v as
-SELECT id,
+select id,
     amount
-   FROM public.t;
+   from public.t;
 create view public.w as
-SELECT id,
-    (amount * 2) AS doubled
-   FROM public.v;
+select id,
+    (amount * 2) as doubled
+   from public.v;
 do $$ declare g text; begin for g in select distinct case when x.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(x.grantee)) end from pg_class c cross join aclexplode(c.relacl) x where c.oid = 'public.w'::regclass and x.grantee <> c.relowner loop execute format('revoke all on table %s from %s', 'public.w', g); end loop; end $$;
-grant SELECT on table public.w to reader;
-grant DELETE on table public.w to sqiff;
-grant INSERT on table public.w to sqiff;
-grant MAINTAIN on table public.w to sqiff;
-grant REFERENCES on table public.w to sqiff;
-grant SELECT on table public.w to sqiff;
-grant TRIGGER on table public.w to sqiff;
-grant TRUNCATE on table public.w to sqiff;
-grant UPDATE on table public.w to sqiff;
+grant select on table public.w to reader;
+grant delete on table public.w to sqiff;
+grant insert on table public.w to sqiff;
+grant maintain on table public.w to sqiff;
+grant references on table public.w to sqiff;
+grant select on table public.w to sqiff;
+grant trigger on table public.w to sqiff;
+grant truncate on table public.w to sqiff;
+grant update on table public.w to sqiff;
 
